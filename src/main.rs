@@ -57,7 +57,7 @@ pub extern "C" fn kmain(_hartid: usize, _dtb: *const u8) -> ! {
     // Reference: xv6-riscv kernel/uart.c is ~100 lines and does all of this.
     // ================================================================
 
-   puts("rust is convolouted\n");
+    puts("rust is convolouted\n");
     puts("if you see this it worked");
 
     loop {
@@ -68,6 +68,10 @@ pub extern "C" fn kmain(_hartid: usize, _dtb: *const u8) -> ! {
 
 fn putchar(c: u8) {
     const UART0: *mut u8 = 0x1000_0000 as *mut u8;
+
+    if c == b'\n' {
+        putchar(b'\r');
+    }
 
     unsafe {
         core::ptr::write_volatile(UART0, c);
