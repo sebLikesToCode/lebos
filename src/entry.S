@@ -42,3 +42,30 @@ _start:
         # diagnose than a runaway program.
 3:      wfi
         j       3b
+
+
+# ---------------------------------------------------------------------------
+# Trap entry.
+#
+# Every exception and interrupt lands here, because kmain writes this address
+# into the stvec CSR.
+#
+# It lives in assembly for a specific reason: stvec's low two bits are a MODE
+# field (00 = direct, 01 = vectored, 10/11 = reserved), not address bits. So
+# the entry point must be at least 4-byte aligned or the mode field gets
+# garbage. Rust cannot align a function -- #[repr(align(4))] applies only to
+# structs, enums, and unions -- so the alignment has to be asserted here.
+#
+# Watch out: RISC-V .align takes a POWER OF TWO. `.align 2` means 2^2 = 4
+# bytes, not 2 bytes.
+#
+# Right now this only forwards to Rust, which is safe solely because
+# trap_handler never returns. A trap that resumes the interrupted code must
+# first save all 31 general-purpose registers here -- the hardware saves none
+# of them -- and restore them before sret. That is the next step.
+# ---------------------------------------------------------------------------
+.section .text
+.align 2
+.globl trap_entry
+trap_entry:
+        j       trap_handler

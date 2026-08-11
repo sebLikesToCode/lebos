@@ -33,6 +33,12 @@ macro_rules! println {
 // 0x80200000 by linker.ld, which is where OpenSBI jumps.
 core::arch::global_asm!(include_str!("entry.S"));
 
+extern "C" {
+    /// The 4-byte-aligned trap trampoline in entry.S. Never called from Rust;
+    /// its address is what goes into stvec.
+    fn trap_entry();
+}
+
 /// First Rust code to run. Called from `_start` with the two values OpenSBI
 /// left in a0/a1.
 ///
@@ -42,8 +48,19 @@ core::arch::global_asm!(include_str!("entry.S"));
 /// It must never return -- hence `-> !`.
 #[no_mangle]
 pub extern "C" fn kmain(hartid: usize, dtb: *const u8) -> ! {
+    // Point stvec at the assembly trampoline in entry.S, not at trap_handler
+    // directly: stvec's low two bits are a mode field, so the address must be
+    // 4-byte aligned, and Rust cannot align a function.
+    unsafe {
+        core::arch::asm!("csrw stvec, {}", in(reg) trap_entry as *const () as usize);
+    }
+
     println!("LeBOS booting");
     println!("hart {} | dtb at {:#x}", hartid, dtb as usize);
+
+    unsafe {
+        core::arch::asm!("unimp");
+    }
 
     loop {
         // Wait For Interrupt: idles the core instead of spinning it at 100%.
@@ -92,6 +109,28 @@ fn _print(args: fmt::Arguments) {
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     println!("PANIC! AT THE KERNEL: {}", info);
+    loop {
+        unsafe { core::arch::asm!("wfi") };
+    }
+}
+
+#[no_mangle]
+extern "C" fn trap_handler() -> ! {
+    let scause: usize;
+    let sepc: usize;
+    let stval: usize;
+
+    unsafe {
+        core::arch::asm!("csrr {}, scause", out(reg) scause);
+        core::arch::asm!("csrr {}, sepc",   out(reg) sepc);
+        core::arch::asm!("csrr {}, stval",  out(reg) stval);
+    }
+
+    println!("*** TRAP ***");
+    println!("  scause {:#x}", scause);
+    println!("  sepc   {:#x}", sepc);
+    println!("  stval  {:#x}", stval);
+
     loop {
         unsafe { core::arch::asm!("wfi") };
     }
