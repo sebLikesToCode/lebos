@@ -57,11 +57,24 @@ pub extern "C" fn kmain(_hartid: usize, _dtb: *const u8) -> ! {
     // Reference: xv6-riscv kernel/uart.c is ~100 lines and does all of this.
     // ================================================================
 
-    const UART0: *mut u8 = 0x1000_0000 as *mut u8;
-
-    unsafe {
-       core::ptr::write_volatile(UART0, b'H');
-    }
+    putchar(b'w');
+    putchar(b'o');
+    putchar(b'w');
+    putchar(b'i');
+    putchar(b'm');
+    putchar(b'w');
+    putchar(b'r');
+    putchar(b'i');
+    putchar(b't');
+    putchar(b'i');
+    putchar(b'n');
+    putchar(b'g');
+    putchar(b'i');
+    putchar(b'n');
+    putchar(b'r');
+    putchar(b'u');
+    putchar(b's');
+    putchar(b't');
 
     loop {
         // Wait For Interrupt: idles the core instead of spinning it at 100%.
@@ -69,6 +82,14 @@ pub extern "C" fn kmain(_hartid: usize, _dtb: *const u8) -> ! {
     }
 }
 
+fn putchar(c: u8) {
+
+    const UART0: *mut u8 = 0x1000_0000 as *mut u8;
+
+    unsafe {
+        core::ptr::write_volatile(UART0, c);
+    }
+}
 /// Where Rust goes when something goes wrong. On a hosted system this unwinds
 /// and prints a backtrace. Here, nothing exists to catch it.
 ///
