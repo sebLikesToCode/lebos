@@ -18,8 +18,14 @@ range read from the **device tree** (`-m 512M` correctly finds 130504 frames,
 no code change); and an Sv39 identity map built from two 1 GiB leaves, with
 page faults arriving in the milestone 3 trap handler unmodified.
 
-Next: 6b — rebuild the map at 4 KiB granularity so code and data can be
-separated, enforce W^X, then move the kernel to the higher half.
+The map is built from 4 KiB pages by a `map()` that walks all three levels and
+creates missing tables as it descends. Each region carries only the rights it
+needs — text `R-X`, rodata `R--`, data and heap `RW-` — so **W^X holds**:
+writing to kernel code raises a store page fault and panics. Describing all
+128 MiB costs 71 frames (284 KiB) of page tables.
+
+Next: 6c — move the kernel to the higher half so user programs get the low
+addresses.
 
 Hard-won details that will bite again if forgotten:
 
@@ -293,8 +299,9 @@ innovation budget is spent at Phase V.
 3. ✅ trap/exception handler printing the trap frame, resuming via sret
 4. ✅ timer interrupts at 100 Hz via SBI, uptime counter
 5. ✅ physical frame allocator + device tree memory map
-6. ✅ 6a Sv39 identity map with 1 GiB leaves; MMU on; page faults land in the existing handler
-   ⬅ **current** — 6b rebuild at 4 KiB granularity, enforce W^X, higher-half kernel
+6. ✅ 6a MMU on via Sv39 identity map; ✅ 6b rebuilt at 4 KiB granularity with
+   W^X enforced; unhandled exceptions are now fatal
+   ⬅ **current** — 6c move the kernel to the higher half
 7. kernel heap
 8. kernel threads + context switch
 9. preemptive scheduler, spinlocks, wait queues — *policy/mechanism split

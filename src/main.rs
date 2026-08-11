@@ -97,7 +97,7 @@ pub extern "C" fn kmain(hartid: usize, dtb: *const u8) -> ! {
     );
 
     println!("paging: building identity map...");
-    paging_init();
+    paging_init(ram_base + ram_size);
     println!("paging: MMU is on -- this line was fetched through a page table");
 
     // Schedule the first timer interrupt one tick out.
@@ -225,35 +225,110 @@ fn pte(pa: usize, flags: usize) -> usize {
     ((pa >> 12) << 10) | flags
 }
 
-/// Build an identity-mapping page table and switch the MMU on.
+/// Physical address a page table entry points at -- the reverse of `pte`.
+fn pte_to_pa(e: usize) -> usize {
+    ((e >> 10) & 0xfff_ffff_ffff) << 12
+}
+
+/// Frames consumed by page tables themselves, so the cost is visible.
+static PT_FRAMES: AtomicUsize = AtomicUsize::new(0);
+
+/// Map one 4 KiB virtual page to one physical page, creating whatever
+/// intermediate tables are missing along the way.
 ///
-/// Identity mapping means virtual X translates to physical X, so nothing
-/// observable changes. That is the point: if the kernel keeps running after
-/// the switch, the table walk is provably correct.
-fn paging_init() {
-    let root = frame_alloc().expect("no frame for the root page table") as *mut usize;
+/// This is the same walk the hardware does, with one difference: where the
+/// hardware gives up on an empty entry and faults, this builds the missing
+/// table and keeps descending.
+fn map(root: *mut usize, va: usize, pa: usize, flags: usize) {
+    let mut table = root;
 
-    // CRITICAL: a frame straight off the free list still holds its old
-    // free-list link in the first 8 bytes. Left there, the MMU would read
-    // that stale value as a page table entry and follow it somewhere
-    // arbitrary. Erase the whole frame first.
-    unsafe { core::ptr::write_bytes(root as *mut u8, 0, PAGE_SIZE) };
+    // Levels 2 then 1. The index is just a 9-bit slice of the address:
+    //   level 2 -> bits 38..30      level 1 -> bits 29..21
+    for level in [2_usize, 1_usize] {
+        let idx = (va >> (12 + 9 * level)) & 0x1ff;
+        let slot = unsafe { table.add(idx) };
+        let mut entry = unsafe { *slot };
 
-    // Two 1 GiB leaves in the root table cover the entire machine:
-    //
-    //   slot 0 -> 0x0000_0000..0x3FFF_FFFF   UART, CLINT, PLIC -- devices
-    //   slot 2 -> 0x8000_0000..0xBFFF_FFFF   the kernel and all of RAM
+        if entry & PTE_V == 0 {
+            // Empty. Build the missing table: allocate, ERASE, link.
+            //
+            // The erase is not optional -- a frame off the free list still
+            // holds its free-list link, and the hardware would follow that
+            // as a real entry.
+            let next = frame_alloc().expect("out of frames while building page tables");
+            unsafe { core::ptr::write_bytes(next, 0, PAGE_SIZE) };
+            PT_FRAMES.fetch_add(1, Ordering::Relaxed);
+
+            // A BRANCH: valid, but R/W/X all clear. That combination is what
+            // tells the hardware to keep walking rather than stop here.
+            entry = pte(next as usize, PTE_V);
+            unsafe { *slot = entry };
+        }
+
+        table = pte_to_pa(entry) as *mut usize;
+    }
+
+    // Level 0: the leaf. Setting any of R/W/X ends the walk.
     //
     // A and D are pre-set because not every implementation updates them in
     // hardware; on those, an unset bit faults on first touch.
-    //
-    // TODO: slot 2 is RWX, which violates W^X. Splitting the kernel's code
-    // and data into separate mappings needs finer granularity than a 1 GiB
-    // page, so it waits until this is built out of 4 KiB leaves.
-    unsafe {
-        *root.add(0) = pte(0x0000_0000, PTE_V | PTE_R | PTE_W | PTE_A | PTE_D);
-        *root.add(2) = pte(0x8000_0000, PTE_V | PTE_R | PTE_W | PTE_X | PTE_A | PTE_D);
+    let idx = (va >> 12) & 0x1ff;
+    unsafe { *table.add(idx) = pte(pa, flags | PTE_V | PTE_A | PTE_D) };
+}
+
+/// Identity-map every page in `[start, end)`. Returns the page count.
+fn map_range(root: *mut usize, start: usize, end: usize, flags: usize) -> usize {
+    let mut va = start & !(PAGE_SIZE - 1);
+    let end = (end + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    let mut pages = 0;
+    while va < end {
+        map(root, va, va, flags);
+        va += PAGE_SIZE;
+        pages += 1;
     }
+    pages
+}
+
+/// Build the kernel page table out of 4 KiB pages and switch the MMU on.
+///
+/// Still an identity map -- virtual X is physical X -- but now each region
+/// carries only the permissions it actually needs, so W^X holds: no page is
+/// both writable and executable.
+fn paging_init(ram_end: usize) {
+    let root = frame_alloc().expect("no frame for the root page table") as *mut usize;
+    unsafe { core::ptr::write_bytes(root as *mut u8, 0, PAGE_SIZE) };
+    PT_FRAMES.fetch_add(1, Ordering::Relaxed);
+
+    let sym = |s: &u8| s as *const u8 as usize;
+    let (text_start, text_end, rodata_start, rodata_end, data_start, kernel_end) = unsafe {
+        (
+            sym(&__text_start),
+            sym(&__text_end),
+            sym(&__rodata_start),
+            sym(&__rodata_end),
+            sym(&__data_start),
+            sym(&__kernel_end),
+        )
+    };
+
+    // Devices. Read/write, never executable.
+    map_range(root, 0x1000_0000, 0x1000_1000, PTE_R | PTE_W); // UART0
+    map_range(root, 0x0200_0000, 0x0201_0000, PTE_R | PTE_W); // CLINT
+    map_range(root, 0x0c00_0000, 0x0c60_0000, PTE_R | PTE_W); // PLIC
+
+    // Kernel code: executable, NOT writable.
+    map_range(root, text_start, text_end, PTE_R | PTE_X);
+    // Constants and string literals: read only. Not writable, not executable.
+    map_range(root, rodata_start, rodata_end, PTE_R);
+    // Globals, .bss and the boot stack: writable, NOT executable.
+    map_range(root, data_start, kernel_end, PTE_R | PTE_W);
+    // Everything the frame allocator hands out: writable, not executable.
+    map_range(root, kernel_end, ram_end, PTE_R | PTE_W);
+
+    println!("  text   {:#x}..{:#x}  R-X", text_start, text_end);
+    println!("  rodata {:#x}..{:#x}  R--", rodata_start, rodata_end);
+    println!("  data   {:#x}..{:#x}  RW-", data_start, kernel_end);
+    println!("  heap   {:#x}..{:#x}  RW-", kernel_end, ram_end);
 
     // satp: mode 8 (Sv39) in the top 4 bits, root table's page number below.
     let satp = (8_usize << 60) | ((root as usize) >> 12);
@@ -278,10 +353,16 @@ fn paging_init() {
     let readback: usize;
     unsafe { core::arch::asm!("csrr {}, satp", out(reg) readback) };
     println!(
-        "paging: satp = {:#x}  mode={} (8 = Sv39)  root frame = {:#x}",
+        "paging: satp = {:#x}  mode={} (8 = Sv39)  root = {:#x}",
         readback,
         readback >> 60,
         (readback & 0xfff_ffff_ffff) << 12
+    );
+    let pt = PT_FRAMES.load(Ordering::Relaxed);
+    println!(
+        "paging: {} frames of page tables ({} KiB) to describe it all",
+        pt,
+        pt * PAGE_SIZE / 1024
     );
 }
 
@@ -425,9 +506,15 @@ fn dtb_memory(dtb: *const u8) -> Option<(usize, usize)> {
 const PAGE_SIZE: usize = 4096;
 
 extern "C" {
-    /// Defined by linker.ld as `__kernel_end = .`. There is no data here --
-    /// the symbol's ADDRESS is the value we want, which is why the code below
-    /// takes `&__kernel_end` rather than reading it.
+    /// Defined by linker.ld. There is no data at any of these -- the symbol's
+    /// ADDRESS is the value we want, which is why the code takes `&sym`
+    /// rather than reading it. Each is 4096-aligned so that regions with
+    /// different permissions never share a page.
+    static __text_start: u8;
+    static __text_end: u8;
+    static __rodata_start: u8;
+    static __rodata_end: u8;
+    static __data_start: u8;
     static __kernel_end: u8;
 }
 
@@ -548,21 +635,35 @@ extern "C" fn trap_handler(frame: &mut TrapFrame) {
         return;
     }
 
+    // An exception. Every one of these is currently a kernel bug -- there is
+    // no user mode yet, so nothing faults legitimately.
+    //
+    // This used to print and then step over the faulting instruction, which
+    // was right while deliberately executing `unimp`. Now that page faults are
+    // real, silently resuming would let a corrupted kernel stagger on and fail
+    // somewhere unrelated. Loud and immediate beats subtle and later.
+    let kind = match code {
+        0 => "instruction address misaligned",
+        1 => "instruction access fault",
+        2 => "illegal instruction",
+        3 => "breakpoint",
+        5 => "load access fault",
+        7 => "store access fault",
+        8 => "ecall from user mode",
+        9 => "ecall from supervisor mode",
+        12 => "instruction page fault -- executing a non-executable page",
+        13 => "load page fault -- reading an unmapped or unreadable page",
+        15 => "store page fault -- writing an unmapped or read-only page",
+        _ => "unknown exception",
+    };
+
     println!("*** TRAP ***");
+    println!("  {}", kind);
     println!(
         "  scause {:#x}  sepc {:#x}  stval {:#x}",
         scause, sepc, stval
     );
     println!("  ra {:#x}  sp {:#x}", frame.x[1], frame.x[2]);
 
-    // Step over the faulting instruction, or we return straight back onto it
-    // and trap forever. RISC-V instructions are 4 bytes UNLESS the low two
-    // bits are something other than 0b11, which marks a 2-byte compressed
-    // instruction. `unimp` is compressed -- it is literally 0x0000.
-    let insn = unsafe { core::ptr::read_volatile(sepc as *const u16) };
-    let len = if insn & 0b11 == 0b11 { 4 } else { 2 };
-
-    unsafe {
-        core::arch::asm!("csrw sepc, {}", in(reg) sepc + len);
-    }
+    panic!("unhandled exception: {}", kind);
 }

@@ -29,23 +29,35 @@ SECTIONS
 {
     . = ORIGIN(ram);
 
+    /* Every section boundary below is 4096-aligned. That is not cosmetic:
+     * permissions are granted per page, so if .text and .rodata shared a page
+     * you could not make one executable and the other not. Alignment is what
+     * makes W^X expressible at all. */
+
     /* .text.entry is forced first so that _start sits at exactly 0x80200000.
      * OpenSBI jumps to that address blindly -- if some other function landed
      * there instead, the machine would execute it and die confusingly. */
     .text : {
+        __text_start = .;
         KEEP(*(.text.entry))
         *(.text .text.*)
+        . = ALIGN(4096);
+        __text_end = .;
     } > ram
 
-    /* Read-only data: string literals, constant tables. */
+    /* Read-only data: string literals, constant tables. Mapped R, no W, no X. */
     .rodata : {
-        . = ALIGN(16);
+        . = ALIGN(4096);
+        __rodata_start = .;
         *(.rodata .rodata.*)
+        . = ALIGN(4096);
+        __rodata_end = .;
     } > ram
 
-    /* Initialised globals. */
+    /* Initialised globals. Everything from here to __kernel_end is R+W. */
     .data : {
-        . = ALIGN(16);
+        . = ALIGN(4096);
+        __data_start = .;
         *(.sdata .sdata.*)
         *(.data .data.*)
     } > ram
