@@ -58,11 +58,20 @@ pub extern "C" fn kmain(hartid: usize, dtb: *const u8) -> ! {
     println!("LeBOS booting");
     println!("hart {} | dtb at {:#x}", hartid, dtb as usize);
 
-    println!("about to execute an illegal instruction");
+    // Schedule the first timer interrupt one second out.
+    sbi_set_timer(now() + TIMER_HZ);
+
+    // Two separate enables, both required:
+    //   sie bit 5  (STIE) -- allow supervisor timer interrupts specifically
+    //   sstatus bit 1 (SIE) -- the master interrupt enable
+    //
+    // `csrs` sets the given bits and leaves the rest of the register alone.
+    // (`csrw` would overwrite the whole thing and destroy unrelated state;
+    //  `csrc` clears bits.)
     unsafe {
-        core::arch::asm!("unimp");
+        core::arch::asm!("csrs sie, {}", in(reg) 1_usize << 5);
+        core::arch::asm!("csrs sstatus, {}", in(reg) 1_usize << 1);
     }
-    println!("...and we survived it");
 
     loop {
         // Wait For Interrupt: idles the core instead of spinning it at 100%.
@@ -102,6 +111,40 @@ fn _print(args: fmt::Arguments) {
     let _ = uart.write_fmt(args);
 }
 
+/// Timer ticks per second on the QEMU virt board. Straight from the OpenSBI
+/// banner: "Platform Timer Device : aclint-mtimer @ 10000000Hz".
+const TIMER_HZ: u64 = 10_000_000;
+
+/// Read the `time` CSR -- a counter incrementing at TIMER_HZ.
+fn now() -> u64 {
+    let t: u64;
+    unsafe {
+        core::arch::asm!("csrr {}, time", out(reg) t);
+    }
+    t
+}
+
+/// Ask OpenSBI to raise a timer interrupt at `when`.
+///
+/// The timer compare register is M-mode only, so S-mode cannot write it
+/// directly. `ecall` traps up to the firmware, which does it on our behalf.
+///
+/// SBI calling convention: a7 = extension id, a6 = function id, a0.. = args.
+/// 0x54494D45 is the ASCII bytes "TIME". This is the same mechanism user
+/// programs will use to call into us at milestone 10, one privilege level
+/// further down.
+fn sbi_set_timer(when: u64) {
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            in("a7") 0x5449_4D45_usize,
+            in("a6") 0_usize,
+            in("a0") when,
+            out("a1") _,
+        );
+    }
+}
+
 /// Where Rust goes when something goes wrong. On a hosted system this unwinds
 /// and prints a backtrace. Here, nothing exists to catch it.
 ///
@@ -131,6 +174,23 @@ extern "C" fn trap_handler(frame: &mut TrapFrame) {
         core::arch::asm!("csrr {}, scause", out(reg) scause);
         core::arch::asm!("csrr {}, sepc",   out(reg) sepc);
         core::arch::asm!("csrr {}, stval",  out(reg) stval);
+    }
+
+    // scause's top bit: set means interrupt, clear means exception.
+    // Reinterpreting as signed makes "top bit set" the same as "negative".
+    let is_interrupt = (scause as isize) < 0;
+    let code = scause & 0xff;
+
+    if is_interrupt && code == 5 {
+        // Supervisor timer. It is one-shot, so rearm it or it never fires
+        // again.
+        sbi_set_timer(now() + TIMER_HZ);
+        println!("tick");
+
+        // Deliberately do NOT touch sepc. An interrupt means the instruction
+        // at sepc has not run yet -- skipping it would silently drop a good
+        // instruction. Only exceptions get stepped over.
+        return;
     }
 
     println!("*** TRAP ***");
