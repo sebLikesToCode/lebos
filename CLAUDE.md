@@ -4,9 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A from-scratch operating system kernel for 64-bit RISC-V, written in Rust, run
-under QEMU. It is a learning project with a real design thesis (see *Design
-thesis* below) — not a Linux clone and not a tutorial follow-along.
+**LeBOS** — a from-scratch operating system kernel for 64-bit RISC-V, written
+in Rust, run under QEMU. It is a learning project with a real design thesis
+(see *Design thesis* below) — not a Linux clone and not a tutorial
+follow-along. Named for its author, Sebastian LeBlanc; `LeBOS` in prose,
+`lebos` as the crate and binary name.
 
 Status: pre-milestone-2. The build/boot/debug harness works and `_start` runs;
 `kmain` is an empty loop awaiting its first serial write.

@@ -1,5 +1,5 @@
 TARGET  := riscv64gc-unknown-none-elf
-KERNEL  := target/$(TARGET)/debug/kernel
+KERNEL  := target/$(TARGET)/debug/lebos
 
 QEMU    := qemu-system-riscv64
 QFLAGS  := -machine virt -cpu rv64 -smp 1 -m 128M -nographic \

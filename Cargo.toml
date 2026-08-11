@@ -1,10 +1,10 @@
 [package]
-name = "os"
+name = "lebos"
 version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "kernel"
+name = "lebos"
 path = "src/main.rs"
 test = false
 bench = false
