@@ -13,6 +13,11 @@
 
 use core::fmt::{self, Write};
 use core::panic::PanicInfo;
+use core::sync::atomic::{AtomicU64, Ordering};
+
+/// Timer interrupts since boot. Atomic rather than `static mut` so it stays
+/// correct once there is more than one hart.
+static TICKS: AtomicU64 = AtomicU64::new(0);
 
 macro_rules! print {
     ($($arg:tt)*) => {
@@ -58,8 +63,8 @@ pub extern "C" fn kmain(hartid: usize, dtb: *const u8) -> ! {
     println!("LeBOS booting");
     println!("hart {} | dtb at {:#x}", hartid, dtb as usize);
 
-    // Schedule the first timer interrupt one second out.
-    sbi_set_timer(now() + TIMER_HZ);
+    // Schedule the first timer interrupt one tick out.
+    sbi_set_timer(now() + TICK_INTERVAL);
 
     // Two separate enables, both required:
     //   sie bit 5  (STIE) -- allow supervisor timer interrupts specifically
@@ -114,6 +119,11 @@ fn _print(args: fmt::Arguments) {
 /// Timer ticks per second on the QEMU virt board. Straight from the OpenSBI
 /// banner: "Platform Timer Device : aclint-mtimer @ 10000000Hz".
 const TIMER_HZ: u64 = 10_000_000;
+
+/// How often the timer fires. This is POLICY -- ours to choose -- unlike
+/// TIMER_HZ above, which is a fact about the hardware. 100 Hz matches Linux's
+/// typical HZ. At milestone 9 this becomes the scheduler quantum.
+const TICK_INTERVAL: u64 = TIMER_HZ / 100;
 
 /// Read the `time` CSR -- a counter incrementing at TIMER_HZ.
 fn now() -> u64 {
@@ -190,8 +200,14 @@ extern "C" fn trap_handler(frame: &mut TrapFrame) {
         // signal stays asserted forever. Returning without pushing timecmp
         // into the future means the CPU re-traps at the very next instruction
         // boundary, forever. Measured: ~165,000 ticks per second instead of 1.
-        sbi_set_timer(now() + TIMER_HZ);
-        println!("tick");
+        sbi_set_timer(now() + TICK_INTERVAL);
+
+        // Ticking at 100 Hz, so print once a second rather than flooding the
+        // serial line. The counter itself is the kernel's notion of uptime.
+        let n = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
+        if n % 100 == 0 {
+            println!("tick {} -- up {}s", n, n / 100);
+        }
 
         // Deliberately do NOT touch sepc. An interrupt means the instruction
         // at sepc has not run yet -- skipping it would silently drop a good
