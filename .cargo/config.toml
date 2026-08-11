@@ -5,6 +5,14 @@ target = "riscv64gc-unknown-none-elf"
 
 [target.riscv64gc-unknown-none-elf]
 rustflags = [
+    # PC-relative addressing everywhere (auipc, never lui). rustc calls this
+    # "medium"; LLVM and the RISC-V world call the same thing "medany". It lets
+    # the kernel relocate itself to the higher half at runtime: every symbol
+    # reference is "wherever I am, plus a fixed distance", so the same machine
+    # code resolves correctly whether the PC is 0x80200000 or its high alias.
+    # It is already the default for this target; pinned so it cannot change
+    # underneath us.
+    "-C", "code-model=medium",
     # Use our linker script instead of the default one. This is what decides
     # that the kernel lives at 0x8020_0000 -- see linker.ld.
     "-C", "link-arg=-Tlinker.ld",

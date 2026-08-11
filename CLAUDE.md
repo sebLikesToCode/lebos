@@ -32,8 +32,25 @@ process's page tables arithmetic rather than a special case at milestone 11.
 The root table splits exactly in half — slots 0–255 are the low half (user),
 256–511 the high half (kernel). Both maps together cost 141 frames (564 KiB).
 
-Next: 6c-ii — relink the kernel for high addresses and jump there, then drop
-the identity map.
+The kernel **executes in the higher half**: after paging is on it adds
+`HIGH_BASE` to `sp` and jumps to the high alias of its own code, then moves
+`stvec` and the UART base up too. `code-model=medium` makes this work without
+relinking, because all code is PC-relative and resolves against whichever alias
+the PC is in.
+
+**The identity map cannot be dropped yet, and the reason is measured.** Clearing
+root slots 0 and 2 boots and relocates, then dies on the first `println!` from
+the trap handler. `code-model=medium` fixes *code*, not *data the linker fills
+with absolute addresses* — this binary carries **436 absolute low addresses in
+`.rodata`**, which are vtables. `core::fmt` reaches the UART through
+`&mut dyn Write`, and that call jumps to `0x802xxxxx`. Direct calls survive
+(bare `putchar` ticks fine); dynamically dispatched ones do not.
+
+Next: relink with VMA in the high half and LMA at `0x80200000` (`> virt AT>
+phys` in linker.ld) so the linker writes high addresses into those 436 slots.
+Early boot still reaches symbols physically for free, because `la` is
+PC-relative. Then the identity map can go and the low half is free for user
+programs.
 
 Hard-won details that will bite again if forgotten:
 
@@ -310,7 +327,8 @@ innovation budget is spent at Phase V.
 6. ✅ 6a MMU on via Sv39 identity map; ✅ 6b rebuilt at 4 KiB granularity with
    W^X enforced; unhandled exceptions are now fatal
    ✅ 6c-i higher-half direct map alongside the identity map, aliasing proven
-   ⬅ **current** — 6c-ii relink and jump so the kernel actually runs high
+   ✅ 6c-ii the kernel now executes in the higher half (PC, sp, stvec all high)
+   ⬅ **current** — relink at high VMA so the identity map can be dropped
 7. kernel heap
 8. kernel threads + context switch
 9. preemptive scheduler, spinlocks, wait queues — *policy/mechanism split

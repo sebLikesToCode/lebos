@@ -127,6 +127,78 @@ pub extern "C" fn kmain(hartid: usize, dtb: *const u8) -> ! {
         frame_free(page);
     }
 
+    println!("reloc: currently at pc = {:#x}", here());
+
+    // Move to the higher half.
+    //
+    // Both maps are live, so the kernel is reachable at two addresses right
+    // now. This shifts the stack pointer and the program counter to the high
+    // alias of exactly the memory already executing.
+    //
+    // `la t0, kmain_high` is PC-relative, so it yields the LOW address of that
+    // function -- adding HIGH_BASE turns it into the high one. After `jr`, the
+    // PC is high and every subsequent PC-relative reference resolves high too,
+    // automatically, with no further work.
+    unsafe {
+        core::arch::asm!(
+            "add sp, sp, {off}",
+            "la  t0, {f}",
+            "add t0, t0, {off}",
+            "jr  t0",
+            off = in(reg) HIGH_BASE,
+            f = sym kmain_high,
+            options(noreturn),
+        );
+    }
+}
+
+/// Everything after the kernel has relocated. The PC is in the higher half
+/// from the first instruction of this function.
+extern "C" fn kmain_high() -> ! {
+    // The UART is the kernel's one hand-written absolute address, so it is the
+    // one thing that does not relocate itself. Point it at the high alias
+    // before the identity map goes away.
+    UART_BASE.store(va(UART0_PHYS), Ordering::Relaxed);
+
+    println!("reloc: now at pc = {:#x}", here());
+
+    // stvec still holds the LOW address of trap_entry, which is about to stop
+    // existing. `trap_entry as usize` is PC-relative and the PC is now high,
+    // so this reads back the high address with no adjustment -- unlike ROOT
+    // below, which was stored as a bare physical number.
+    let entry = trap_entry as *const () as usize;
+    unsafe { core::arch::asm!("csrw stvec, {}", in(reg) entry) };
+    println!("reloc: trap vector moved to {:#x}", entry);
+
+    // ---------------------------------------------------------------------
+    // The identity map CANNOT be removed yet. Measured, not assumed.
+    //
+    // Clearing root slots 0 and 2 boots, relocates, and then dies on the first
+    // `println!` from the trap handler: a store page fault in trap_entry with
+    // sp far below the stack, after the kernel had run away into unmapped low
+    // memory.
+    //
+    // Cause: `code-model=medium` makes CODE position-independent, but it does
+    // nothing about DATA the linker fills in with absolute addresses. This
+    // binary has 436 absolute low addresses embedded in .rodata -- vtables.
+    // core::fmt reaches the UART through `&mut dyn Write`, and calling through
+    // that vtable jumps to 0x802xxxxx, which no longer exists.
+    //
+    // Direct calls survive (a bare `putchar` ticks along fine); anything
+    // dynamically dispatched does not.
+    //
+    // The real fix is 6c-ii proper: relink with VMA in the high half and LMA
+    // at 0x80200000 (`> virt AT> phys` in linker.ld), so the linker writes
+    // HIGH addresses into those 436 slots. Early boot must then reach symbols
+    // physically, which PC-relative `la` already does for free.
+    //
+    // Until then the identity map stays. The kernel genuinely executes in the
+    // higher half, which was the point; the low half simply is not reclaimed
+    // yet.
+    // ---------------------------------------------------------------------
+    let _ = ROOT.load(Ordering::Relaxed);
+    println!("reloc: running high; identity map retained (see 6c-ii note)");
+
     // Schedule the first timer interrupt one tick out.
     sbi_set_timer(now() + TICK_INTERVAL);
 
@@ -148,15 +220,34 @@ pub extern "C" fn kmain(hartid: usize, dtb: *const u8) -> ! {
     }
 }
 
-fn putchar(c: u8) {
-    const UART0: *mut u8 = 0x1000_0000 as *mut u8;
+/// The address this instruction is executing at. `auipc rd, 0` puts the
+/// current PC into a register -- the most direct possible answer to "where am
+/// I actually running?"
+fn here() -> usize {
+    let pc: usize;
+    unsafe { core::arch::asm!("auipc {}, 0", out(reg) pc) };
+    pc
+}
 
+/// Physical address of UART0 on the QEMU virt board.
+const UART0_PHYS: usize = 0x1000_0000;
+
+/// Where putchar currently reaches the UART.
+///
+/// This is the kernel's one hand-written absolute address, so it is the one
+/// thing that breaks when the identity map is removed. It starts as the
+/// physical address and is bumped to the higher-half alias once the kernel
+/// has relocated.
+static UART_BASE: AtomicUsize = AtomicUsize::new(UART0_PHYS);
+
+fn putchar(c: u8) {
     if c == b'\n' {
         putchar(b'\r');
     }
 
+    let base = UART_BASE.load(Ordering::Relaxed) as *mut u8;
     unsafe {
-        core::ptr::write_volatile(UART0, c);
+        core::ptr::write_volatile(base, c);
     }
 }
 
@@ -267,6 +358,29 @@ fn pte(pa: usize, flags: usize) -> usize {
 /// those few root entries.
 const HIGH_BASE: usize = 0xFFFF_FFC0_0000_0000;
 
+/// Physical address of the root page table. Stored as a plain number, so it
+/// stays physical no matter which alias the kernel is executing from.
+static ROOT: AtomicUsize = AtomicUsize::new(0);
+
+/// physical -> virtual, and back. Linux calls these __va and __pa.
+///
+/// These matter once the kernel runs high: `frame_alloc` returns PHYSICAL
+/// addresses, and after the identity map is gone a physical address is not
+/// directly usable. Anything the allocator hands out must go through `va`
+/// before it is written to.
+///
+/// Note the asymmetry with linker symbols: `&some_symbol` is materialised
+/// PC-relative, so it already yields whichever alias the kernel is currently
+/// executing from, and must NOT be adjusted.
+fn va(pa: usize) -> usize {
+    pa.wrapping_add(HIGH_BASE)
+}
+
+#[allow(dead_code)]
+fn pa(va: usize) -> usize {
+    va.wrapping_sub(HIGH_BASE)
+}
+
 /// Physical address a page table entry points at -- the reverse of `pte`.
 fn pte_to_pa(e: usize) -> usize {
     ((e >> 10) & 0xfff_ffff_ffff) << 12
@@ -344,6 +458,10 @@ fn paging_init(ram_end: usize) {
     let root = frame_alloc().expect("no frame for the root page table") as *mut usize;
     unsafe { core::ptr::write_bytes(root as *mut u8, 0, PAGE_SIZE) };
     PT_FRAMES.fetch_add(1, Ordering::Relaxed);
+
+    // Remembered as a bare physical number so the relocated kernel can still
+    // find it after the identity map is gone.
+    ROOT.store(root as usize, Ordering::Relaxed);
 
     let sym = |s: &u8| s as *const u8 as usize;
     let (text_start, text_end, rodata_start, rodata_end, data_start, kernel_end) = unsafe {
