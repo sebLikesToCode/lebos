@@ -1,6 +1,10 @@
 /target
 Cargo.lock
 .idea/
+
+# Scratch copy of main.rs for experiments -- deliberately untracked so it can
+# be broken freely. `make resync` recreates it from main.rs.
+src/main2.rs
 qemu.log
 virt.dtb
 virt.dts

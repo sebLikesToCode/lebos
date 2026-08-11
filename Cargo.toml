@@ -9,6 +9,15 @@ path = "src/main.rs"
 test = false
 bench = false
 
+# Scratch copy for experiments. Gitignored, and built only by `make play` so
+# that breaking it can never block `make run`. Create/refresh it from main.rs
+# with `make resync`.
+[[bin]]
+name = "main2"
+path = "src/main2.rs"
+test = false
+bench = false
+
 # Kernels must abort, never unwind: there is no runtime to unwind into.
 [profile.dev]
 panic = "abort"
