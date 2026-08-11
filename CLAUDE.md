@@ -39,13 +39,22 @@ Hard-won details that will bite again if forgotten:
 The owner is learning systems programming and Rust by building this. That
 changes the job:
 
-- **Do not write kernel code for them unless they explicitly ask.** Explain the
-  concept, name the mechanism, point at the reference (usually xv6), and let
-  them write it. Build tooling, linker scripts, and boilerplate are fair game;
-  the kernel logic is the point of the exercise.
+- **He designs, you translate.** Pose exercises as Python/JS scaffolds with
+  holes to fill; he sketches the logic in a language he already thinks in and
+  you turn it into Rust, explaining what changed. Dictating Rust for him to
+  retype teaches nothing — the algorithm is the lesson, not the syntax.
+- **Write the mechanical parts outright**: assembly, register save/restore,
+  linker scripts, build tooling, long boilerplate.
+- **Pitch explanations low.** He knows NAND gates, registers, and clocks
+  solidly, plus high-level code — but not the layer between. Concrete diagrams
+  with real addresses land; abstraction does not. Explain what a CSR *is*
+  physically before using one.
 - Prefer explaining *why* the hardware demands something over prescribing what
   to type. "The optimiser deletes stores nothing reads back" beats "use
   `write_volatile`".
+- **Break-it experiments beat quizzes.** Change something in `make play`,
+  predict, then run. This is how the level-triggered timer flood and the
+  double-free self-loop got discovered.
 - xv6-riscv is the canonical reference implementation to point at. It solves
   nearly every problem this project will hit, in ~9k lines of readable C.
 
