@@ -76,6 +76,30 @@ changes the job:
 - xv6-riscv is the canonical reference implementation to point at. It solves
   nearly every problem this project will hit, in ~9k lines of readable C.
 
+## Easter eggs and tributes
+
+The author wants this codebase full of them. **Flag the opportunity whenever
+writing code that has a natural slot** — don't add one silently, and don't add
+one where it would cost clarity or correctness.
+
+Legitimate slots are places where an arbitrary constant or string is needed
+anyway, so the joke is free:
+
+- magic numbers (format signatures, struct validity markers)
+- allocator canaries and stack guard values
+- panic and error messages
+- the boot banner
+- RSW bits — RISC-V reserves PTE bits 8–9 for software use
+- comments, in the `/* You are not expected to understand this */` tradition
+
+Already present: `PANIC! AT THE KERNEL` (Panic! At The Disco), and inherited
+from the FDT spec, `0xd00dfeed` ("dude feed").
+
+**Reserved:** `0x1EB05` spells LEBOS in hex (1=L, 0=O, 5=S). Earmarked for the
+object store's on-disk magic number at milestone 12 — the format signature is
+permanent and the most visible constant the project will ever have. Do not
+spend it on something smaller.
+
 ## Setup
 
 ```
