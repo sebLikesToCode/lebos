@@ -137,7 +137,19 @@ crash-correct than in-place update; see log-structured storage / LSM trees).
 
 The syscall surface for storage is roughly `create` / `get` / `query` / `link`.
 
-**Invariants to defend:**
+## Known improvement, deliberately deferred
+
+`frame_alloc` returns a raw `*mut u8`, which opts out of every guarantee Rust
+offers — a double free silently makes a page point at itself, so every
+subsequent allocation returns that same page while the rest of the free list
+becomes unreachable (demonstrated and measured; three allocations all returned
+`0x87fff000`).
+
+The fix is an owning `struct Frame(*mut u8)` with a `Drop` impl that returns
+the page, making double-free a compile error. Deferred until after milestone 6,
+so page tables and frames can be wrapped together once the shape is known.
+
+## Design thesis invariants to defend:
 
 - *No hierarchy, ever.* The pressure to add "just a little" path-like nesting
   is exactly what killed WinFS. Push back on it.
