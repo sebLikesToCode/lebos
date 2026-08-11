@@ -24,8 +24,16 @@ needs — text `R-X`, rodata `R--`, data and heap `RW-` — so **W^X holds**:
 writing to kernel code raises a store page fault and panics. Describing all
 128 MiB costs 71 frames (284 KiB) of page tables.
 
-Next: 6c — move the kernel to the higher half so user programs get the low
-addresses.
+Every physical address P is also mapped at `HIGH_BASE + P`
+(`0xFFFF_FFC0_0000_0000`), verified by writing through the low address and
+reading it back through the high one. That is a **direct map**: the kernel can
+reach any physical page by adding a constant, which makes editing another
+process's page tables arithmetic rather than a special case at milestone 11.
+The root table splits exactly in half — slots 0–255 are the low half (user),
+256–511 the high half (kernel). Both maps together cost 141 frames (564 KiB).
+
+Next: 6c-ii — relink the kernel for high addresses and jump there, then drop
+the identity map.
 
 Hard-won details that will bite again if forgotten:
 
@@ -301,7 +309,8 @@ innovation budget is spent at Phase V.
 5. ✅ physical frame allocator + device tree memory map
 6. ✅ 6a MMU on via Sv39 identity map; ✅ 6b rebuilt at 4 KiB granularity with
    W^X enforced; unhandled exceptions are now fatal
-   ⬅ **current** — 6c move the kernel to the higher half
+   ✅ 6c-i higher-half direct map alongside the identity map, aliasing proven
+   ⬅ **current** — 6c-ii relink and jump so the kernel actually runs high
 7. kernel heap
 8. kernel threads + context switch
 9. preemptive scheduler, spinlocks, wait queues — *policy/mechanism split

@@ -96,9 +96,36 @@ pub extern "C" fn kmain(hartid: usize, dtb: *const u8) -> ! {
         free * PAGE_SIZE / 1024 / 1024
     );
 
-    println!("paging: building identity map...");
+    println!("paging: building kernel page table...");
     paging_init(ram_base + ram_size);
     println!("paging: MMU is on -- this line was fetched through a page table");
+
+    // Prove the higher-half alias is real: write through the low address,
+    // read it back through the high one. If they are the same memory, the
+    // MMU is genuinely translating rather than passing addresses through.
+    //
+    // 0x1EB05 spells LEBOS in hex. Throwaway probe value here, not the
+    // reserved on-disk magic number.
+    {
+        let page = frame_alloc().expect("no frame for the alias test");
+        let low = page as usize;
+        let high = HIGH_BASE + low;
+        unsafe {
+            core::ptr::write_volatile(low as *mut usize, 0x1EB05);
+            let back = core::ptr::read_volatile(high as *const usize);
+            println!("alias: wrote {:#x} to {:#x}", 0x1EB05_usize, low);
+            println!("       read  {:#x} at {:#x}", back, high);
+            println!(
+                "       one physical page, two virtual addresses: {}",
+                if back == 0x1EB05 {
+                    "CONFIRMED"
+                } else {
+                    "FAILED"
+                }
+            );
+        }
+        frame_free(page);
+    }
 
     // Schedule the first timer interrupt one tick out.
     sbi_set_timer(now() + TICK_INTERVAL);
@@ -225,6 +252,21 @@ fn pte(pa: usize, flags: usize) -> usize {
     ((pa >> 12) << 10) | flags
 }
 
+/// Base of the high half of the address space.
+///
+/// Sv39 uses 39-bit addresses in 64-bit registers, and requires bits 63..39 to
+/// all copy bit 38 -- sign extension. So only two ranges are legal:
+///
+///   0x0000_0000_0000_0000 .. 0x0000_003F_FFFF_FFFF   low half  (user)
+///   0xFFFF_FFC0_0000_0000 .. 0xFFFF_FFFF_FFFF_FFFF   high half (kernel)
+///
+/// with an enormous invalid hole between them. In the root table that lands
+/// exactly on the halfway line: slots 0..255 are the low half, 256..511 the
+/// high half. The kernel lives in the top half at the SAME virtual addresses
+/// in every process, so creating a process page table later is just copying
+/// those few root entries.
+const HIGH_BASE: usize = 0xFFFF_FFC0_0000_0000;
+
 /// Physical address a page table entry points at -- the reverse of `pte`.
 fn pte_to_pa(e: usize) -> usize {
     ((e >> 10) & 0xfff_ffff_ffff) << 12
@@ -276,14 +318,18 @@ fn map(root: *mut usize, va: usize, pa: usize, flags: usize) {
     unsafe { *table.add(idx) = pte(pa, flags | PTE_V | PTE_A | PTE_D) };
 }
 
-/// Identity-map every page in `[start, end)`. Returns the page count.
-fn map_range(root: *mut usize, start: usize, end: usize, flags: usize) -> usize {
-    let mut va = start & !(PAGE_SIZE - 1);
+/// Map every page of physical `[start, end)` at virtual address
+/// `offset + physical`. Returns the page count.
+///
+/// `offset == 0` gives an identity map. `offset == HIGH_BASE` gives the
+/// higher-half alias of the same physical memory.
+fn map_range(root: *mut usize, start: usize, end: usize, offset: usize, flags: usize) -> usize {
+    let mut pa = start & !(PAGE_SIZE - 1);
     let end = (end + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
     let mut pages = 0;
-    while va < end {
-        map(root, va, va, flags);
-        va += PAGE_SIZE;
+    while pa < end {
+        map(root, offset.wrapping_add(pa), pa, flags);
+        pa += PAGE_SIZE;
         pages += 1;
     }
     pages
@@ -311,19 +357,38 @@ fn paging_init(ram_end: usize) {
         )
     };
 
+    // --- the identity map, still what the kernel actually runs on ---
+
     // Devices. Read/write, never executable.
-    map_range(root, 0x1000_0000, 0x1000_1000, PTE_R | PTE_W); // UART0
-    map_range(root, 0x0200_0000, 0x0201_0000, PTE_R | PTE_W); // CLINT
-    map_range(root, 0x0c00_0000, 0x0c60_0000, PTE_R | PTE_W); // PLIC
+    map_range(root, 0x1000_0000, 0x1000_1000, 0, PTE_R | PTE_W); // UART0
+    map_range(root, 0x0200_0000, 0x0201_0000, 0, PTE_R | PTE_W); // CLINT
+    map_range(root, 0x0c00_0000, 0x0c60_0000, 0, PTE_R | PTE_W); // PLIC
 
     // Kernel code: executable, NOT writable.
-    map_range(root, text_start, text_end, PTE_R | PTE_X);
+    map_range(root, text_start, text_end, 0, PTE_R | PTE_X);
     // Constants and string literals: read only. Not writable, not executable.
-    map_range(root, rodata_start, rodata_end, PTE_R);
+    map_range(root, rodata_start, rodata_end, 0, PTE_R);
     // Globals, .bss and the boot stack: writable, NOT executable.
-    map_range(root, data_start, kernel_end, PTE_R | PTE_W);
+    map_range(root, data_start, kernel_end, 0, PTE_R | PTE_W);
     // Everything the frame allocator hands out: writable, not executable.
-    map_range(root, kernel_end, ram_end, PTE_R | PTE_W);
+    map_range(root, kernel_end, ram_end, 0, PTE_R | PTE_W);
+
+    // --- the higher-half alias of the same physical memory ---
+    //
+    // Every physical address P is now ALSO reachable at HIGH_BASE + P, with
+    // the same permissions. Two virtual addresses, one physical page.
+    //
+    // This is a "direct map", and it is worth more than just being a stepping
+    // stone to relocating the kernel: it means the kernel can reach ANY
+    // physical page by adding a constant. At milestone 11, editing another
+    // process's page tables becomes arithmetic instead of a special case.
+    map_range(root, 0x1000_0000, 0x1000_1000, HIGH_BASE, PTE_R | PTE_W);
+    map_range(root, 0x0200_0000, 0x0201_0000, HIGH_BASE, PTE_R | PTE_W);
+    map_range(root, 0x0c00_0000, 0x0c60_0000, HIGH_BASE, PTE_R | PTE_W);
+    map_range(root, text_start, text_end, HIGH_BASE, PTE_R | PTE_X);
+    map_range(root, rodata_start, rodata_end, HIGH_BASE, PTE_R);
+    map_range(root, data_start, kernel_end, HIGH_BASE, PTE_R | PTE_W);
+    map_range(root, kernel_end, ram_end, HIGH_BASE, PTE_R | PTE_W);
 
     println!("  text   {:#x}..{:#x}  R-X", text_start, text_end);
     println!("  rodata {:#x}..{:#x}  R--", rodata_start, rodata_end);
