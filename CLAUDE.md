@@ -264,7 +264,8 @@ innovation budget is spent at Phase V.
 3. ✅ trap/exception handler printing the trap frame, resuming via sret
 4. ✅ timer interrupts at 100 Hz via SBI, uptime counter
 5. ✅ physical frame allocator + device tree memory map
-6. ⬅ **current** — virtual memory, Sv39 page tables, higher-half kernel
+6. ✅ 6a Sv39 identity map with 1 GiB leaves; MMU on; page faults land in the existing handler
+   ⬅ **current** — 6b rebuild at 4 KiB granularity, enforce W^X, higher-half kernel
 7. kernel heap
 8. kernel threads + context switch
 9. preemptive scheduler, spinlocks, wait queues — *policy/mechanism split

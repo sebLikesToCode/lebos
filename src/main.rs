@@ -96,12 +96,9 @@ pub extern "C" fn kmain(hartid: usize, dtb: *const u8) -> ! {
         free * PAGE_SIZE / 1024 / 1024
     );
 
-    let a = frame_alloc().unwrap();
-    let b = frame_alloc().unwrap();
-    println!("  alloc a={:p}  b={:p}", a, b);
-    frame_free(a);
-    let c = frame_alloc().unwrap();
-    println!("  freed a, next alloc c={:p}", c);
+    println!("paging: building identity map...");
+    paging_init();
+    println!("paging: MMU is on -- this line was fetched through a page table");
 
     // Schedule the first timer interrupt one tick out.
     sbi_set_timer(now() + TICK_INTERVAL);
@@ -193,6 +190,99 @@ fn sbi_set_timer(when: u64) {
             out("a1") _,
         );
     }
+}
+
+// ===========================================================================
+// Paging -- Sv39
+//
+// A page table is one 4096-byte frame holding 512 entries of 8 bytes. An
+// address is chopped into three 9-bit slot numbers plus a 12-bit offset, and
+// the MMU walks up to three tables to find the physical page. The offset is
+// never translated.
+//
+// Entry layout:
+//
+//   63       54 53                          10  9 8  7 6 5 4 3 2 1 0
+//   [ reserved ][   PPN  -- 44 bits          ][RSW][D][A][G][U][X][W][R][V]
+//
+// R/W/X all zero means the entry is a BRANCH -- keep walking. Any of them set
+// makes it a LEAF, and the walk stops. A leaf may appear at any level: at
+// level 0 it maps 4 KiB, at level 1 2 MiB, at level 2 a full 1 GiB.
+// ===========================================================================
+
+const PTE_V: usize = 1 << 0; // valid
+const PTE_R: usize = 1 << 1; // readable
+const PTE_W: usize = 1 << 2; // writable
+const PTE_X: usize = 1 << 3; // executable
+const PTE_A: usize = 1 << 6; // accessed  (hardware sets this)
+const PTE_D: usize = 1 << 7; // dirty     (hardware sets this)
+
+/// Build an entry pointing at physical address `pa`.
+///
+/// The stored field is a page NUMBER, not an address: shift off the low 12
+/// bits (always zero for an aligned page), then shift into position at bit 10.
+fn pte(pa: usize, flags: usize) -> usize {
+    ((pa >> 12) << 10) | flags
+}
+
+/// Build an identity-mapping page table and switch the MMU on.
+///
+/// Identity mapping means virtual X translates to physical X, so nothing
+/// observable changes. That is the point: if the kernel keeps running after
+/// the switch, the table walk is provably correct.
+fn paging_init() {
+    let root = frame_alloc().expect("no frame for the root page table") as *mut usize;
+
+    // CRITICAL: a frame straight off the free list still holds its old
+    // free-list link in the first 8 bytes. Left there, the MMU would read
+    // that stale value as a page table entry and follow it somewhere
+    // arbitrary. Erase the whole frame first.
+    unsafe { core::ptr::write_bytes(root as *mut u8, 0, PAGE_SIZE) };
+
+    // Two 1 GiB leaves in the root table cover the entire machine:
+    //
+    //   slot 0 -> 0x0000_0000..0x3FFF_FFFF   UART, CLINT, PLIC -- devices
+    //   slot 2 -> 0x8000_0000..0xBFFF_FFFF   the kernel and all of RAM
+    //
+    // A and D are pre-set because not every implementation updates them in
+    // hardware; on those, an unset bit faults on first touch.
+    //
+    // TODO: slot 2 is RWX, which violates W^X. Splitting the kernel's code
+    // and data into separate mappings needs finer granularity than a 1 GiB
+    // page, so it waits until this is built out of 4 KiB leaves.
+    unsafe {
+        *root.add(0) = pte(0x0000_0000, PTE_V | PTE_R | PTE_W | PTE_A | PTE_D);
+        *root.add(2) = pte(0x8000_0000, PTE_V | PTE_R | PTE_W | PTE_X | PTE_A | PTE_D);
+    }
+
+    // satp: mode 8 (Sv39) in the top 4 bits, root table's page number below.
+    let satp = (8_usize << 60) | ((root as usize) >> 12);
+
+    // sfence.vma flushes the MMU's cached translations (the TLB). Required
+    // after changing satp, or the hardware may keep using stale answers.
+    //
+    // The instruction AFTER the csrw is already fetched through the MMU. It
+    // only survives because this mapping is an identity map.
+    unsafe {
+        core::arch::asm!(
+            "sfence.vma",
+            "csrw satp, {}",
+            "sfence.vma",
+            in(reg) satp,
+        );
+    }
+
+    // Read satp back. An identity map is invisible by construction, so the
+    // kernel surviving proves nothing on its own -- a silently ignored write
+    // would look identical. This confirms the mode field actually took.
+    let readback: usize;
+    unsafe { core::arch::asm!("csrr {}, satp", out(reg) readback) };
+    println!(
+        "paging: satp = {:#x}  mode={} (8 = Sv39)  root frame = {:#x}",
+        readback,
+        readback >> 60,
+        (readback & 0xfff_ffff_ffff) << 12
+    );
 }
 
 // ===========================================================================
