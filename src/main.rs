@@ -11,6 +11,7 @@
 #![no_std]
 #![no_main]
 
+use core::fmt::{self, Write};
 use core::panic::PanicInfo;
 
 // Pull entry.S into the binary. Its `.text.entry` section is placed at
@@ -57,8 +58,8 @@ pub extern "C" fn kmain(_hartid: usize, _dtb: *const u8) -> ! {
     // Reference: xv6-riscv kernel/uart.c is ~100 lines and does all of this.
     // ================================================================
 
-    puts("rust is convolouted\n");
-    puts("if you see this it worked");
+    let mut uart = Uart;
+    write!(uart, "the answer is {} and in hex {:#x}\n", 42, 42).unwrap();
 
     loop {
         // Wait For Interrupt: idles the core instead of spinning it at 100%.
@@ -81,6 +82,15 @@ fn putchar(c: u8) {
 fn puts(s: &str) {
     for c in s.bytes() {
         putchar(c);
+    }
+}
+
+struct Uart;
+
+impl Write for Uart {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        puts(s);
+        Ok(())
     }
 }
 
