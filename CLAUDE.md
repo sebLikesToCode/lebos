@@ -10,8 +10,9 @@ in Rust, run under QEMU. It is a learning project with a real design thesis
 follow-along. Named for its author, Sebastian LeBlanc; `LeBOS` in prose,
 `lebos` as the crate and binary name.
 
-Status: pre-milestone-2. The build/boot/debug harness works and `_start` runs;
-`kmain` is an empty loop awaiting its first serial write.
+Status: milestone 2 done. Boots under OpenSBI and has working formatted
+output — `putchar` → `puts` → `impl core::fmt::Write for Uart` → `print!` /
+`println!` macros. Next up is trap handling (milestone 3).
 
 ## How to work in this repo
 
@@ -176,8 +177,8 @@ Phases I–III are deliberately conventional — copy xv6's structure; the
 innovation budget is spent at Phase V.
 
 1. ✅ build + boot harness
-2. ⬅ **current** — UART serial output, then `println!` via `core::fmt::Write`
-3. trap/exception handler printing the trap frame
+2. ✅ UART serial output, `println!` via `core::fmt::Write`
+3. ⬅ **current** — trap/exception handler printing the trap frame
 4. timer interrupts
 5. physical frame allocator (parse device tree for the memory map)
 6. virtual memory, Sv39 page tables, higher-half kernel

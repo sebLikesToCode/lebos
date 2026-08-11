@@ -14,6 +14,21 @@
 use core::fmt::{self, Write};
 use core::panic::PanicInfo;
 
+macro_rules! print {
+    ($($arg:tt)*) => {
+        _print(format_args!($($arg)*))
+    };
+}
+
+macro_rules! println {
+    () => {
+        print!("\n")
+    };
+    ($($arg:tt)*) => {
+        print!("{}\n", format_args!($($arg)*))
+    };
+}
+
 // Pull entry.S into the binary. Its `.text.entry` section is placed at
 // 0x80200000 by linker.ld, which is where OpenSBI jumps.
 core::arch::global_asm!(include_str!("entry.S"));
@@ -26,40 +41,9 @@ core::arch::global_asm!(include_str!("entry.S"));
 ///
 /// It must never return -- hence `-> !`.
 #[no_mangle]
-pub extern "C" fn kmain(_hartid: usize, _dtb: *const u8) -> ! {
-    // ================================================================
-    // MILESTONE 2 -- this is yours to write.
-    //
-    // Goal: make the letters "hello" appear in your terminal.
-    //
-    // The UART (the serial port chip) on the QEMU virt board is a 16550,
-    // and it is memory-mapped at physical address 0x1000_0000. Writing a
-    // byte to that address transmits that byte out the serial line, which
-    // QEMU has connected to your terminal via `-serial mon:stdio`.
-    //
-    // So: write the byte 0x48 ('H') to the address 0x1000_0000 and it
-    // appears on screen. That is the entire mechanism. No driver, no
-    // initialisation, no interrupts -- one store instruction.
-    //
-    // What you need to look up:
-    //   - core::ptr::write_volatile, and why a plain `*p = x` is wrong here
-    //     (hint: the optimiser can legally delete stores to memory nothing
-    //     ever reads back, and MMIO is memory nothing ever reads back)
-    //   - why this needs an `unsafe` block, and what you are promising the
-    //     compiler by writing one
-    //
-    // Once a single byte works, in order:
-    //   1. a putchar(c: u8) function
-    //   2. a puts(s: &str) built on it
-    //   3. implement core::fmt::Write for a Uart struct -- this is the
-    //      moment you get println!() with formatting, and it is the single
-    //      biggest quality-of-life jump in the whole project. Do it early.
-    //
-    // Reference: xv6-riscv kernel/uart.c is ~100 lines and does all of this.
-    // ================================================================
-
-    let mut uart = Uart;
-    write!(uart, "the answer is {} and in hex {:#x}\n", 42, 42).unwrap();
+pub extern "C" fn kmain(hartid: usize, dtb: *const u8) -> ! {
+    println!("LeBOS booting");
+    println!("hart {} | dtb at {:#x}", hartid, dtb as usize);
 
     loop {
         // Wait For Interrupt: idles the core instead of spinning it at 100%.
@@ -92,6 +76,11 @@ impl Write for Uart {
         puts(s);
         Ok(())
     }
+}
+
+fn _print(args: fmt::Arguments) {
+    let mut uart = Uart;
+    let _ = uart.write_fmt(args);
 }
 
 /// Where Rust goes when something goes wrong. On a hosted system this unwinds
