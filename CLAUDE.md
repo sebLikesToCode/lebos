@@ -10,13 +10,13 @@ in Rust, run under QEMU. It is a learning project with a real design thesis
 follow-along. Named for its author, Sebastian LeBlanc; `LeBOS` in prose,
 `lebos` as the crate and binary name.
 
-Status: milestone 6a done — **the MMU is on.** Boots under OpenSBI; formatted
-serial output (`putchar` → `puts` → `impl core::fmt::Write for Uart` →
-`println!`); traps via a full 32-register frame saved in `entry.S`; timer
-interrupts at 100 Hz through an SBI `ecall`; a physical frame allocator over a
-range read from the **device tree** (`-m 512M` correctly finds 130504 frames,
-no code change); and an Sv39 identity map built from two 1 GiB leaves, with
-page faults arriving in the milestone 3 trap handler unmodified.
+Status: milestone 6b done — **the MMU is on and W^X is enforced.** Boots under
+OpenSBI; formatted serial output (`putchar` → `puts` → `impl core::fmt::Write
+for Uart` → `println!`); traps via a full 32-register frame saved in `entry.S`;
+timer interrupts at 100 Hz through an SBI `ecall`; a physical frame allocator
+over a range read from the **device tree** (`-m 512M` correctly finds 130504
+frames, no code change); and an Sv39 page table, with page faults arriving in
+the milestone 3 trap handler unmodified.
 
 The map is built from 4 KiB pages by a `map()` that walks all three levels and
 creates missing tables as it descends. Each region carries only the rights it
