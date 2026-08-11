@@ -13,7 +13,7 @@
 
 use core::fmt::{self, Write};
 use core::panic::PanicInfo;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// Timer interrupts since boot. Atomic rather than `static mut` so it stays
 /// correct once there is more than one hart.
@@ -62,6 +62,20 @@ pub extern "C" fn kmain(hartid: usize, dtb: *const u8) -> ! {
 
     println!("LeBOS booting");
     println!("hart {} | dtb at {:#x}", hartid, dtb as usize);
+
+    let free = frame_init();
+    println!(
+        "memory: {} frames free ({} MiB)",
+        free,
+        free * PAGE_SIZE / 1024 / 1024
+    );
+
+    let a = frame_alloc().unwrap();
+    let b = frame_alloc().unwrap();
+    println!("  alloc a={:p}  b={:p}", a, b);
+    frame_free(a);
+    let c = frame_alloc().unwrap();
+    println!("  freed a, next alloc c={:p}", c);
 
     // Schedule the first timer interrupt one tick out.
     sbi_set_timer(now() + TICK_INTERVAL);
@@ -153,6 +167,93 @@ fn sbi_set_timer(when: u64) {
             out("a1") _,
         );
     }
+}
+
+// ===========================================================================
+// Physical frame allocator
+//
+// Hands out 4096-byte pages of physical memory. 4096 because that is the page
+// size of Sv39, the paging scheme milestone 6 uses -- frames of any other size
+// or alignment would be useless for page tables.
+//
+// The free list is threaded through the free pages themselves: the first 8
+// bytes of every free page hold the address of the next free page. Tracking
+// ~31,000 pages therefore costs zero bytes of dedicated memory. Once a page is
+// handed out the caller overwrites that field, which is fine -- the link only
+// has meaning while the page sits on the list.
+// ===========================================================================
+
+const PAGE_SIZE: usize = 4096;
+
+extern "C" {
+    /// Defined by linker.ld as `__kernel_end = .`. There is no data here --
+    /// the symbol's ADDRESS is the value we want, which is why the code below
+    /// takes `&__kernel_end` rather than reading it.
+    static __kernel_end: u8;
+}
+
+/// One past the last usable byte of RAM. The QEMU virt board puts RAM at
+/// 0x8000_0000 and the Makefile boots with `-m 128M`.
+///
+/// Hardcoded on purpose: milestone 5b replaces this by parsing the device tree
+/// at the pointer OpenSBI left in a1, which is the honest way to learn it.
+const RAM_END: usize = 0x8000_0000 + 128 * 1024 * 1024;
+
+/// Head of the free list; 0 means empty.
+///
+/// Atomic only so we can have a mutable global without `static mut`. This is
+/// NOT concurrency-safe: alloc reads the head and then writes it as two
+/// separate steps, so a timer interrupt landing in between could corrupt the
+/// list. Nothing allocates from interrupt context yet. Milestone 9 replaces
+/// this with a real lock.
+static FREE_LIST: AtomicUsize = AtomicUsize::new(0);
+
+/// Build the free list from every page between the end of the kernel image and
+/// the end of RAM. Returns how many pages were added.
+fn frame_init() -> usize {
+    let kernel_end = unsafe { &__kernel_end as *const u8 as usize };
+
+    // Round up to a page boundary. `PAGE_SIZE - 1` is 0xFFF, so `!(PAGE_SIZE-1)`
+    // is ...FFFFF000 -- ANDing with it clears the low 12 bits, rounding DOWN.
+    // Adding 0xFFF first turns that into rounding UP.
+    let mut p = (kernel_end + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+
+    let mut count = 0;
+    while p + PAGE_SIZE <= RAM_END {
+        frame_free(p as *mut u8);
+        p += PAGE_SIZE;
+        count += 1;
+    }
+    count
+}
+
+/// Take a page off the free list. None when memory is exhausted.
+fn frame_alloc() -> Option<*mut u8> {
+    let head = FREE_LIST.load(Ordering::Relaxed);
+    if head == 0 {
+        return None;
+    }
+
+    // Read the link the page is storing, and make that the new head.
+    let next = unsafe { core::ptr::read(head as *const usize) };
+    FREE_LIST.store(next, Ordering::Relaxed);
+
+    Some(head as *mut u8)
+}
+
+/// Put a page back on the free list.
+fn frame_free(page: *mut u8) {
+    let addr = page as usize;
+    assert!(
+        addr % PAGE_SIZE == 0,
+        "frame_free: address not page aligned"
+    );
+
+    // Write the current head into this page's first 8 bytes, then point the
+    // list at this page. Classic linked-list push.
+    let head = FREE_LIST.load(Ordering::Relaxed);
+    unsafe { core::ptr::write(addr as *mut usize, head) };
+    FREE_LIST.store(addr, Ordering::Relaxed);
 }
 
 /// Where Rust goes when something goes wrong. On a hosted system this unwinds

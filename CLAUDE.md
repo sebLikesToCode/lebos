@@ -193,7 +193,8 @@ innovation budget is spent at Phase V.
 2. ✅ UART serial output, `println!` via `core::fmt::Write`
 3. ✅ trap/exception handler printing the trap frame, resuming via sret
 4. ✅ timer interrupts at 100 Hz via SBI, uptime counter
-5. ⬅ **current** — physical frame allocator
+5. ✅ 5a physical frame allocator (free list threaded through free pages)
+   ⬅ **current** — 5b parse the device tree for the real memory map
 5. physical frame allocator (parse device tree for the memory map)
 6. virtual memory, Sv39 page tables, higher-half kernel
 7. kernel heap
