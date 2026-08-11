@@ -10,12 +10,13 @@ in Rust, run under QEMU. It is a learning project with a real design thesis
 follow-along. Named for its author, Sebastian LeBlanc; `LeBOS` in prose,
 `lebos` as the crate and binary name.
 
-Status: milestone 5a done. Boots under OpenSBI; formatted serial output
+Status: milestone 5 done. Boots under OpenSBI; formatted serial output
 (`putchar` → `puts` → `impl core::fmt::Write for Uart` → `println!`); takes
 traps via a full 32-register frame saved in `entry.S`; timer interrupts at
 100 Hz through an SBI `ecall`; and a physical frame allocator handing out
-4096-byte pages. Next: 5b, parsing the device tree for the real memory map
-instead of assuming 128 MiB.
+4096-byte pages over a range read from the **device tree** rather than
+assumed — booting with `-m 512M` correctly finds 130504 frames with no code
+change. Next: milestone 6, virtual memory.
 
 Hard-won details that will bite again if forgotten:
 
@@ -211,9 +212,8 @@ innovation budget is spent at Phase V.
 2. ✅ UART serial output, `println!` via `core::fmt::Write`
 3. ✅ trap/exception handler printing the trap frame, resuming via sret
 4. ✅ timer interrupts at 100 Hz via SBI, uptime counter
-5. ✅ 5a physical frame allocator (free list threaded through free pages)
-   ⬅ **current** — 5b parse the device tree for the real memory map
-6. virtual memory, Sv39 page tables, higher-half kernel
+5. ✅ physical frame allocator + device tree memory map
+6. ⬅ **current** — virtual memory, Sv39 page tables, higher-half kernel
 7. kernel heap
 8. kernel threads + context switch
 9. preemptive scheduler, spinlocks, wait queues — *policy/mechanism split

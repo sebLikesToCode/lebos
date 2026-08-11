@@ -63,7 +63,16 @@ pub extern "C" fn kmain(hartid: usize, dtb: *const u8) -> ! {
     println!("LeBOS booting");
     println!("hart {} | dtb at {:#x}", hartid, dtb as usize);
 
-    let free = frame_init();
+    // Ask the machine how much RAM it has instead of assuming.
+    let (ram_base, ram_size) = dtb_memory(dtb).expect("no memory node in device tree");
+    println!(
+        "ram: {:#x}..{:#x} ({} MiB), per device tree",
+        ram_base,
+        ram_base + ram_size,
+        ram_size / 1024 / 1024
+    );
+
+    let free = frame_init(ram_base + ram_size);
     println!(
         "memory: {} frames free ({} MiB)",
         free,
@@ -170,6 +179,129 @@ fn sbi_set_timer(when: u64) {
 }
 
 // ===========================================================================
+// Device tree (FDT / "flattened device tree")
+//
+// OpenSBI leaves a pointer to this blob in a1 at boot. It describes the whole
+// machine: how much RAM, where the UART is, which interrupt controller exists.
+// Every magic address hardcoded elsewhere in this file is really described
+// here, and eventually should be read from here instead.
+//
+// The layout is a 40-byte header followed by a flat stream of 4-byte tokens:
+//
+//   BEGIN_NODE (1)  followed by a NUL-terminated node name
+//   END_NODE   (2)
+//   PROP       (3)  followed by: data length, name offset, then the data
+//   NOP        (4)  skip
+//   END        (9)  end of the stream
+//
+// Property NAMES live in a separate strings block at the end of the blob; PROP
+// stores an offset into it, because names like "reg" repeat constantly.
+//
+// Two things that will bite: every integer is BIG-endian (RISC-V is little),
+// and every name and data blob is padded up to a 4-byte boundary.
+// ===========================================================================
+
+const FDT_MAGIC: u32 = 0xd00d_feed;
+const FDT_BEGIN_NODE: u32 = 1;
+const FDT_END_NODE: u32 = 2;
+const FDT_PROP: u32 = 3;
+const FDT_NOP: u32 = 4;
+const FDT_END: u32 = 9;
+
+/// Read a big-endian u32. `from_be_bytes` does the byte reversal for us.
+unsafe fn be32(p: *const u8) -> u32 {
+    u32::from_be_bytes([*p, *p.add(1), *p.add(2), *p.add(3)])
+}
+
+/// Read a big-endian u64.
+unsafe fn be64(p: *const u8) -> u64 {
+    let mut v = 0u64;
+    for i in 0..8 {
+        v = (v << 8) | *p.add(i) as u64;
+    }
+    v
+}
+
+/// Length of a NUL-terminated string, not counting the NUL.
+unsafe fn cstr_len(p: *const u8) -> usize {
+    let mut n = 0;
+    while *p.add(n) != 0 {
+        n += 1;
+    }
+    n
+}
+
+/// Does the NUL-terminated string at `p` begin with `s`?
+unsafe fn cstr_starts_with(p: *const u8, s: &str) -> bool {
+    s.as_bytes()
+        .iter()
+        .enumerate()
+        .all(|(i, &b)| *p.add(i) == b)
+}
+
+/// Is the NUL-terminated string at `p` exactly `s`?
+unsafe fn cstr_eq(p: *const u8, s: &str) -> bool {
+    cstr_starts_with(p, s) && *p.add(s.len()) == 0
+}
+
+/// Walk the device tree looking for the `memory` node, and return its
+/// (base address, size) from the `reg` property.
+///
+/// Returns None if the blob is not a device tree or has no memory node.
+fn dtb_memory(dtb: *const u8) -> Option<(usize, usize)> {
+    unsafe {
+        if be32(dtb) != FDT_MAGIC {
+            return None;
+        }
+
+        let off_struct = be32(dtb.add(8)) as usize; // where the token stream starts
+        let off_strings = be32(dtb.add(12)) as usize; // where property names live
+
+        let mut p = dtb.add(off_struct);
+        let mut in_memory = false;
+
+        loop {
+            let token = be32(p);
+            p = p.add(4);
+
+            match token {
+                FDT_BEGIN_NODE => {
+                    // Nodes are named like "memory@80000000" -- the part after
+                    // the @ is the address, so match on the prefix.
+                    in_memory = cstr_starts_with(p, "memory@");
+                    // Skip the name, rounded up to a 4-byte boundary. Same
+                    // trick as page alignment, one size down.
+                    let n = cstr_len(p) + 1;
+                    p = p.add((n + 3) & !3);
+                }
+
+                FDT_END_NODE => in_memory = false,
+
+                FDT_PROP => {
+                    let len = be32(p) as usize;
+                    let nameoff = be32(p.add(4)) as usize;
+                    p = p.add(8);
+
+                    let name = dtb.add(off_strings + nameoff);
+                    if in_memory && cstr_eq(name, "reg") && len >= 16 {
+                        // reg = <base_hi base_lo size_hi size_lo>, i.e. two
+                        // big-endian 64-bit values back to back.
+                        return Some((be64(p) as usize, be64(p.add(8)) as usize));
+                    }
+
+                    p = p.add((len + 3) & !3);
+                }
+
+                FDT_NOP => {}
+
+                FDT_END => return None, // walked the whole tree, no memory node
+                _ => return None,       // malformed blob
+            }
+        }
+    }
+}
+
+// ===========================================================================
 // Physical frame allocator
 //
 // Hands out 4096-byte pages of physical memory. 4096 because that is the page
@@ -192,13 +324,6 @@ extern "C" {
     static __kernel_end: u8;
 }
 
-/// One past the last usable byte of RAM. The QEMU virt board puts RAM at
-/// 0x8000_0000 and the Makefile boots with `-m 128M`.
-///
-/// Hardcoded on purpose: milestone 5b replaces this by parsing the device tree
-/// at the pointer OpenSBI left in a1, which is the honest way to learn it.
-const RAM_END: usize = 0x8000_0000 + 128 * 1024 * 1024;
-
 /// Head of the free list; 0 means empty.
 ///
 /// Atomic only so we can have a mutable global without `static mut`. This is
@@ -209,8 +334,8 @@ const RAM_END: usize = 0x8000_0000 + 128 * 1024 * 1024;
 static FREE_LIST: AtomicUsize = AtomicUsize::new(0);
 
 /// Build the free list from every page between the end of the kernel image and
-/// the end of RAM. Returns how many pages were added.
-fn frame_init() -> usize {
+/// `ram_end`. Returns how many pages were added.
+fn frame_init(ram_end: usize) -> usize {
     let kernel_end = unsafe { &__kernel_end as *const u8 as usize };
 
     // Round up to a page boundary. `PAGE_SIZE - 1` is 0xFFF, so `!(PAGE_SIZE-1)`
@@ -219,7 +344,7 @@ fn frame_init() -> usize {
     let mut p = (kernel_end + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
 
     let mut count = 0;
-    while p + PAGE_SIZE <= RAM_END {
+    while p + PAGE_SIZE <= ram_end {
         frame_free(p as *mut u8);
         p += PAGE_SIZE;
         count += 1;
