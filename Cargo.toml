@@ -1,0 +1,22 @@
+[package]
+name = "os"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "kernel"
+path = "src/main.rs"
+test = false
+bench = false
+
+# Kernels must abort, never unwind: there is no runtime to unwind into.
+[profile.dev]
+panic = "abort"
+opt-level = 1     # opt-level = 0 generates enormous stack frames that can
+                  # overflow our small boot stack before paging is set up.
+
+[profile.release]
+panic = "abort"
+lto = true
+
+[dependencies]

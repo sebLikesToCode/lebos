@@ -1,0 +1,6 @@
+# Pinned so the build doesn't change under you. Stable is deliberate: nightly
+# breaks kernels for unrelated reasons and you don't need it for rv64 yet.
+[toolchain]
+channel = "stable"
+components = ["rust-src", "llvm-tools", "rustfmt", "clippy"]
+targets = ["riscv64gc-unknown-none-elf"]

@@ -1,0 +1,28 @@
+# Applies to any `cargo build` run inside this directory, so you never have to
+# type --target. Delete this and you'll accidentally build a Linux binary.
+[build]
+target = "riscv64gc-unknown-none-elf"
+
+[target.riscv64gc-unknown-none-elf]
+rustflags = [
+    # Use our linker script instead of the default one. This is what decides
+    # that the kernel lives at 0x8020_0000 -- see linker.ld.
+    "-C", "link-arg=-Tlinker.ld",
+    # Don't let the linker garbage-collect our boot code just because nothing
+    # appears to call it.
+    "-C", "link-arg=--no-gc-sections",
+]
+
+# `cargo run` boots the kernel in QEMU. See the Makefile for the same command
+# with debugging variants.
+runner = """
+qemu-system-riscv64
+    -machine virt
+    -cpu rv64
+    -smp 1
+    -m 128M
+    -nographic
+    -serial mon:stdio
+    -bios default
+    -kernel
+"""

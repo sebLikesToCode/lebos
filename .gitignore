@@ -1,0 +1,6 @@
+/target
+Cargo.lock
+.idea/
+qemu.log
+virt.dtb
+virt.dts
