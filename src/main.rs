@@ -182,8 +182,14 @@ extern "C" fn trap_handler(frame: &mut TrapFrame) {
     let code = scause & 0xff;
 
     if is_interrupt && code == 5 {
-        // Supervisor timer. It is one-shot, so rearm it or it never fires
-        // again.
+        // Supervisor timer. Rearming is not optional and not just about
+        // scheduling the next tick -- it is how we ACKNOWLEDGE this one.
+        //
+        // The timer interrupt is LEVEL-triggered: the condition is
+        // `time >= timecmp`, and `time` only counts up, so once it fires the
+        // signal stays asserted forever. Returning without pushing timecmp
+        // into the future means the CPU re-traps at the very next instruction
+        // boundary, forever. Measured: ~165,000 ticks per second instead of 1.
         sbi_set_timer(now() + TIMER_HZ);
         println!("tick");
 
