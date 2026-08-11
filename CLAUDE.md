@@ -213,6 +213,23 @@ The fix is an owning `struct Frame(*mut u8)` with a `Drop` impl that returns
 the page, making double-free a compile error. Deferred until after milestone 6,
 so page tables and frames can be wrapped together once the shape is known.
 
+**The compatibility story (his idea, 2026-08-11):** ship a familiar-looking
+files app so users get what they expect while being eased into the store. The
+reconciliation is that **a "folder" is a saved query** — opening one runs it,
+dragging something in adds the attribute that makes it match, removing it drops
+that attribute, and one object can appear in many folders with no copies and no
+canonical location. Gmail is the precedent: labels, not folders, and hundreds
+of millions of users migrated without noticing.
+
+This lives in **userspace, and the dependency arrow points one way only**: the
+view may render the store; nothing in the store may know the view exists. The
+moment a program depends on path semantics, files have been reinvented.
+
+**Open question, decide by milestone 12: what does "delete" mean?** In a
+filesystem an object is garbage when nothing links to it from the root. With no
+root and no hierarchy, reachability is undefined. The answer shapes the whole
+storage layer.
+
 ## Design thesis invariants to defend:
 
 - *No hierarchy, ever.* The pressure to add "just a little" path-like nesting
