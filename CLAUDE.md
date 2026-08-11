@@ -10,14 +10,14 @@ in Rust, run under QEMU. It is a learning project with a real design thesis
 follow-along. Named for its author, Sebastian LeBlanc; `LeBOS` in prose,
 `lebos` as the crate and binary name.
 
-Status: milestone 3 done. Boots under OpenSBI, has formatted serial output
-(`putchar` → `puts` → `impl core::fmt::Write for Uart` → `println!`), and
-takes traps: `trap_entry` in entry.S saves a full 32-register frame, calls
-into Rust, restores, and `sret`s. Illegal instructions are caught, reported,
-stepped over, and execution resumes. Next up is timer interrupts
-(milestone 4).
+Status: milestone 5a done. Boots under OpenSBI; formatted serial output
+(`putchar` → `puts` → `impl core::fmt::Write for Uart` → `println!`); takes
+traps via a full 32-register frame saved in `entry.S`; timer interrupts at
+100 Hz through an SBI `ecall`; and a physical frame allocator handing out
+4096-byte pages. Next: 5b, parsing the device tree for the real memory map
+instead of assuming 128 MiB.
 
-Two hard-won details that will bite again if forgotten:
+Hard-won details that will bite again if forgotten:
 
 - `stvec`'s low two bits are a MODE field, so the trap vector must be at
   least 4-byte aligned. `riscv64gc` functions are only 2-byte aligned
@@ -26,6 +26,12 @@ Two hard-won details that will bite again if forgotten:
 - `sepc` points **at** the faulting instruction, not past it. The handler
   must advance it or the CPU re-executes the fault forever. Instruction
   length is 4 bytes if the low two bits are `0b11`, else 2.
+- Interrupts get the opposite treatment: **never** advance `sepc` for one.
+  The instruction there has not run yet.
+- The timer interrupt is **level-triggered** on `time >= timecmp`. Rearming
+  it is how you acknowledge it, not merely how you schedule the next one —
+  skip the rearm and it re-fires at every instruction boundary forever
+  (measured: 494k ticks in 3 seconds).
 
 ## How to work in this repo
 
@@ -195,7 +201,6 @@ innovation budget is spent at Phase V.
 4. ✅ timer interrupts at 100 Hz via SBI, uptime counter
 5. ✅ 5a physical frame allocator (free list threaded through free pages)
    ⬅ **current** — 5b parse the device tree for the real memory map
-5. physical frame allocator (parse device tree for the memory map)
 6. virtual memory, Sv39 page tables, higher-half kernel
 7. kernel heap
 8. kernel threads + context switch
