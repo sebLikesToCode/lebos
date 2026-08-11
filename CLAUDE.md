@@ -34,6 +34,24 @@ Hard-won details that will bite again if forgotten:
   skip the rearm and it re-fires at every instruction boundary forever
   (measured: 494k ticks in 3 seconds).
 
+## Returning after a break
+
+Work happens in bursts — roughly two weeks on, two weeks off. Assume the
+author has forgotten the details and re-orient before writing any code:
+
+1. `make run` — watch it boot. Seeing it work rebuilds more context in 30
+   seconds than reading does in an hour.
+2. Read the **Status** line above, then the last 5 commit messages
+   (`git log --oneline -5`); they are written to explain *why*, not just what.
+3. Check `git status` — the tree should be clean and booting. If it is not,
+   that is the first thing to fix, before anything else.
+4. Only then pick up the current milestone.
+
+**Never let a burst end on a non-booting commit.** A two-week gap plus a
+broken tree is the most likely way this project dies, and it is entirely
+avoidable — commit a working partial state instead, and note in the message
+what was mid-flight.
+
 ## How to work in this repo
 
 The owner is learning systems programming and Rust by building this. That
