@@ -19,6 +19,23 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 /// correct once there is more than one hart.
 static TICKS: AtomicU64 = AtomicU64::new(0);
 
+/// Printed at boot, directly under OpenSBI's banner and deliberately in the
+/// same style.
+///
+/// A raw string (`r"..."`) so the backslashes stay backslashes instead of
+/// being read as escape sequences.
+///
+/// Legal note for the confused: LeBOS is also a French womenswear label. This
+/// is the other one.
+const BANNER: &str = r"
+ _          ____   ___  ____
+| |    ___ | __ ) / _ \/ ___|
+| |   / _ \|  _ \| | | \___ \
+| |__|  __/| |_) | |_| |___) |
+|_____\___||____/ \___/|____/
+        no files. no paths. no regrets.
+";
+
 macro_rules! print {
     ($($arg:tt)*) => {
         _print(format_args!($($arg)*))
@@ -60,7 +77,7 @@ pub extern "C" fn kmain(hartid: usize, dtb: *const u8) -> ! {
         core::arch::asm!("csrw stvec, {}", in(reg) trap_entry as *const () as usize);
     }
 
-    println!("LeBOS booting");
+    println!("{}", BANNER);
     println!("hart {} | dtb at {:#x}", hartid, dtb as usize);
 
     // Ask the machine how much RAM it has instead of assuming.
