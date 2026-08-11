@@ -10,13 +10,16 @@ in Rust, run under QEMU. It is a learning project with a real design thesis
 follow-along. Named for its author, Sebastian LeBlanc; `LeBOS` in prose,
 `lebos` as the crate and binary name.
 
-Status: milestone 5 done. Boots under OpenSBI; formatted serial output
-(`putchar` → `puts` → `impl core::fmt::Write for Uart` → `println!`); takes
-traps via a full 32-register frame saved in `entry.S`; timer interrupts at
-100 Hz through an SBI `ecall`; and a physical frame allocator handing out
-4096-byte pages over a range read from the **device tree** rather than
-assumed — booting with `-m 512M` correctly finds 130504 frames with no code
-change. Next: milestone 6, virtual memory.
+Status: milestone 6a done — **the MMU is on.** Boots under OpenSBI; formatted
+serial output (`putchar` → `puts` → `impl core::fmt::Write for Uart` →
+`println!`); traps via a full 32-register frame saved in `entry.S`; timer
+interrupts at 100 Hz through an SBI `ecall`; a physical frame allocator over a
+range read from the **device tree** (`-m 512M` correctly finds 130504 frames,
+no code change); and an Sv39 identity map built from two 1 GiB leaves, with
+page faults arriving in the milestone 3 trap handler unmodified.
+
+Next: 6b — rebuild the map at 4 KiB granularity so code and data can be
+separated, enforce W^X, then move the kernel to the higher half.
 
 Hard-won details that will bite again if forgotten:
 
@@ -57,10 +60,19 @@ what was mid-flight.
 The owner is learning systems programming and Rust by building this. That
 changes the job:
 
-- **He designs, you translate.** Pose exercises as Python/JS scaffolds with
-  holes to fill; he sketches the logic in a language he already thinks in and
-  you turn it into Rust, explaining what changed. Dictating Rust for him to
-  retype teaches nothing — the algorithm is the lesson, not the syntax.
+- **Explain, then write it yourself.** Dictating Rust for him to retype teaches
+  nothing — the algorithm is the lesson, not the syntax. He sketches logic in
+  Python/JS when he wants to; translate it and say what changed.
+- **Do NOT hand him blank `???` scaffolds to fill in.** Tried and failed:
+  recognition and generation are different skills, and stalling on an empty
+  function body reads to him as "I can't grasp this" when he has already
+  reasoned correctly about the same thing minutes earlier. Don't quiz what he
+  has demonstrably understood.
+- **Always give an explicit picture↔code mapping table** when using an analogy.
+  State outright that `free_list` IS the door note and `mem[X]` IS the note
+  inside box X. He stalled on the allocator purely because that row was
+  missing. When he says he's lost, ask which *symbol* failed to map before
+  re-explaining the concept.
 - **Write the mechanical parts outright**: assembly, register save/restore,
   linker scripts, build tooling, long boilerplate.
 - **Pitch explanations low.** He knows NAND gates, registers, and clocks
