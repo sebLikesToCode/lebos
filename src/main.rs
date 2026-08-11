@@ -90,7 +90,8 @@ fn _print(args: fmt::Arguments) {
 /// carries the file, line, and message of the panic, and having that visible
 /// will save you many hours.
 #[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
+fn panic(info: &PanicInfo) -> ! {
+    println!("PANIC! AT THE KERNEL: {}", info);
     loop {
         unsafe { core::arch::asm!("wfi") };
     }
