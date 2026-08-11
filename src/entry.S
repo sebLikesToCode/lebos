@@ -59,13 +59,61 @@ _start:
 # Watch out: RISC-V .align takes a POWER OF TWO. `.align 2` means 2^2 = 4
 # bytes, not 2 bytes.
 #
-# Right now this only forwards to Rust, which is safe solely because
-# trap_handler never returns. A trap that resumes the interrupted code must
-# first save all 31 general-purpose registers here -- the hardware saves none
-# of them -- and restore them before sret. That is the next step.
+# The hardware saves NO general-purpose registers on a trap. It only sets
+# sepc, scause, and stval. Every one of the 32 registers still holds whatever
+# the interrupted code had in it, and Rust will start clobbering them the
+# instant it runs. So this code saves all of them to the stack, calls Rust,
+# and puts them back.
+#
+# That block of saved registers is the "trap frame". Its layout is exactly
+# x0..x31 in register-number order, 8 bytes each, 256 bytes total, so Rust can
+# view it as [usize; 32] and index it by register number.
+#
+# A note on stacks: this runs on whatever stack was already active, which is
+# fine while everything is kernel code. Once user mode exists (milestone 10),
+# trapping from userspace means sp holds a USER stack pointer that cannot be
+# trusted or even relied on to be mapped -- at that point this has to swap to
+# a known-good kernel stack via the sscratch CSR first.
 # ---------------------------------------------------------------------------
+
+.macro SAVE_GP i
+        sd      x\i, \i*8(sp)
+.endm
+
+.macro LOAD_GP i
+        ld      x\i, \i*8(sp)
+.endm
+
 .section .text
 .align 2
 .globl trap_entry
 trap_entry:
-        j       trap_handler
+        addi    sp, sp, -256
+
+        # Save everything except x2 (sp), which we just changed. Its original
+        # value is reconstructed a few instructions down.
+        .irp n, 0,1,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+        SAVE_GP \n
+        .endr
+
+        # Record the interrupted code's sp into its slot. Safe to clobber t0
+        # (x5) here because it was saved by the loop above.
+        addi    t0, sp, 256
+        sd      t0, 2*8(sp)
+
+        # First argument to trap_handler: a pointer to the frame we just built.
+        mv      a0, sp
+        call    trap_handler
+
+        # Restore. x0 is skipped because it is hardwired to zero, and x2
+        # because the stack adjustment below is what restores sp.
+        .irp n, 1,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+        LOAD_GP \n
+        .endr
+
+        addi    sp, sp, 256
+
+        # Return to sepc and restore the pre-trap interrupt-enable state.
+        # NOT `ret` -- that would jump to ra, which belongs to the interrupted
+        # code and has nothing to do with where the trap happened.
+        sret

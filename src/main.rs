@@ -58,9 +58,11 @@ pub extern "C" fn kmain(hartid: usize, dtb: *const u8) -> ! {
     println!("LeBOS booting");
     println!("hart {} | dtb at {:#x}", hartid, dtb as usize);
 
+    println!("about to execute an illegal instruction");
     unsafe {
         core::arch::asm!("unimp");
     }
+    println!("...and we survived it");
 
     loop {
         // Wait For Interrupt: idles the core instead of spinning it at 100%.
@@ -114,8 +116,13 @@ fn panic(info: &PanicInfo) -> ! {
     }
 }
 
+#[repr(C)]
+pub struct TrapFrame {
+    pub x: [usize; 32],
+}
+
 #[no_mangle]
-extern "C" fn trap_handler() -> ! {
+extern "C" fn trap_handler(frame: &mut TrapFrame) {
     let scause: usize;
     let sepc: usize;
     let stval: usize;
@@ -127,11 +134,20 @@ extern "C" fn trap_handler() -> ! {
     }
 
     println!("*** TRAP ***");
-    println!("  scause {:#x}", scause);
-    println!("  sepc   {:#x}", sepc);
-    println!("  stval  {:#x}", stval);
+    println!(
+        "  scause {:#x}  sepc {:#x}  stval {:#x}",
+        scause, sepc, stval
+    );
+    println!("  ra {:#x}  sp {:#x}", frame.x[1], frame.x[2]);
 
-    loop {
-        unsafe { core::arch::asm!("wfi") };
+    // Step over the faulting instruction, or we return straight back onto it
+    // and trap forever. RISC-V instructions are 4 bytes UNLESS the low two
+    // bits are something other than 0b11, which marks a 2-byte compressed
+    // instruction. `unimp` is compressed -- it is literally 0x0000.
+    let insn = unsafe { core::ptr::read_volatile(sepc as *const u16) };
+    let len = if insn & 0b11 == 0b11 { 4 } else { 2 };
+
+    unsafe {
+        core::arch::asm!("csrw sepc, {}", in(reg) sepc + len);
     }
 }
