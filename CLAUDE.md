@@ -10,9 +10,22 @@ in Rust, run under QEMU. It is a learning project with a real design thesis
 follow-along. Named for its author, Sebastian LeBlanc; `LeBOS` in prose,
 `lebos` as the crate and binary name.
 
-Status: milestone 2 done. Boots under OpenSBI and has working formatted
-output — `putchar` → `puts` → `impl core::fmt::Write for Uart` → `print!` /
-`println!` macros. Next up is trap handling (milestone 3).
+Status: milestone 3 done. Boots under OpenSBI, has formatted serial output
+(`putchar` → `puts` → `impl core::fmt::Write for Uart` → `println!`), and
+takes traps: `trap_entry` in entry.S saves a full 32-register frame, calls
+into Rust, restores, and `sret`s. Illegal instructions are caught, reported,
+stepped over, and execution resumes. Next up is timer interrupts
+(milestone 4).
+
+Two hard-won details that will bite again if forgotten:
+
+- `stvec`'s low two bits are a MODE field, so the trap vector must be at
+  least 4-byte aligned. `riscv64gc` functions are only 2-byte aligned
+  (compressed instructions) and Rust cannot align a function, which is why
+  `trap_entry` lives in assembly.
+- `sepc` points **at** the faulting instruction, not past it. The handler
+  must advance it or the CPU re-executes the fault forever. Instruction
+  length is 4 bytes if the low two bits are `0b11`, else 2.
 
 ## How to work in this repo
 
@@ -178,8 +191,8 @@ innovation budget is spent at Phase V.
 
 1. ✅ build + boot harness
 2. ✅ UART serial output, `println!` via `core::fmt::Write`
-3. ⬅ **current** — trap/exception handler printing the trap frame
-4. timer interrupts
+3. ✅ trap/exception handler printing the trap frame, resuming via sret
+4. ⬅ **current** — timer interrupts
 5. physical frame allocator (parse device tree for the memory map)
 6. virtual memory, Sv39 page tables, higher-half kernel
 7. kernel heap
