@@ -575,7 +575,13 @@ fn sbi_set_timer(when: u64) {
             "ecall",
             in("a7") 0x5449_4D45_usize,
             in("a6") 0_usize,
-            in("a0") when,
+            // BOTH a0 and a1 are clobbered, not just a1. An SBI call returns
+            // `sbiret { error, value }` in a0 and a1, so OpenSBI overwrites
+            // a0. Declaring it `in("a0")` promised the compiler the register
+            // survives the call, which let it keep a live value there and
+            // reuse OpenSBI's error code afterwards -- as a pointer, in at
+            // least one case.
+            inout("a0") when => _,
             out("a1") _,
         );
     }

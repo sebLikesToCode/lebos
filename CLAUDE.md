@@ -93,52 +93,51 @@ Written as `Vec<Thread>` it crashed: spawning the fifth thread grew the Vec past
 capacity 4, every suspended thread's context moved, and the pointers became
 freed memory. Boxing lets the Vec move while the threads never do.
 
-**OPEN BUG, found 2026-08-12. Heavily narrowed, not solved.**
+**OPEN BUG, found 2026-08-12. One real cause fixed, at least one remains.**
 
-Only reproduces with `TICK_INTERVAL` at 500 us or shorter; at the shipped 10 ms
-it never happens, so `make run` is green. Must be fixed before milestone 10 --
-user mode multiplies the trap rate.
+Only reproduces with `TICK_INTERVAL` at 500 us or shorter; green at the shipped
+10 ms. Must be finished before relying on user mode, which multiplies traps.
 
-**Minimal reproduction:** a 500 us quantum plus any thread doing
-`println!` then `yield_now()`. No locks, no racer threads, and no printing from
-the timer handler are needed.
+**Reproduction:** 500 us quantum plus any thread doing `println!` then
+`yield_now()`.
 
-**Signature:** a *caller-saved* register holding a live pointer contains garbage
-after a preemption. Seen twice, in different code:
+**Signature:** a caller-saved register holding a live pointer contains garbage,
+seen in `puts` (a1, the `&str` pointer) and in `SpinLock::lock` (a3, the lock
+address).
 
-    lbu a5, 0x0(a1)         inside puts; a1 is the &str pointer  -> stval 0x34f9e5eb444a00a1
-    amoor.w.aq a2, a0, (a3) inside SpinLock::lock; a3 = &lock    -> stval 0x10
+**FIXED -- one real cause.** `sbi_set_timer` declared `in("a0") when`, but an
+SBI call returns `sbiret { error, value }` in **a0 and a1**, so OpenSBI
+overwrites a0. `in(...)` promises the compiler the register survives, letting it
+keep a live value there and reuse OpenSBI's error code afterwards -- as a
+pointer. Now `inout("a0") when => _`. This made the crash take substantially
+longer, so it was real, but did not eliminate it.
 
-Caller-saved registers are preserved by the **trap frame**, not by `switch`.
+**Ruled out, each by direct measurement:**
 
-**Ruled out, each by direct test:**
+- the spinlock and racer threads -- reproduces with neither
+- thread stack overflow -- bottom-of-stack canaries intact at fault time
+- boot stack overflow -- `sp` near the TOP of the boot stack
+- stack size -- still faults at 128 KiB
+- the handler's own `println!` -- still faults with the handler silent
+- `trap_entry`'s save/restore -- audited from the disassembly: x0,x1,x3..x31
+  each stored to slot `x*8`, x1,x3..x31 each loaded from the same slots, x0 and
+  x2 correctly excluded, one deliberate foreign store stashing the original sp
+- **the trap frame being written while parked** -- a tripwire that snapshots all
+  32 slots on handler entry and compares on exit **never fired.** The frame is
+  intact through the whole handler, including across the switch away and back.
 
-- The spinlock and racer threads -- reproduces with neither.
-- Thread stack overflow -- a canary at the bottom of every thread stack is
-  still intact when the fault hits.
-- Boot stack overflow -- `sp` at fault time sits near the TOP of the boot
-  stack, i.e. main is shallow.
-- Stack size -- still faults with 128 KiB stacks instead of 16 KiB.
-- The handler's own `println!` -- still faults with the handler silent.
-- **`trap_entry`'s save/restore lists** -- audited from the disassembly, not by
-  reading the macro. x0,x1,x3..x31 are each stored to their own slot `x*8`;
-  x1,x3..x31 are each loaded from the same slot. x0 saved and not restored
-  (correct, hardwired). x2 in neither (correct, the `addi` restores it). The
-  one store to a foreign slot is the deliberate `sd t0, 16(sp)` stashing the
-  original sp. **The frame is correct.**
+That last one matters: it kills the entire "preemption corrupts the interrupted
+code's registers" model. The frame is fine, so the corruption is in the
+**handler's own register state**, i.e. in what Rust believes about an inline asm
+block.
 
-**Leading hypothesis:** the handler takes longer than the quantum, so the timer
-is already overdue when `sret` runs and fires again immediately. Back-to-back
-traps at the same stack location should be harmless, so something in that path
-is not re-entrant. Unproven.
+**Next step, and it is now a narrow one: audit every `asm!` block in the kernel
+for missing clobbers or missing `options`.** `sbi_set_timer` had exactly this
+bug and there may be another. Every block that transfers control elsewhere
+(`ecall`, `sret`, anything jumping) is a candidate.
 
-**Next diagnostic -- do this one, it is decisive:** `make debug`, then set a
-hardware watchpoint on the trap frame slot for the corrupted register (a1 is
-x11, so offset 11*8 = 88 from the frame base) and let GDB catch whoever writes
-it. That identifies the corrupting instruction directly instead of inferring
-from the victim.
+Next: milestone 10b, sret into user mode.
 
-Next: milestone 10, user mode.
 
 
 
