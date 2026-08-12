@@ -62,7 +62,26 @@ owning a 16 KiB stack; `thread_spawn` forges a context whose `ra` points at the
 entry function, so the first switch "returns" into a function never called.
 Cooperative -- `yield_now()` round-robins.
 
-Next: milestone 9, preemption.
+The timer branch of the trap handler now calls `yield_now()`, so a thread that
+never yields is switched away anyway -- verified with `thread_greedy`, which
+contains no yield and still shares the CPU. Switching from inside a trap works
+because the trap frame lives on that thread's stack and rides along in the
+saved context.
+
+New threads start at `thread_start` in entry.S rather than their entry function
+directly: preemption means a thread's first scheduling can happen inside a trap
+handler where the hardware cleared `sstatus.SIE`, and a thread that began there
+would never be preempted again. The trampoline sets SIE and jumps to the real
+entry, which it finds in `s0`.
+
+`yield_now()` brackets the switch with `intr_off()`/`intr_on()` -- a lock in
+everything but name, which 9b replaces.
+
+**Order matters in kmain_high:** the timer must be armed BEFORE the scratch
+zone. It was not, and a greedy thread monopolising the CPU looked exactly like
+a scheduler bug when the real cause was that no timer had ever been scheduled.
+
+Next: 9b, real spinlocks.
 
 Hard-won details that will bite again if forgotten:
 
@@ -349,7 +368,8 @@ innovation budget is spent at Phase V.
    ✅ 6c the kernel executes in the higher half and the identity map is gone
 7. ✅ kernel heap: free list, first fit, splitting, two-way coalescing
 8. ✅ kernel threads + cooperative context switch
-9. ⬅ **current** — preemptive scheduler, spinlocks, wait queues
+9. ✅ 9a preemption -- the timer forces switches
+   ⬅ **current** 9b spinlocks that disable interrupts
 8. kernel threads + context switch
 10. user mode + syscalls
 11. process creation

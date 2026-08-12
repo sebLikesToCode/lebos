@@ -322,13 +322,33 @@ extern "C" fn kmain_high() -> ! {
         println!("heap: {} free block, {} bytes free (all released)", n2, f2);
     }
 
+    // Schedule the first timer interrupt one tick out.
+    //
+    // This has to happen BEFORE the scratch zone, or experiments run on a
+    // kernel where no timer has ever been armed -- which silently disables
+    // preemption and made a greedy thread look like a scheduler bug.
+    sbi_set_timer(now() + TICK_INTERVAL);
+
+    // Two separate enables, both required:
+    //   sie bit 5  (STIE) -- allow supervisor timer interrupts specifically
+    //   sstatus bit 1 (SIE) -- the master interrupt enable
+    //
+    // `csrs` sets the given bits and leaves the rest of the register alone.
+    // (`csrw` would overwrite the whole thing and destroy unrelated state;
+    //  `csrc` clears bits.)
+    unsafe {
+        core::arch::asm!("csrs sie, {}", in(reg) 1_usize << 5);
+        core::arch::asm!("csrs sstatus, {}", in(reg) 1_usize << 1);
+    }
+
     // =====================================================================
     //  SCRATCH ZONE
     //
     //  Put experiments HERE, in src/main2.rs, then `make play`.
     //
-    //  By this point everything is up: paging, the heap, println!, traps.
-    //  Code here runs once, before the idle loop below.
+    //  By this point everything is up: paging, the heap, println!, traps,
+    //  AND the timer, so preemption is live. Code here runs once, before the
+    //  idle loop below.
     //
     //  This marker lives in main.rs so that `make resync` always gives you a
     //  fresh copy of it. Nothing you write inside it is precious --
@@ -345,32 +365,21 @@ extern "C" fn kmain_high() -> ! {
     threads_init();
     thread_spawn("alpha", thread_alpha);
     thread_spawn("beta", thread_beta);
+    thread_spawn("greedy", thread_greedy);
 
-    println!("threads: spawned alpha and beta; main will now take turns");
+    println!("threads: spawned alpha, beta and greedy (which never yields)");
     for round in 0..4 {
         println!("[main ] round {}", round);
         yield_now();
     }
-    println!("threads: back in {}, all three took turns", current_name());
+    println!(
+        "threads: back in {} -- greedy is now preempted forever",
+        current_name()
+    );
 
     // =====================================================================
     //  END SCRATCH ZONE
     // =====================================================================
-
-    // Schedule the first timer interrupt one tick out.
-    sbi_set_timer(now() + TICK_INTERVAL);
-
-    // Two separate enables, both required:
-    //   sie bit 5  (STIE) -- allow supervisor timer interrupts specifically
-    //   sstatus bit 1 (SIE) -- the master interrupt enable
-    //
-    // `csrs` sets the given bits and leaves the rest of the register alone.
-    // (`csrw` would overwrite the whole thing and destroy unrelated state;
-    //  `csrc` clears bits.)
-    unsafe {
-        core::arch::asm!("csrs sie, {}", in(reg) 1_usize << 5);
-        core::arch::asm!("csrs sstatus, {}", in(reg) 1_usize << 1);
-    }
 
     loop {
         // Wait For Interrupt: idles the core instead of spinning it at 100%.
@@ -399,6 +408,22 @@ extern "C" fn thread_beta() -> ! {
     }
     loop {
         yield_now();
+    }
+}
+
+/// A thread that never yields, on purpose.
+///
+/// Under cooperative scheduling this would own the CPU forever and freeze the
+/// machine -- the Windows 3.1 failure mode. If anything else prints after this
+/// starts, preemption is real.
+extern "C" fn thread_greedy() -> ! {
+    let mut spins: u64 = 0;
+    loop {
+        spins = spins.wrapping_add(1);
+        if spins % 4_000_000 == 0 {
+            println!("[greedy] {}M spins, never yielded once", spins / 1_000_000);
+        }
+        // Note the absence of yield_now(). That is the whole point.
     }
 }
 
@@ -1072,6 +1097,26 @@ extern "C" {
     /// Save the current registers into `old`, load `new`, and return into
     /// whatever thread `new` belongs to.
     fn switch(old: *mut Context, new: *const Context);
+
+    /// Where a new thread begins: enables interrupts, then jumps to the entry
+    /// function held in s0. See entry.S for why the indirection is required.
+    fn thread_start();
+}
+
+/// Turn interrupts off, reporting whether they had been on.
+///
+/// `csrrci` reads sstatus and clears bit 1 (SIE) in a single instruction, so
+/// there is no window where an interrupt could land between the read and the
+/// write.
+fn intr_off() -> bool {
+    let old: usize;
+    unsafe { core::arch::asm!("csrrci {}, sstatus, 2", out(reg) old) };
+    old & 2 != 0
+}
+
+/// Turn interrupts back on.
+fn intr_on() {
+    unsafe { core::arch::asm!("csrsi sstatus, 2") };
 }
 
 struct Thread {
@@ -1116,8 +1161,11 @@ fn thread_spawn(name: &'static str, entry: extern "C" fn() -> !) {
     let top = (stack.as_mut_ptr() as usize + STACK_SIZE) & !15;
 
     let mut ctx = Context::zeroed();
-    ctx.ra = entry as usize;
+    // Start at the trampoline, not the entry function -- it enables interrupts
+    // first. The real destination rides in s0, which `switch` restores.
+    ctx.ra = thread_start as *const () as usize;
     ctx.sp = top;
+    ctx.s[0] = entry as *const () as usize;
 
     unsafe {
         (*core::ptr::addr_of_mut!(THREADS)).push(Thread {
@@ -1129,9 +1177,21 @@ fn thread_spawn(name: &'static str, entry: extern "C" fn() -> !) {
 }
 
 /// Give up the CPU to the next thread, round robin.
+///
+/// Called two ways now: voluntarily by a thread, and involuntarily from the
+/// timer's trap handler. Interrupts are off for the switch itself either way --
+/// a timer landing halfway through swapping contexts would be reading a thread
+/// that is neither running nor saved.
+///
+/// This is a lock in everything but name, and 9b replaces it with a real one.
 fn yield_now() {
+    let was_on = intr_off();
+
     let threads = unsafe { &mut *core::ptr::addr_of_mut!(THREADS) };
     if threads.len() < 2 {
+        if was_on {
+            intr_on();
+        }
         return;
     }
 
@@ -1149,6 +1209,9 @@ fn yield_now() {
     // Execution resumes HERE, but possibly minutes later and after several
     // other threads have run. Nothing local survived except what was in
     // callee-saved registers or on this thread's own stack.
+    if was_on {
+        intr_on();
+    }
 }
 
 fn current_name() -> &'static str {
@@ -1418,6 +1481,20 @@ extern "C" fn trap_handler(frame: &mut TrapFrame) {
         if n % 100 == 0 {
             println!("tick {} -- up {}s", n, n / 100);
         }
+
+        // PREEMPTION. Up to now the timer only counted; now it takes the CPU
+        // away from whatever was running, whether that thread cooperates or
+        // not.
+        //
+        // Switching from inside a trap handler works because the trap frame
+        // lives on THIS thread's stack, so it simply rides along in the saved
+        // context. When something switches back here later, execution resumes
+        // inside yield_now, returns through this handler, and unwinds normally
+        // through trap_entry's register restore and sret.
+        //
+        // Rearm before switching, or the next thread inherits a timer that has
+        // already been acknowledged and never fires again.
+        yield_now();
 
         // Deliberately do NOT touch sepc. An interrupt means the instruction
         // at sepc has not run yet -- skipping it would silently drop a good

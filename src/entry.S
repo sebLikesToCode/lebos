@@ -100,6 +100,27 @@ _start:
 #     8   sp
 #    16   s0 .. s11
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# thread_start -- where every new thread actually begins.
+#
+# A thread's forged `ra` points here rather than straight at its entry
+# function, for one reason: preemption means a thread's FIRST scheduling can
+# happen from inside the timer's trap handler, where the hardware has cleared
+# sstatus.SIE. A thread that started there would run with interrupts disabled
+# forever, could never be preempted again, and would hang the machine.
+#
+# So the real entry point is stashed in s0 (which `switch` preserves), and this
+# turns interrupts on before jumping to it. Setting an already-set bit is a
+# no-op, so it is equally correct when a thread is first scheduled from a
+# voluntary yield.
+# ---------------------------------------------------------------------------
+.section .text
+.globl thread_start
+thread_start:
+        csrsi   sstatus, 2      # set SIE (bit 1)
+        jr      s0              # into the thread's entry function
+
+
 .macro SAVE_S i
         sd      s\i, (16 + \i*8)(a0)
 .endm
