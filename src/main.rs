@@ -501,6 +501,9 @@ extern "C" fn kmain_high() -> ! {
     //  END SCRATCH ZONE
     // =====================================================================
 
+    // Milestone 15: the console stops being polled.
+    plic_init();
+
     // Milestone 14: hand the machine over to whoever is typing.
     thread_spawn("shell", shell);
 
@@ -802,31 +805,190 @@ fn puts(s: &str) {
 const UART_LSR: usize = 5;
 const UART_LSR_RX_READY: u8 = 1 << 0;
 
-/// Read one byte from the serial line, or None if nobody has typed anything.
+/// Interrupt Enable Register. Bit 0 = interrupt me when a byte arrives.
 ///
-/// The exact mirror of `putchar`, on the same chip: writing offset 0 transmits,
-/// reading offset 0 receives. The only new idea is that receiving can FAIL --
-/// transmitting is something we choose to do, receiving is something we wait
-/// for. So the status register has to be consulted first; reading the receive
-/// register with nothing in it returns stale garbage, not an error.
+/// Switch one of three. A UART that has not been asked to speak up will sit
+/// there holding your keystroke in perfect silence.
+const UART_IER: usize = 1;
+const UART_IER_RX: u8 = 1 << 0;
+
+// ---------------------------------------------------------------------------
+// The console ring buffer
+//
+// The interrupt handler writes; the shell thread reads. A classic producer /
+// consumer pair, and the classic way to kill a kernel with one:
+//
+//     shell takes the lock
+//     a keystroke arrives -> the ISR runs
+//     the ISR waits for the lock
+//     the lock will be released by a thread that cannot resume until the ISR
+//     returns
+//
+// That deadlock cannot happen here, because `SpinLock::lock` turns interrupts
+// OFF before it takes the lock. The handler physically cannot run while the
+// shell holds it. Milestone 9b built that discipline for its own sake; this is
+// the bug it was actually for.
+//
+// Overflow drops the newest byte rather than overwriting the oldest. Losing a
+// keystroke you just typed is confusing; losing one from a second ago, after
+// several have already appeared on screen, is baffling.
+// ---------------------------------------------------------------------------
+
+const CONSOLE_CAP: usize = 256;
+
+struct Ring {
+    buf: [u8; CONSOLE_CAP],
+    head: usize, // next slot to write
+    tail: usize, // next slot to read
+}
+
+static CONSOLE: SpinLock<Ring> = SpinLock::new(Ring {
+    buf: [0; CONSOLE_CAP],
+    head: 0,
+    tail: 0,
+});
+
+/// How many keystrokes arrived as interrupts. Proof, not decoration: if this
+/// climbs while you type, nothing is polling.
+static CONSOLE_IRQS: AtomicU64 = AtomicU64::new(0);
+
+fn console_push(c: u8) {
+    let mut r = CONSOLE.lock();
+    let next = (r.head + 1) % CONSOLE_CAP;
+    if next == r.tail {
+        return; // full
+    }
+    let h = r.head;
+    r.buf[h] = c;
+    r.head = next;
+}
+
+fn console_pop() -> Option<u8> {
+    let mut r = CONSOLE.lock();
+    if r.head == r.tail {
+        return None;
+    }
+    let c = r.buf[r.tail];
+    r.tail = (r.tail + 1) % CONSOLE_CAP;
+    Some(c)
+}
+
+// ---------------------------------------------------------------------------
+// PLIC -- Platform-Level Interrupt Controller
+//
+// A hart has exactly ONE external-interrupt input line and this board has
+// dozens of devices, so something has to multiplex them. That something is not
+// part of the CPU: it is a separate chip at 0x0c000000 whose whole job is to be
+// a switchboard, and to answer the question "who was it?"
+//
+// A CONTEXT is a (hart, privilege level) pair -- the PLIC must distinguish
+// hart 0's M-mode firmware from hart 0's S-mode kernel, because they want
+// different interrupts. hart0-M is context 0; hart0-S, which is us, is 1.
+// ---------------------------------------------------------------------------
+
+const PLIC: usize = 0x0c00_0000;
+const PLIC_PRIORITY: usize = PLIC; // + irq*4
+const PLIC_ENABLE: usize = PLIC + 0x2000; // + ctx*0x80
+const PLIC_THRESHOLD: usize = PLIC + 0x20_0000; // + ctx*0x1000
+const PLIC_CLAIM: usize = PLIC + 0x20_0004; // + ctx*0x1000
+
+/// hart 0, supervisor mode.
+const PLIC_CTX: usize = 1;
+
+/// UART0's interrupt number on the QEMU virt board -- straight out of the
+/// device tree: `serial@10000000 { interrupts = <0x0a>; }`. Not a constant to
+/// memorise; a fact to look up, which is what milestone 5 built the parser for.
+const IRQ_UART0: u32 = 10;
+
+fn plic_reg(off: usize) -> *mut u32 {
+    // The PLIC is mapped in both halves, so this must follow the kernel
+    // wherever it is executing -- exactly like UART_BASE.
+    (off + if here() > HIGH_BASE { HIGH_BASE } else { 0 }) as *mut u32
+}
+
+fn plic_init() {
+    unsafe {
+        // Priority 0 means DISABLED, so a source left at its reset value never
+        // fires no matter what else is switched on. Any non-zero value works
+        // when there is only one source to arbitrate between.
+        core::ptr::write_volatile(plic_reg(PLIC_PRIORITY + IRQ_UART0 as usize * 4), 1);
+
+        // One bit per source, so source N lives in word N/32 at bit N%32.
+        let word = PLIC_ENABLE + PLIC_CTX * 0x80 + (IRQ_UART0 as usize / 32) * 4;
+        let bit = 1u32 << (IRQ_UART0 % 32);
+        let cur = core::ptr::read_volatile(plic_reg(word));
+        core::ptr::write_volatile(plic_reg(word), cur | bit);
+
+        // Threshold is a floor: the PLIC delivers only interrupts with
+        // priority STRICTLY ABOVE it. Zero means "let everything through".
+        core::ptr::write_volatile(plic_reg(PLIC_THRESHOLD + PLIC_CTX * 0x1000), 0);
+
+        // Switch one of three: tell the UART itself to speak up.
+        let uart = UART_BASE.load(Ordering::Relaxed) as *mut u8;
+        core::ptr::write_volatile(uart.add(UART_IER), UART_IER_RX);
+
+        // Switch three of three: sie bit 9, SEIE -- the hart's willingness to
+        // hear external interrupts at all.
+        core::arch::asm!("csrs sie, {}", in(reg) 1usize << 9);
+    }
+    println!("plic: UART0 (irq {}) -> hart 0 supervisor", IRQ_UART0);
+}
+
+/// "Which interrupt fired, and I am taking it."
 ///
-/// This is the first byte to ever travel INTO the kernel.
-fn getchar() -> Option<u8> {
+/// One read does both: it returns the highest-priority pending source AND
+/// marks it in-flight so it will not be delivered again until completed. Zero
+/// means nothing was pending.
+fn plic_claim() -> u32 {
+    unsafe { core::ptr::read_volatile(plic_reg(PLIC_CLAIM + PLIC_CTX * 0x1000)) }
+}
+
+/// "Finished with that one; you may raise it again."
+///
+/// Skip this and the device goes permanently silent -- the PLIC keeps waiting
+/// for a reply that never comes. Same shape as rearming the timer: the write
+/// is an ACKNOWLEDGEMENT, and forgetting it is not a missed optimisation but a
+/// dead device.
+fn plic_complete(irq: u32) {
+    unsafe { core::ptr::write_volatile(plic_reg(PLIC_CLAIM + PLIC_CTX * 0x1000), irq) }
+}
+
+/// Drain everything the UART has and hand it to the shell.
+///
+/// A loop, not a single read: several keystrokes can arrive between one
+/// interrupt and the handler running, and the 16550 only re-raises its
+/// interrupt when the receive register goes from empty to non-empty. Read one
+/// byte of three and the other two are stranded, with no interrupt coming to
+/// remind you.
+fn console_interrupt() {
     let base = UART_BASE.load(Ordering::Relaxed) as *mut u8;
     unsafe {
-        if core::ptr::read_volatile(base.add(UART_LSR)) & UART_LSR_RX_READY == 0 {
-            return None;
+        while core::ptr::read_volatile(base.add(UART_LSR)) & UART_LSR_RX_READY != 0 {
+            console_push(core::ptr::read_volatile(base));
+            CONSOLE_IRQS.fetch_add(1, Ordering::Relaxed);
         }
-        Some(core::ptr::read_volatile(base))
     }
+}
+
+/// Take one byte from the console.
+///
+/// It no longer touches the UART. Milestone 14 read the chip directly and
+/// milestone 15 moved that read into the interrupt handler, so this now pops
+/// from a buffer the hardware filled while nobody was looking. The byte
+/// arrived because the UART asked to be heard, not because anyone checked.
+fn getchar() -> Option<u8> {
+    console_pop()
 }
 
 /// Wait for a keystroke, letting everything else run in the meantime.
 ///
 /// `yield_now()` rather than a spin: a human types at maybe 5 characters a
 /// second, and the CPU can do tens of millions of things between two of them.
-/// Burning that on a poll loop would be the single most wasteful thing in the
-/// kernel. The scheduler built at milestone 8 is what makes waiting cheap.
+/// The scheduler built at milestone 8 is what makes waiting cheap.
+///
+/// This still spins around the scheduler, which is honest but not free -- the
+/// real answer is to block the thread and have the interrupt wake it, and that
+/// needs a sleep/wake primitive the kernel does not have yet. Milestone 16.
 fn getchar_blocking() -> u8 {
     loop {
         if let Some(c) = getchar() {
@@ -3052,6 +3214,13 @@ fn shell_stats() {
         TICKS.load(Ordering::Relaxed),
         TICKS.load(Ordering::Relaxed) / 100
     );
+    // The proof that milestone 15 is real. If this climbs while you type,
+    // nothing anywhere is polling the UART -- the chip is raising IRQ 10 and
+    // the PLIC is routing it here.
+    println!(
+        "  {} bytes arrived by interrupt",
+        CONSOLE_IRQS.load(Ordering::Relaxed)
+    );
 }
 
 /// The shell thread. Never returns; it is the machine's front door.
@@ -3785,6 +3954,22 @@ extern "C" fn trap_handler(frame: &mut TrapFrame) {
         // Deliberately do NOT touch sepc. An interrupt means the instruction
         // at sepc has not run yet -- skipping it would silently drop a good
         // instruction. Only exceptions get stepped over.
+        return;
+    }
+
+    if is_interrupt && code == 9 {
+        // Supervisor EXTERNAL interrupt. Unlike the timer, this does not say
+        // which device -- the hart has one wire for all of them. Ask the PLIC.
+        let irq = plic_claim();
+        if irq == IRQ_UART0 {
+            console_interrupt();
+        }
+        // Complete even an unrecognised or zero irq. Claiming without
+        // completing leaves that source in-flight forever, so a device we do
+        // not handle yet would take its interrupt line to the grave.
+        if irq != 0 {
+            plic_complete(irq);
+        }
         return;
     }
 

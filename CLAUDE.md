@@ -427,14 +427,53 @@ Two things cost real time to find, both worth remembering:
   with `-global virtio-mmio.force-legacy=false` in the Makefile. On real
   hardware you would have to handle whichever version you were given.
 
-## The shell (milestone 14)
+## The console (milestones 14 and 15)
 
-`getchar()` is the mirror of `putchar` on the same 16550: writing offset 0
-transmits, **reading offset 0 receives**, and LSR (offset 5) bit 0 says whether
-a byte is actually waiting. `getchar_blocking()` calls `yield_now()` between
-polls rather than spinning — a human types ~5 characters a second and the CPU
-can do tens of millions of things in between. The scheduler is what makes
-waiting cheap.
+Milestone 14 read the 16550 directly: writing offset 0 transmits, **reading
+offset 0 receives**, and LSR (offset 5) bit 0 says whether a byte is waiting.
+
+Milestone 15 moved that read into an interrupt handler, so `getchar()` now pops
+from a ring buffer the hardware filled while nobody was looking. The UART is
+never polled.
+
+**The PLIC.** A hart has exactly one external-interrupt input line and this
+board has dozens of devices, so a separate chip at `0x0c00_0000` multiplexes
+them and answers "who was it?". A **context** is a *(hart, privilege)* pair —
+hart0-M is 0, hart0-S (us) is 1.
+
+| bank | address |
+|---|---|
+| priority | `PLIC + irq*4` — **0 means disabled** |
+| enable | `PLIC + 0x2000 + ctx*0x80`, one bit per source |
+| threshold | `PLIC + 0x200000 + ctx*0x1000`, a floor, strictly-above |
+| claim/complete | `PLIC + 0x200004 + ctx*0x1000` |
+
+**Claim/complete is a handshake.** Reading returns the highest-priority pending
+source *and* marks it in-flight; writing it back permits redelivery. Skip the
+write and that device is silent forever — the same lesson as rearming the
+timer, where the write is an ACKNOWLEDGEMENT. The handler completes even
+unrecognised IRQs for this reason.
+
+**Three switches, and silence if any one is off:** the UART's own IER bit 0,
+the PLIC's priority+enable+threshold, and `sie` bit 9 (SEIE).
+
+`console_interrupt` drains in a **loop**: the 16550 only re-raises when the
+receive register goes empty→non-empty, so reading one byte of three strands the
+other two with no interrupt coming.
+
+**The ring buffer deadlock that cannot happen here.** The ISR writes and the
+shell reads, so they share a lock — and an ISR that fires while the shell holds
+it would spin forever waiting for a thread that cannot resume until the ISR
+returns. `SpinLock::lock` disables interrupts *before* taking the lock, so the
+handler physically cannot run at that moment. Milestone 9b built the fix years
+before the bug. Overflow drops the newest byte, not the oldest.
+
+`stats` reports `CONSOLE_IRQS`. Verified: typing `stats` twice reports exactly
+6 then 12 — five characters plus a carriage return, each arriving as IRQ 10.
+
+`getchar_blocking()` still spins around `yield_now()`. The real answer is to
+block the thread and let the interrupt wake it, which needs a sleep/wake
+primitive the kernel does not have. Milestone 16.
 
 The terminal is raw. Nothing echoes unless `readline` echoes it, backspace is
 the byte `0x7f` rather than an action, and erasing means printing `\x08 \x08`
@@ -732,6 +771,28 @@ innovation budget is spent at Phase V.
 13. ✅ 13a virtio-blk driver: a sector written and read back
     ✅ 13b the store persists: header + record stream, replay on boot
 14. ✅ `getchar` + a shell whose commands are queries, not paths
+
+### Phase VI — the OS moves out of the kernel
+
+The shell is currently a KERNEL THREAD: every command runs in supervisor mode
+with unrestricted access to physical memory. Query parsing, formatting and the
+result list are pure policy sitting in ring 0 because that was the only place
+that existed. Phase VI ends with `lebos` being a kernel and nothing else.
+
+15. ✅ PLIC + interrupt-driven console
+16. ⬅ **current** — process lifecycle: `exit`, `wait`, reap. Nothing frees a
+    dead process's frames, and `exit` currently returns and spins. Also the
+    sleep/wake primitive that lets a blocked thread stop spinning.
+17. userspace memory: an `sbrk` syscall, which unlocks `alloc` in user programs
+18. the store syscalls a shell needs: get, hide, evict, forget, save, readline
+19. **exec-by-query** — a program is an object with `type=program`, so running
+    one means running a QUERY. `execve("/bin/sh")` is a path lookup in every OS
+    that has shipped; this cannot do that, and what replaces it is better.
+20. the shell as a user program, loaded from the store. Swap FNV-1a for
+    SHA-256 here -- untrusted code can write to the store from this point.
+
+Then Phase VII is pixels, cleanly: the framebuffer driver is mechanism
+(kernel), the window manager is policy (userspace).
 
 Known, not yet fixed: `EVENTS` grows without bound (every access appends,
 nothing trims). `SpinLock` is NOT reentrant -- taking the same lock twice
