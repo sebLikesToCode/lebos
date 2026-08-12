@@ -369,6 +369,75 @@ rust-toolchain.toml  pinned to stable — nightly is not needed for rv64
 dev is deliberate — `opt-level = 0` produces stack frames large enough to
 overflow the 64 KiB boot stack.
 
+## Store design -- DECIDED, 2026-08-12
+
+Worked out in conversation with the author. These are his calls; do not
+relitigate them without him.
+
+**An id is a CONTENT HASH.** Identical bytes get an identical id on every
+machine forever. Buys dedup free, makes an id globally meaningful (so "that
+object lives on my desktop" is expressible, and distribution stays possible),
+gives tamper detection, and makes immutability arithmetic rather than
+discipline. Currently FNV-1a, which is NOT cryptographic -- **swap to SHA-256
+before anything untrusted can write to the store.**
+
+**UNRESOLVED TENSION, decide before the syscall ABI hardens:** content-addressed
+ids are *computable from content*, so they cannot also be unforgeable
+capabilities. Either ids are public names with access granted separately, or a
+capability is (id, secret), or capabilities are dropped in favour of
+process-boundary security. The original "an object id is a capability" line is
+incompatible with hashing as written.
+
+**A NAME is just another attribute, and that does not break the thesis.** A
+path is an ADDRESS -- unique, hierarchical, says WHERE. A name is a LABEL --
+not unique, flat, says what it is CALLED. Addresses are what is being deleted.
+Consequence worth keeping: because the name is data rather than a lookup key,
+**approximate matching on it is legal**. `open("todo.txt")` must be exact;
+`name ~= "todo"` need not be. Every "did you mean" in every file manager fights
+its own model; this one does not.
+
+**Attribute values are TYPED**, not raw bytes: `Int`, `Text`, `Id`, `Bytes`.
+Not tidiness -- it is what makes range queries possible. Stored as bytes,
+`created_at` could only be compared for equality, since alphabetically "9"
+sorts after "1754870400". Time is the axis that narrows hardest, so it is
+exactly the one that must be typed.
+
+**The retrieval target is NOT "find the file" -- it is "narrow to ~20 so a
+human can scan."** Three orthogonal tags do it: 100k objects, /30 by type, /50
+by week, /4 by origin, leaves ~16. Semantic search only ever handles the
+residue. This is why tags must be ORTHOGONAL; two that always co-occur narrow
+nothing.
+
+**"Delete" is three unrelated problems wearing one word**, and separating them
+dissolves the "no root, so what is garbage" question entirely:
+
+| problem | verb | behaviour |
+|---|---|---|
+| clutter | `hidden = true` | an attribute. Reversible, nothing lost. The "Cluttered" view is a saved query. This is what most deletion actually is. |
+| privacy | `forget` | explicit, destroys the bytes, irreversible, rare |
+| space | `evict` | only under pressure, by policy (LRU/size), never by reachability |
+
+Eviction keeps the **record** while dropping the **bytes** -- only possible
+because ids are content hashes. An evicted object remains a valid, globally
+meaningful coordinate, so *"the file I was working on while that video was
+open"* still answers even though the video is gone. No filesystem can do this.
+
+**Two tables, not one:**
+
+    objects   id (content hash) + bytes + typed attributes    what EXISTS
+    events    (time, process, object_id)  append-only         what HAPPENED
+
+Creation stamps say where an object came from. The event log says what was
+happening *around* it, which is what co-occurrence queries need and **cannot be
+reconstructed later**. This is the one genuinely irreversible decision.
+
+**Kernel records facts; userspace decides what they mean.** Whatever mediates
+access must log it and there must be exactly one such chokepoint, or history
+has holes you cannot detect. So the kernel owns object identity, access, and
+appending raw events; userspace derives sessions (collapse adjacent events per
+process), co-occurrence (overlap those intervals), indexes and ranking. Same
+shape as the A/D bits in a page table: hardware records, software interprets.
+
 ## Design thesis — the part that makes this not-Linux
 
 **There is no filesystem, no paths, and no directories.** Storage is a
@@ -493,7 +562,8 @@ innovation budget is spent at Phase V.
 10. ✅ user mode, syscalls, sscratch kernel stacks, SUM discipline, pointer
     validation
 11. ✅ process creation -- one address space per process
-12. ⬅ **current** — the object store
+12. ✅ 12a store in RAM: content-addressed objects, typed attributes, query
+    ⬅ **current** — 12b syscalls, hidden/forget/evict, indexes
 8. kernel threads + context switch
 13. virtio-blk + persist the store as an append-only log
 14. userspace shell whose commands are queries, not paths

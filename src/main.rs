@@ -382,6 +382,8 @@ extern "C" fn kmain_high() -> ! {
 
     // ---- your experiments go here ----
 
+    store_demo();
+
     // 10a: a second binary now exists inside the kernel image. It is not
     // running -- there is no user mode yet, and nothing has mapped it. This
     // just proves the toolchain produced it and the kernel can see it.
@@ -558,6 +560,105 @@ extern "C" fn thread_greedy() -> ! {
         }
         // Note the absence of yield_now(). That is the whole point.
     }
+}
+
+/// Fill the store with a plausible mess and then narrow it down, to show that
+/// a handful of orthogonal tags beats knowing where anything is.
+fn store_demo() {
+    use alloc::string::ToString;
+    use alloc::vec;
+
+    // Pretend timestamps: day numbers. Real ones would come from `now()`.
+    const MON: i64 = 100;
+    const TUE: i64 = 101;
+    const WED: i64 = 102;
+    const LAST_MONTH: i64 = 40;
+
+    let mut put = |name: &str, kind: &str, day: i64, origin: &str, body: &str| {
+        store_create(
+            body.as_bytes().to_vec(),
+            vec![
+                ("name".to_string(), Value::Text(name.to_string())),
+                ("type".to_string(), Value::Text(kind.to_string())),
+                ("created_at".to_string(), Value::Int(day)),
+                ("origin".to_string(), Value::Text(origin.to_string())),
+            ],
+        )
+    };
+
+    put(
+        "brick breaker",
+        "python",
+        TUE,
+        "editor",
+        "import pygame  # paddle",
+    );
+    put("notes", "text", TUE, "editor", "remember to fix the paddle");
+    put(
+        "brick breaker",
+        "python",
+        LAST_MONTH,
+        "editor",
+        "first attempt, bad",
+    );
+    put("solver", "python", MON, "editor", "def solve(): pass");
+    put("screenshot", "image", TUE, "camera", "PNG-ish bytes");
+    put("todo", "text", WED, "editor", "buy milk");
+    put("scratch", "python", WED, "repl", "2+2");
+    put("paddle sketch", "image", TUE, "editor", "PNG-ish paddle");
+
+    println!(
+        "store: {} objects, no paths, no directories",
+        STORE.lock().len()
+    );
+
+    // The query from day one: "last tuesday's python file about brick breaker"
+    let all = store_query(&[]);
+    let by_type = store_query(&[Cond::Eq("type", Value::Text("python".to_string()))]);
+    let by_type_day = store_query(&[
+        Cond::Eq("type", Value::Text("python".to_string())),
+        Cond::Between("created_at", TUE, TUE),
+    ]);
+    let final_set = store_query(&[
+        Cond::Eq("type", Value::Text("python".to_string())),
+        Cond::Between("created_at", TUE, TUE),
+        Cond::Contains("name", "brick"),
+    ]);
+
+    println!("query: \"last tuesday's python file about brick breaker\"");
+    println!("  everything                     -> {}", all.len());
+    println!("  + type = python                -> {}", by_type.len());
+    println!("  + created tuesday              -> {}", by_type_day.len());
+    println!("  + name contains \"brick\"        -> {}", final_set.len());
+
+    for id in &final_set {
+        let store = STORE.lock();
+        let o = &store[id];
+        println!(
+            "  => {:?}  name={:?}  {} bytes",
+            o.id,
+            o.attr("name"),
+            o.bytes.len()
+        );
+    }
+
+    // Content addressing: identical bytes are the same object, always.
+    let a = store_create(b"duplicate".to_vec(), vec![]);
+    let b = store_create(b"duplicate".to_vec(), vec![]);
+    println!(
+        "dedup: stored the same bytes twice -> {} ids, {} objects total",
+        if a == b { "1" } else { "2" },
+        STORE.lock().len()
+    );
+
+    // The usage log: reading things is itself recorded.
+    for id in &final_set {
+        log_event(*id);
+    }
+    println!(
+        "events: {} access records so far (what was happening, not what exists)",
+        EVENTS.lock().len()
+    );
 }
 
 /// The address this instruction is executing at. `auipc rd, 0` puts the
@@ -1295,8 +1396,33 @@ fn heap_stats() -> (usize, usize) {
 
 struct Heap;
 
+// The allocator walks and rewrites a shared free list across several steps.
+// That was safe when nothing could interrupt it; with preemption, a timer
+// landing mid-walk lets another thread see a half-updated list.
+//
+// Interrupts off for the duration is the same lock yield_now uses, and it is
+// enough here because the critical sections are a few dozen instructions.
 unsafe impl GlobalAlloc for Heap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let was_on = intr_off();
+        let p = self.alloc_locked(layout);
+        if was_on {
+            intr_on();
+        }
+        p
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        let was_on = intr_off();
+        self.dealloc_locked(ptr, layout);
+        if was_on {
+            intr_on();
+        }
+    }
+}
+
+impl Heap {
+    unsafe fn alloc_locked(&self, layout: Layout) -> *mut u8 {
         // Every block is 16-aligned, so anything asking for more than that
         // would need front-padding this allocator does not do. Nothing normal
         // does -- Box, Vec, BTreeMap all want 8 or less.
@@ -1357,7 +1483,7 @@ unsafe impl GlobalAlloc for Heap {
         core::ptr::null_mut() // no gap long enough
     }
 
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+    unsafe fn dealloc_locked(&self, ptr: *mut u8, layout: Layout) {
         let size = align_up(layout.size().max(MIN_BLOCK), HEAP_ALIGN);
         let addr = ptr as usize;
 
@@ -1719,6 +1845,154 @@ extern "C" fn thread_racer() -> ! {
     loop {
         yield_now();
     }
+}
+
+// ===========================================================================
+// The object store -- milestone 12
+//
+// No files. No paths. No directories. There is nowhere to put anything.
+//
+// An object is bytes plus a set of typed attributes, named by a hash of its
+// own content. It is reachable exactly two ways: by id, or by query. Nothing
+// records WHERE anything is, because there is no where.
+//
+// A NAME is just another attribute. That is not a contradiction: a path is an
+// ADDRESS (unique, hierarchical, says where), while a name is a LABEL (not
+// unique, flat, says what it is called). Deleting addresses is the whole
+// design; deleting names would just be inconvenient. And because the name is
+// data rather than a lookup key, approximate matching on it is legal --
+// `open("todo.txt")` must be exact, `name ~= "todo"` need not be.
+// ===========================================================================
+
+/// An object's identity: a hash of its content.
+///
+/// Content-addressed, so identical bytes get an identical id on every machine
+/// forever. That buys dedup for free, makes an id globally meaningful (so
+/// "that object lives on my desktop" is expressible), and makes immutability
+/// arithmetic rather than a rule -- you cannot alter an object without
+/// changing its name.
+///
+/// FNV-1a for now: about five lines, and enough to make content-addressing
+/// real. It is NOT cryptographic -- collisions can be constructed
+/// deliberately. Swap in SHA-256 before anything untrusted can write to the
+/// store.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+struct ObjId(u64);
+
+fn hash_bytes(bytes: &[u8]) -> ObjId {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV offset basis
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3); // FNV prime
+    }
+    ObjId(h)
+}
+
+/// What an attribute holds.
+///
+/// Typed rather than raw bytes, and that is not tidiness -- it is what makes
+/// range queries possible. Stored as bytes, `created_at` could only be tested
+/// for exact equality, because "is this after Tuesday" would compare text
+/// alphabetically and "9" sorts after "1754870400". Time is the axis that
+/// narrows hardest, so it is precisely the one that must be typed.
+#[derive(Clone, PartialEq, Debug)]
+enum Value {
+    Int(i64),
+    Text(alloc::string::String),
+    Id(ObjId),
+    Bytes(alloc::vec::Vec<u8>),
+}
+
+struct Object {
+    id: ObjId,
+    bytes: alloc::vec::Vec<u8>,
+    attrs: alloc::vec::Vec<(alloc::string::String, Value)>,
+}
+
+impl Object {
+    fn attr(&self, key: &str) -> Option<&Value> {
+        self.attrs.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+    }
+}
+
+/// Everything that exists. A map, not a tree -- there is no parent, no child,
+/// and no order except the one a query asks for.
+static STORE: SpinLock<alloc::collections::BTreeMap<ObjId, Object>> =
+    SpinLock::new(alloc::collections::BTreeMap::new());
+
+/// What happened. Append-only, and the kernel never interprets it.
+///
+/// Creation stamps say where an object CAME FROM. This says what was happening
+/// AROUND it -- which is what "the file I was working on while that video was
+/// open" actually needs, and it cannot be reconstructed later. Userspace turns
+/// these raw events into sessions and co-occurrence; the kernel only writes
+/// down that something happened.
+#[derive(Clone, Copy)]
+struct Event {
+    time: u64,
+    process: usize,
+    id: ObjId,
+}
+
+static EVENTS: SpinLock<alloc::vec::Vec<Event>> = SpinLock::new(alloc::vec::Vec::new());
+
+fn log_event(id: ObjId) {
+    EVENTS.lock().push(Event {
+        time: now(),
+        process: CURRENT.load(Ordering::Relaxed),
+        id,
+    });
+}
+
+/// Put an object in the store. Returns its id.
+///
+/// Identical content returns the identical id and stores nothing twice.
+fn store_create(
+    bytes: alloc::vec::Vec<u8>,
+    attrs: alloc::vec::Vec<(alloc::string::String, Value)>,
+) -> ObjId {
+    let id = hash_bytes(&bytes);
+    let mut store = STORE.lock();
+    store.entry(id).or_insert(Object { id, bytes, attrs });
+    id
+}
+
+/// Does this object satisfy one condition?
+enum Cond {
+    /// Attribute equals a value exactly.
+    Eq(&'static str, Value),
+    /// Integer attribute falls in [lo, hi]. The range query typing exists for.
+    Between(&'static str, i64, i64),
+    /// Text attribute contains a substring -- the crude ancestor of the
+    /// fuzzy name matching a semantic layer would do later.
+    Contains(&'static str, &'static str),
+}
+
+fn matches(obj: &Object, c: &Cond) -> bool {
+    match c {
+        Cond::Eq(k, want) => obj.attr(k) == Some(want),
+        Cond::Between(k, lo, hi) => match obj.attr(k) {
+            Some(Value::Int(n)) => n >= lo && n <= hi,
+            _ => false,
+        },
+        Cond::Contains(k, needle) => match obj.attr(k) {
+            Some(Value::Text(t)) => t.as_str().contains(needle),
+            _ => false,
+        },
+    }
+}
+
+/// Every object satisfying ALL conditions.
+///
+/// A linear scan, deliberately: indexes are an optimisation, and the semantics
+/// have to be right before the speed matters. Milestone 13 adds them.
+fn store_query(conds: &[Cond]) -> alloc::vec::Vec<ObjId> {
+    let store = STORE.lock();
+    store
+        .values()
+        .filter(|o| conds.iter().all(|c| matches(o, c)))
+        .map(|o| o.id)
+        .collect()
 }
 
 // ===========================================================================
