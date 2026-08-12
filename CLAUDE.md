@@ -54,7 +54,15 @@ the end of an allocation at the next allocation rather than a thousand later.
 Verified: a freed block is handed straight back to the next request, and after
 everything drops the heap returns to exactly one free block of 1048576 bytes.
 
-Next: milestone 8, threads and context switching.
+`switch(old, new)` in entry.S saves 14 callee-saved registers and loads
+another set -- only 14, not 32, because a context switch is a function call and
+the ABI already spilled the caller-saved ones. Its final `ret` jumps to the new
+thread's `ra`, which IS the switch. Threads are `Vec<Thread>` on the heap, each
+owning a 16 KiB stack; `thread_spawn` forges a context whose `ra` points at the
+entry function, so the first switch "returns" into a function never called.
+Cooperative -- `yield_now()` round-robins.
+
+Next: milestone 9, preemption.
 
 Hard-won details that will bite again if forgotten:
 
@@ -340,10 +348,9 @@ innovation budget is spent at Phase V.
    ✅ 6c-i higher-half direct map alongside the identity map, aliasing proven
    ✅ 6c the kernel executes in the higher half and the identity map is gone
 7. ✅ kernel heap: free list, first fit, splitting, two-way coalescing
-8. ⬅ **current** — kernel threads + context switch
+8. ✅ kernel threads + cooperative context switch
+9. ⬅ **current** — preemptive scheduler, spinlocks, wait queues
 8. kernel threads + context switch
-9. preemptive scheduler, spinlocks, wait queues — *policy/mechanism split
-   starts here*
 10. user mode + syscalls
 11. process creation
 12. **the object store**, in RAM first: indexes, query, versioning

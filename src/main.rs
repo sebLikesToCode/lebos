@@ -342,6 +342,17 @@ extern "C" fn kmain_high() -> ! {
 
     // ---- your experiments go here ----
 
+    threads_init();
+    thread_spawn("alpha", thread_alpha);
+    thread_spawn("beta", thread_beta);
+
+    println!("threads: spawned alpha and beta; main will now take turns");
+    for round in 0..4 {
+        println!("[main ] round {}", round);
+        yield_now();
+    }
+    println!("threads: back in {}, all three took turns", current_name());
+
     // =====================================================================
     //  END SCRATCH ZONE
     // =====================================================================
@@ -364,6 +375,30 @@ extern "C" fn kmain_high() -> ! {
     loop {
         // Wait For Interrupt: idles the core instead of spinning it at 100%.
         unsafe { core::arch::asm!("wfi") };
+    }
+}
+
+/// Two threads that do nothing but announce themselves and hand the desk
+/// back. `-> !` because a thread has nowhere to return TO -- its `ra` was
+/// forged, and running off the end would jump into whatever the fake return
+/// address happened to be.
+extern "C" fn thread_alpha() -> ! {
+    for i in 0..4 {
+        println!("[alpha] tick {}", i);
+        yield_now();
+    }
+    loop {
+        yield_now();
+    }
+}
+
+extern "C" fn thread_beta() -> ! {
+    for i in 0..4 {
+        println!("[beta ] tick {}", i);
+        yield_now();
+    }
+    loop {
+        yield_now();
     }
 }
 
@@ -991,6 +1026,135 @@ unsafe impl GlobalAlloc for Heap {
 
 #[global_allocator]
 static ALLOCATOR: Heap = Heap;
+
+// ===========================================================================
+// Threads -- milestone 8
+//
+// A thread is a saved copy of the registers plus a stack. That is the whole
+// definition; the CPU has no idea threads exist. One worker, one desk, and a
+// stack of cardboard boxes each holding a half-finished job.
+//
+// Switching is: sweep the desk into box A, lay out box B exactly as it was,
+// carry on. The worker never notices.
+//
+// Cooperative for now -- a thread runs until it CHOOSES to yield. Milestone 9
+// hands the timer the power to take the desk away by force.
+// ===========================================================================
+
+/// Per-thread stack. 16 KiB is roomy for println!'s formatting depth without
+/// being so large that an overflow bug can hide for long.
+const STACK_SIZE: usize = 16 * 1024;
+
+/// The 14 registers that survive a function call, which is exactly the set a
+/// context switch must preserve.
+///
+/// #[repr(C)] is load-bearing: `switch` in entry.S indexes this by hand at
+/// fixed offsets, and Rust is otherwise free to reorder fields.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Context {
+    ra: usize,      // offset 0  -- where `ret` will jump
+    sp: usize,      // offset 8
+    s: [usize; 12], // offset 16 -- s0..s11
+}
+
+impl Context {
+    const fn zeroed() -> Self {
+        Context {
+            ra: 0,
+            sp: 0,
+            s: [0; 12],
+        }
+    }
+}
+
+extern "C" {
+    /// Save the current registers into `old`, load `new`, and return into
+    /// whatever thread `new` belongs to.
+    fn switch(old: *mut Context, new: *const Context);
+}
+
+struct Thread {
+    ctx: Context,
+    name: &'static str,
+    /// Owns the thread's stack. Dropping the Thread frees it -- the heap from
+    /// milestone 7 doing real work.
+    _stack: alloc::vec::Vec<u8>,
+}
+
+/// Single hart, cooperative scheduling, so a plain static is honest here. It
+/// becomes a lie the moment there is a second core or preemption, which is
+/// milestone 9's problem.
+static mut THREADS: alloc::vec::Vec<Thread> = alloc::vec::Vec::new();
+static CURRENT: AtomicUsize = AtomicUsize::new(0);
+
+/// Register the currently-executing code as thread 0.
+///
+/// Its context is left zeroed on purpose: nothing needs to be restored to get
+/// back here, because the first `switch` away will fill it in.
+fn threads_init() {
+    unsafe {
+        (*core::ptr::addr_of_mut!(THREADS)).push(Thread {
+            ctx: Context::zeroed(),
+            name: "main",
+            _stack: alloc::vec::Vec::new(), // main runs on the boot stack
+        });
+    }
+}
+
+/// Create a thread that will begin at `entry` the first time it is scheduled.
+///
+/// The trick: build a context whose `ra` points at `entry` and whose `sp`
+/// points at a fresh stack. When `switch` runs its final `ret`, it "returns"
+/// into a function that has never been called. Thread creation is a forged
+/// return address.
+fn thread_spawn(name: &'static str, entry: extern "C" fn() -> !) {
+    let mut stack = alloc::vec![0u8; STACK_SIZE];
+
+    // Stacks grow DOWN, so the pointer starts at the high end. 16-aligned
+    // because the ABI requires it.
+    let top = (stack.as_mut_ptr() as usize + STACK_SIZE) & !15;
+
+    let mut ctx = Context::zeroed();
+    ctx.ra = entry as usize;
+    ctx.sp = top;
+
+    unsafe {
+        (*core::ptr::addr_of_mut!(THREADS)).push(Thread {
+            ctx,
+            name,
+            _stack: stack,
+        });
+    }
+}
+
+/// Give up the CPU to the next thread, round robin.
+fn yield_now() {
+    let threads = unsafe { &mut *core::ptr::addr_of_mut!(THREADS) };
+    if threads.len() < 2 {
+        return;
+    }
+
+    let cur = CURRENT.load(Ordering::Relaxed);
+    let next = (cur + 1) % threads.len();
+    CURRENT.store(next, Ordering::Relaxed);
+
+    // Two raw pointers into the same Vec. Taking two &mut would be instant
+    // undefined behaviour, and `switch` only reads one and writes the other.
+    let old = &mut threads[cur].ctx as *mut Context;
+    let new = &threads[next].ctx as *const Context;
+
+    unsafe { switch(old, new) };
+
+    // Execution resumes HERE, but possibly minutes later and after several
+    // other threads have run. Nothing local survived except what was in
+    // callee-saved registers or on this thread's own stack.
+}
+
+fn current_name() -> &'static str {
+    let threads = unsafe { &*core::ptr::addr_of!(THREADS) };
+    threads[CURRENT.load(Ordering::Relaxed)].name
+}
 
 // ===========================================================================
 // Device tree (FDT / "flattened device tree")

@@ -76,6 +76,60 @@ _start:
 # a known-good kernel stack via the sscratch CSR first.
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# switch(old: *mut Context, new: *const Context)
+#
+# The strangest function in the kernel: it is CALLED by one thread and RETURNS
+# into a different one.
+#
+# a0 = where to dump the current thread's registers
+# a1 = where to load the next thread's registers from
+#
+# Only 14 registers, not 32, and that is not laziness. A trap is involuntary
+# and can land between any two instructions, so trap_entry must save
+# everything. This is an ordinary function call, so the calling convention has
+# ALREADY forced the caller to spill anything it cared about in t0-t6 and
+# a0-a7. Only the callee-saved set survives a call, so only the callee-saved
+# set needs preserving here.
+#
+# The last instruction is a plain `ret`, which jumps to ra -- and ra was just
+# loaded from the NEW thread. That single instruction is the context switch.
+#
+# Context layout (must match the Rust struct exactly):
+#     0   ra
+#     8   sp
+#    16   s0 .. s11
+# ---------------------------------------------------------------------------
+.macro SAVE_S i
+        sd      s\i, (16 + \i*8)(a0)
+.endm
+
+.macro LOAD_S i
+        ld      s\i, (16 + \i*8)(a1)
+.endm
+
+.section .text
+.globl switch
+switch:
+        # Sweep the desk into box A.
+        sd      ra, 0(a0)
+        sd      sp, 8(a0)
+        .irp n, 0,1,2,3,4,5,6,7,8,9,10,11
+        SAVE_S \n
+        .endr
+
+        # Lay out box B on the desk.
+        ld      ra, 0(a1)
+        ld      sp, 8(a1)
+        .irp n, 0,1,2,3,4,5,6,7,8,9,10,11
+        LOAD_S \n
+        .endr
+
+        # Returns to the OTHER thread's ra. For a brand new thread that is a
+        # forged address pointing at a function which has never been called.
+        ret
+
+
 .macro SAVE_GP i
         sd      x\i, \i*8(sp)
 .endm
