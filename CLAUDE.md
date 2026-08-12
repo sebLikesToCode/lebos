@@ -682,10 +682,11 @@ innovation budget is spent at Phase V.
 12. ✅ store: blobs + objects, typed attributes, query, syscalls,
     hide/evict/forget via claims
 13. ✅ 13a virtio-blk driver: a sector written and read back
-    ⬅ **current** — 13b the store as an append-only log on disk
+    ✅ 13b the store persists: header + record stream, replay on boot
+14. ⬅ **current** — userspace shell whose commands are queries, not paths.
+    Needs `getchar` first: the machine has never read a single byte of input.
 
 Known, not yet fixed: `EVENTS` grows without bound (every access appends,
 nothing trims). `SpinLock` is NOT reentrant -- taking the same lock twice
 deadlocks, and no current path does, but it is a landmine.
-8. kernel threads + context switch
-14. userspace shell whose commands are queries, not paths
+
