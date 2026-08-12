@@ -266,11 +266,25 @@ environment, which REPLACES config rustflags instead of merging with them.
 bakes those in with `include_bytes!`, the same trick xv6 uses for `initcode`.
 Loading from storage waits for milestone 13.
 
+**Structured syscall arguments arrive as ONE packed buffer**, not a nest of
+pointers. That is security, not tidiness: a nested layout means validating 2N
+untrusted pointers per call, and every accepted pointer is attack surface. The
+kernel validates one range, copies it in, and parses in its own memory where
+nothing can change underneath it. Content addressing forces this anyway -- an
+object's id depends on its complete contents, so it cannot be built field by
+field.
+
+The `Reader` refuses to run off the end of a buffer, and any count that could
+not possibly fit is treated as a lie rather than an allocation request.
+
 Syscall ABI, defined in user/src/main.rs:
 
-    a7      = syscall number      1 = write(ptr, len)
-    a0..a5  = arguments           0 = exit(code)
-    a0      = return value
+    a7 = number, a0.. = arguments, a0 = return value
+
+    0  exit(code)
+    1  write(ptr, len)
+    2  create(buf, len)                 -> object id, or usize::MAX
+    3  query(buf, len, out, out_cap)    -> ids written, or usize::MAX
 
 `enter_user` clears `sstatus.SPP` (return to U-mode) and sets SPIE (stay
 preemptible).
@@ -574,8 +588,8 @@ innovation budget is spent at Phase V.
 10. ✅ user mode, syscalls, sscratch kernel stacks, SUM discipline, pointer
     validation
 11. ✅ process creation -- one address space per process
-12. ✅ 12a store in RAM: blobs + objects, typed attributes, query
-    ⬅ **current** — 12b syscalls, hidden/forget/evict, indexes
+12. ✅ 12a store in RAM; ✅ 12b store syscalls reachable from user programs
+    ⬅ **current** — 12c hidden/forget/evict, 12d indexes
 
 Known, not yet fixed: `EVENTS` grows without bound (every access appends,
 nothing trims). `SpinLock` is NOT reentrant -- taking the same lock twice

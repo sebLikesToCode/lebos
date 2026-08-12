@@ -24,6 +24,9 @@ SECTIONS
 
     .rodata : { *(.rodata .rodata.*) }
     .data   : { *(.sdata .sdata.* .data .data.*) }
+    /* .bss occupies no file space, so nothing that must exist at runtime may
+     * live here -- the kernel copies the raw image and does not know to zero
+     * anything beyond it. The stack comes from the kernel. */
     .bss    : { *(.sbss .sbss.* .bss .bss.*) }
 
     /DISCARD/ : { *(.eh_frame) *(.note .note.*) *(.comment) }

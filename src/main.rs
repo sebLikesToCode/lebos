@@ -963,6 +963,94 @@ fn map_user(root_pa: usize) -> usize {
     stack_va + USER_STACK_SIZE
 }
 
+// ---------------------------------------------------------------------------
+// Store syscall wire format
+//
+// Structured arguments arrive as ONE packed buffer rather than a nest of
+// pointers. That is a security decision, not a tidiness one: a nested layout
+// would mean validating 2N untrusted pointers per call, and every accepted
+// pointer is an attack surface. This way the kernel checks one range, copies it
+// in, and parses in its own memory where nothing can change underneath it.
+//
+// Content addressing also forces it. An object's id depends on its complete
+// contents, so it cannot be built up field by field -- it has to arrive whole.
+//
+// create buffer, all little-endian:
+//     u32  content_len
+//     ..   content bytes
+//     u32  attr_count
+//     per attr:
+//         u32 key_len, key bytes
+//         u8  kind        0 = Int, 1 = Text
+//         Int:  i64
+//         Text: u32 len, bytes
+//
+// query buffer:
+//     u32  cond_count
+//     per cond:
+//         u8  op          0 = Eq(Text), 1 = Between(Int)
+//         u32 key_len, key bytes
+//         Eq:      u32 len, bytes
+//         Between: i64 lo, i64 hi
+// ---------------------------------------------------------------------------
+
+/// Reads a packed buffer, refusing to run off the end.
+struct Reader<'a> {
+    b: &'a [u8],
+    at: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn new(b: &'a [u8]) -> Self {
+        Reader { b, at: 0 }
+    }
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        let end = self.at.checked_add(n)?;
+        if end > self.b.len() {
+            return None;
+        }
+        let s = &self.b[self.at..end];
+        self.at = end;
+        Some(s)
+    }
+    fn u32(&mut self) -> Option<u32> {
+        let s = self.take(4)?;
+        Some(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+    }
+    fn i64(&mut self) -> Option<i64> {
+        let s = self.take(8)?;
+        let mut a = [0u8; 8];
+        a.copy_from_slice(s);
+        Some(i64::from_le_bytes(a))
+    }
+    fn u8(&mut self) -> Option<u8> {
+        Some(self.take(1)?[0])
+    }
+    fn text(&mut self) -> Option<alloc::string::String> {
+        let n = self.u32()? as usize;
+        let s = self.take(n)?;
+        core::str::from_utf8(s)
+            .ok()
+            .map(alloc::string::ToString::to_string)
+    }
+}
+
+/// Copy a range of user memory into kernel memory, once, with SUM enabled only
+/// for the copy itself.
+///
+/// # Safety
+/// The range must already have been checked with `user_range_ok`.
+unsafe fn copy_in(addr: usize, len: usize) -> alloc::vec::Vec<u8> {
+    // Allocate first, so no allocation happens with SUM enabled.
+    let mut v = alloc::vec::Vec::with_capacity(len);
+    core::arch::asm!("csrs sstatus, {}", in(reg) 1_usize << 18);
+    for i in 0..len {
+        v.push(core::ptr::read_volatile((addr + i) as *const u8));
+    }
+    core::arch::asm!("csrc sstatus, {}", in(reg) 1_usize << 18);
+    v
+}
+
 /// Is `[ptr, ptr+len)` memory that USER mode is allowed to read?
 ///
 /// This is the single most important function in the milestone. A user program
@@ -1022,6 +1110,34 @@ unsafe fn copy_from_user(addr: usize) -> u8 {
     let b = core::ptr::read_volatile(addr as *const u8);
     core::arch::asm!("csrc sstatus, {}", in(reg) 1_usize << 18);
     b
+}
+
+/// Same as `user_range_ok`, but the range must also be WRITABLE by user mode.
+///
+/// A separate check because letting a program nominate somewhere for the
+/// kernel to write is strictly more dangerous than letting it nominate
+/// somewhere to read: it turns the kernel into a writer of the program's
+/// choosing.
+fn user_range_writable(root_pa: usize, ptr: usize, len: usize) -> bool {
+    if len == 0 {
+        return true;
+    }
+    let end = match ptr.checked_add(len) {
+        Some(e) => e,
+        None => return false,
+    };
+    if end > (1_usize << 38) {
+        return false;
+    }
+    let mut p = ptr & !(PAGE_SIZE - 1);
+    while p < end {
+        match probe(root_pa, p) {
+            Some(e) if (e & PTE_U != 0) && (e & PTE_W != 0) => {}
+            _ => return false,
+        }
+        p += PAGE_SIZE;
+    }
+    true
 }
 
 /// Drop to user mode and start the program. Never returns -- from here on this
@@ -2082,6 +2198,82 @@ fn matches(obj: &Object, c: &Cond) -> bool {
     }
 }
 
+/// Parse a create request. Returns None on anything malformed -- a user
+/// program is allowed to send nonsense, and the kernel's job is to notice.
+fn parse_create(
+    buf: &[u8],
+) -> Option<(
+    alloc::vec::Vec<u8>,
+    alloc::vec::Vec<(alloc::string::String, Value)>,
+)> {
+    let mut r = Reader::new(buf);
+    let content_len = r.u32()? as usize;
+    let content = r.take(content_len)?.to_vec();
+
+    let n = r.u32()? as usize;
+    // A count that could not possibly fit in the buffer is a lie; refuse it
+    // rather than trying to allocate for it.
+    if n > buf.len() {
+        return None;
+    }
+
+    let mut attrs = alloc::vec::Vec::with_capacity(n);
+    for _ in 0..n {
+        let key = r.text()?;
+        let value = match r.u8()? {
+            0 => Value::Int(r.i64()?),
+            1 => Value::Text(r.text()?),
+            _ => return None,
+        };
+        attrs.push((key, value));
+    }
+    Some((content, attrs))
+}
+
+/// Parse a query request.
+fn parse_query(buf: &[u8]) -> Option<alloc::vec::Vec<OwnedCond>> {
+    let mut r = Reader::new(buf);
+    let n = r.u32()? as usize;
+    if n > buf.len() {
+        return None;
+    }
+    let mut conds = alloc::vec::Vec::with_capacity(n);
+    for _ in 0..n {
+        let op = r.u8()?;
+        let key = r.text()?;
+        conds.push(match op {
+            0 => OwnedCond::Eq(key, r.text()?),
+            1 => OwnedCond::Between(key, r.i64()?, r.i64()?),
+            _ => return None,
+        });
+    }
+    Some(conds)
+}
+
+/// A condition whose key came from userspace, so it cannot be `&'static str`.
+enum OwnedCond {
+    Eq(alloc::string::String, alloc::string::String),
+    Between(alloc::string::String, i64, i64),
+}
+
+fn matches_owned(obj: &Object, c: &OwnedCond) -> bool {
+    match c {
+        OwnedCond::Eq(k, want) => matches!(obj.attr(k), Some(Value::Text(t)) if t == want),
+        OwnedCond::Between(k, lo, hi) => {
+            matches!(obj.attr(k), Some(Value::Int(n)) if n >= lo && n <= hi)
+        }
+    }
+}
+
+fn store_query_owned(conds: &[OwnedCond]) -> alloc::vec::Vec<ObjId> {
+    let store = STORE.lock();
+    store
+        .values()
+        .filter(|o| conds.iter().all(|c| matches_owned(o, c)))
+        .map(|o| o.id)
+        .collect()
+}
+
 /// Every object satisfying ALL conditions.
 ///
 /// A linear scan, deliberately: indexes are an optimisation, and the semantics
@@ -2406,19 +2598,22 @@ extern "C" fn trap_handler(frame: &mut TrapFrame) {
         let arg0 = frame.x[10]; // a0
         let arg1 = frame.x[11]; // a1
 
+        // Which address space is the caller in? Every pointer they hand us is
+        // only meaningful in their own city, so this is needed by every
+        // syscall that takes one.
+        let satp: usize;
+        unsafe { core::arch::asm!("csrr {}, satp", out(reg) satp) };
+        let cur_root = (satp & 0xfff_ffff_ffff) << 12;
+
         let ret: usize = match num {
             // write(ptr, len)
             //
             // The pointer is checked before it is touched. This is the office
             // worker reading the request slip and refusing an absurd one.
             1 => {
-                // Validate against the address space that is CURRENTLY active,
-                // not the kernel's. Every process has its own city, and a
-                // pointer is only meaningful in the one its owner lives in.
-                let satp: usize;
-                unsafe { core::arch::asm!("csrr {}, satp", out(reg) satp) };
-                let cur_root = (satp & 0xfff_ffff_ffff) << 12;
-
+                // Validated against the address space that is CURRENTLY
+                // active, not the kernel's -- a pointer only means something
+                // in the city its owner lives in.
                 if !user_range_ok(cur_root, arg0, arg1) {
                     println!(
                         "user: REFUSED write({:#x}, {}) -- not user-readable memory",
@@ -2448,6 +2643,66 @@ extern "C" fn trap_handler(frame: &mut TrapFrame) {
                 // never be written back.
                 0
             }
+            // create(buf, len) -> object id, or usize::MAX on refusal.
+            //
+            // One pointer to validate. Everything nested lives inside the
+            // buffer, where it is copied into kernel memory before being
+            // parsed and cannot change while we look at it.
+            2 => {
+                if !user_range_ok(cur_root, arg0, arg1) || arg1 > 64 * 1024 {
+                    println!("store: REFUSED create -- bad buffer");
+                    usize::MAX
+                } else {
+                    let buf = unsafe { copy_in(arg0, arg1) };
+                    match parse_create(&buf) {
+                        Some((content, attrs)) => {
+                            let id = store_create(content, attrs);
+                            log_event(id);
+                            id.0 as usize
+                        }
+                        None => {
+                            println!("store: REFUSED create -- malformed request");
+                            usize::MAX
+                        }
+                    }
+                }
+            }
+
+            // query(buf, len, out_ptr, out_cap) -> how many ids written
+            3 => {
+                let out_ptr = frame.x[12]; // a2
+                let out_cap = frame.x[13]; // a3
+                if !user_range_ok(cur_root, arg0, arg1)
+                    || !user_range_writable(cur_root, out_ptr, out_cap * 8)
+                {
+                    println!("store: REFUSED query -- bad buffer");
+                    usize::MAX
+                } else {
+                    let buf = unsafe { copy_in(arg0, arg1) };
+                    match parse_query(&buf) {
+                        Some(conds) => {
+                            let hits = store_query_owned(&conds);
+                            let n = core::cmp::min(hits.len(), out_cap);
+                            unsafe {
+                                core::arch::asm!("csrs sstatus, {}", in(reg) 1_usize << 18);
+                                for (i, h) in hits.iter().take(n).enumerate() {
+                                    core::ptr::write_volatile((out_ptr + i * 8) as *mut u64, h.0);
+                                }
+                                core::arch::asm!("csrc sstatus, {}", in(reg) 1_usize << 18);
+                            }
+                            for h in hits.iter().take(n) {
+                                log_event(*h);
+                            }
+                            n
+                        }
+                        None => {
+                            println!("store: REFUSED query -- malformed request");
+                            usize::MAX
+                        }
+                    }
+                }
+            }
+
             _ => {
                 println!("user: unknown syscall {}", num);
                 usize::MAX
