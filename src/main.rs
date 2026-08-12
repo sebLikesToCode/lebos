@@ -129,6 +129,11 @@ pub extern "C" fn kmain(hartid: usize, dtb: *const u8) -> ! {
     // Before literally anything else -- see boot_paging.
     unsafe { boot_paging() };
 
+    // sscratch = 0 means "currently in the kernel". trap_entry relies on this
+    // to tell a user trap from a kernel one; a nonzero value here would make it
+    // treat the very first kernel trap as if it came from userspace.
+    unsafe { core::arch::asm!("csrw sscratch, zero") };
+
     // Point stvec at the assembly trampoline in entry.S, not at trap_handler
     // directly: stvec's low two bits are a mode field, so the address must be
     // 4-byte aligned, and Rust cannot align a function.
@@ -729,6 +734,67 @@ fn map_user(root_pa: usize) -> usize {
     stack_va + USER_STACK_SIZE
 }
 
+/// Is `[ptr, ptr+len)` memory that USER mode is allowed to read?
+///
+/// This is the single most important function in the milestone. A user program
+/// hands the kernel an address; without this check the kernel will happily
+/// dereference it, and a program could ask to have kernel memory printed, or
+/// point at a device register, or at nothing at all.
+///
+/// The rule is not "is it mapped" but **"is it mapped for THEM"** -- the U bit.
+/// Kernel pages are mapped and readable and must still be refused.
+///
+/// Walks the same page table the MMU walks, using the `probe` written back at
+/// milestone 6 for exactly this kind of question.
+fn user_range_ok(root_pa: usize, ptr: usize, len: usize) -> bool {
+    if len == 0 {
+        return true;
+    }
+
+    // Overflow first: a length near usize::MAX would otherwise wrap and make
+    // the range look tiny.
+    let end = match ptr.checked_add(len) {
+        Some(e) => e,
+        None => return false,
+    };
+
+    // A legitimate user pointer lives in the low half. Anything at or above
+    // 2^38 is either the invalid hole or the kernel's half, and no user program
+    // has any business naming it.
+    if end > (1_usize << 38) {
+        return false;
+    }
+
+    // Every page the range touches must be present, readable, AND user-
+    // accessible. Checking only the first page is a classic hole: a program can
+    // pass a valid pointer with a length that runs off the end of its mapping.
+    let mut p = ptr & !(PAGE_SIZE - 1);
+    while p < end {
+        match probe(root_pa, p) {
+            Some(e) if (e & PTE_U != 0) && (e & PTE_R != 0) => {}
+            _ => return false,
+        }
+        p += PAGE_SIZE;
+    }
+    true
+}
+
+/// Read one byte of user memory, with SUM enabled for exactly that one access.
+///
+/// SUM (sstatus bit 18) permits supervisor code to touch U=1 pages. It is off
+/// the rest of the time on purpose: with it off, a stray kernel dereference of
+/// a user pointer FAULTS instead of quietly succeeding. Turning it on only
+/// around a deliberate copy means accidents stay loud.
+///
+/// # Safety
+/// The range must already have been checked with `user_range_ok`.
+unsafe fn copy_from_user(addr: usize) -> u8 {
+    core::arch::asm!("csrs sstatus, {}", in(reg) 1_usize << 18);
+    let b = core::ptr::read_volatile(addr as *const u8);
+    core::arch::asm!("csrc sstatus, {}", in(reg) 1_usize << 18);
+    b
+}
+
 /// Drop to user mode and start the program. Never returns -- from here on this
 /// thread IS the user program, and only a trap brings the kernel back.
 fn enter_user(user_sp: usize) -> ! {
@@ -737,16 +803,15 @@ fn enter_user(user_sp: usize) -> ! {
         core::arch::asm!("csrc sstatus, {}", in(reg) 1_usize << 8);
         // SPIE (bit 5) = 1 -> interrupts on after sret, so it stays preemptible
         core::arch::asm!("csrs sstatus, {}", in(reg) 1_usize << 5);
-        // SUM (bit 18) = 1 -> supervisor may touch U=1 pages.
-        //
-        // Needed for two reasons, both temporary: trap_entry pushes the trap
-        // frame onto whatever sp holds, which after a user trap is a USER
-        // stack; and the write syscall has to read the user's string. A real
-        // kernel enables SUM only around explicit copies, and swaps to a
-        // kernel stack via sscratch first. That is 10c.
-        core::arch::asm!("csrs sstatus, {}", in(reg) 1_usize << 18);
+        // SUM stays OFF. Supervisor code cannot touch U=1 pages by default,
+        // and that default is a feature: it means the kernel cannot be tricked
+        // into dereferencing a user pointer by accident. It is enabled only
+        // around explicit copies, in `copy_from_user`.
 
         core::arch::asm!(
+            // Hand trap_entry a kernel stack for this thread. sscratch nonzero
+            // is also how it knows the next trap came from user mode.
+            "csrw sscratch, sp",
             "csrw sepc, {entry}",
             "mv sp, {usp}",
             "sret",
@@ -1827,17 +1892,23 @@ extern "C" fn trap_handler(frame: &mut TrapFrame) {
         let ret: usize = match num {
             // write(ptr, len)
             //
-            // NO VALIDATION. `ptr` came from an untrusted program and is being
-            // dereferenced on faith. It could be a kernel address, and reading
-            // through it works right now only because SUM is set. Checking it
-            // is 10d, and it is the single most important thing in the
-            // milestone.
+            // The pointer is checked before it is touched. This is the office
+            // worker reading the request slip and refusing an absurd one.
             1 => {
-                for i in 0..arg1 {
-                    let b = unsafe { core::ptr::read_volatile((arg0 + i) as *const u8) };
-                    putchar(b);
+                if !user_range_ok(ROOT.load(Ordering::Relaxed), arg0, arg1) {
+                    println!(
+                        "user: REFUSED write({:#x}, {}) -- not user-readable memory",
+                        arg0, arg1
+                    );
+                    // -1 as a usize, the conventional "no" for a syscall.
+                    usize::MAX
+                } else {
+                    for i in 0..arg1 {
+                        let b = unsafe { copy_from_user(arg0 + i) };
+                        putchar(b);
+                    }
+                    arg1
                 }
-                arg1
             }
             // exit(code)
             0 => {

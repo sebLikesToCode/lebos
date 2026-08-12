@@ -162,31 +162,84 @@ switch:
 .section .text
 .align 2
 .globl trap_entry
-trap_entry:
-        addi    sp, sp, -256
-
-        # Save everything except x2 (sp), which we just changed. Its original
-        # value is reconstructed a few instructions down.
+.macro SAVE_ALL
         .irp n, 0,1,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
         SAVE_GP \n
         .endr
+.endm
 
-        # Record the interrupted code's sp into its slot. Safe to clobber t0
-        # (x5) here because it was saved by the loop above.
-        addi    t0, sp, 256
-        sd      t0, 2*8(sp)
-
-        # First argument to trap_handler: a pointer to the frame we just built.
-        mv      a0, sp
-        call    trap_handler
-
-        # Restore. x0 is skipped because it is hardwired to zero, and x2
-        # because the stack adjustment below is what restores sp.
+.macro LOAD_ALL
+        # x0 skipped (hardwired zero), x2 skipped (sp is handled separately).
         .irp n, 1,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
         LOAD_GP \n
         .endr
+.endm
 
+trap_entry:
+        # ------------------------------------------------------------------
+        # THE STACK PROBLEM.
+        #
+        # A trap from user mode arrives with sp holding a USER stack pointer.
+        # That value is chosen by an untrusted program. It might point at
+        # kernel memory, at a device register, or at nothing mapped at all --
+        # and the very first thing this code wants to do is write 256 bytes to
+        # it. A program could aim the kernel's own register dump at whatever it
+        # liked, or make the trap itself fault.
+        #
+        # So user traps must land on a KERNEL stack, chosen by us, before
+        # anything is written anywhere.
+        #
+        # sscratch is a CSR that exists for exactly this. The convention:
+        #     in USER mode   -> sscratch holds this thread's kernel sp
+        #     in KERNEL mode -> sscratch holds 0
+        #
+        # `csrrw sp, sscratch, sp` swaps them in one instruction, which is the
+        # only way to get a usable stack without first having one to spill to.
+        # ------------------------------------------------------------------
+        csrrw   sp, sscratch, sp
+        bnez    sp, 1f
+
+        # sscratch was 0, so we came from the kernel and sp is fine. Undo the
+        # swap to get it back, and leave sscratch at 0.
+        csrrw   sp, sscratch, sp
+        addi    sp, sp, -256
+        SAVE_ALL
+        # The interrupted sp is just above the frame. Safe to clobber t0, it is
+        # already saved.
+        addi    t0, sp, 256
+        sd      t0, 2*8(sp)
+        j       2f
+
+1:      # We came from USER. sp is now this thread's kernel stack, and the
+        # user's own sp is sitting in sscratch.
+        addi    sp, sp, -256
+        SAVE_ALL
+        csrr    t0, sscratch
+        sd      t0, 2*8(sp)             # record the USER sp in the frame
+        csrw    sscratch, zero          # we are in the kernel now
+
+2:      # First argument to trap_handler: a pointer to the frame.
+        mv      a0, sp
+        call    trap_handler
+
+        # Decide where we are returning to BEFORE restoring registers, while t0
+        # is still ours to clobber. SPP is bit 8 of sstatus: 1 = supervisor.
+        csrr    t0, sstatus
+        andi    t0, t0, 0x100
+        beqz    t0, 3f
+
+        # --- back to supervisor ---
+        LOAD_ALL
         addi    sp, sp, 256
+        sret
+
+3:      # --- back to USER ---
+        # Re-arm sscratch with this thread's kernel sp while we still know it,
+        # so the next user trap can find a stack.
+        addi    t0, sp, 256
+        csrw    sscratch, t0
+        LOAD_ALL
+        ld      sp, 2*8(sp)             # the user's own sp, from the frame
 
         # Return to sepc and restore the pre-trap interrupt-enable state.
         # NOT `ret` -- that would jump to ra, which belongs to the interrupted

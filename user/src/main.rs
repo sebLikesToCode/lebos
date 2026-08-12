@@ -26,9 +26,31 @@ core::arch::global_asm!(
 .section .text.start
 .globl _start
 _start:
+        # 1. A legitimate request. Should succeed and return 14.
         lla     a0, msg         # PC-relative, so it works wherever we are mapped
         li      a1, 14          # length of msg
         li      a7, 1           # SYS_WRITE
+        ecall
+
+        # 2. Ask the kernel to print memory we do not own -- a low address that
+        #    is simply not mapped for us. Should be refused.
+        li      a0, 0x9000
+        li      a1, 8
+        li      a7, 1
+        ecall
+
+        # 3. Ask the kernel to print KERNEL memory. -1 is 0xFFFF...FFFF, which
+        #    is in the high half where the kernel lives. Should be refused.
+        li      a0, -1
+        li      a1, 8
+        li      a7, 1
+        ecall
+
+        # 4. A valid pointer with a length that runs off the end of our
+        #    mapping. Checking only the first page would let this through.
+        lla     a0, msg
+        li      a1, 8192        # two pages past what we own
+        li      a7, 1
         ecall
 
         li      a0, 0

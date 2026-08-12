@@ -277,17 +277,31 @@ Syscall ABI, defined in user/src/main.rs:
     a0..a5  = arguments           0 = exit(code)
     a0      = return value
 
-`enter_user` clears `sstatus.SPP` (return to U-mode), sets SPIE (stay
-preemptible) and sets **SUM** (bit 18), which permits supervisor code to touch
-`U=1` pages. SUM is currently on permanently, and that is a deliberate
-shortcut: `trap_entry` pushes the frame onto whatever `sp` holds, which after a
-user trap is an untrusted USER stack, and `write` reads the user's string
-directly. Both are fixed the same way -- swap to a kernel stack via `sscratch`
-first, and enable SUM only around explicit copies. That is 10c.
+`enter_user` clears `sstatus.SPP` (return to U-mode) and sets SPIE (stay
+preemptible).
 
-**`write` does no pointer validation.** The address comes from an untrusted
-program and is dereferenced on faith. That is 10d and it is the whole point of
-the milestone.
+**`sscratch` holds the kernel stack.** A trap from user mode arrives with `sp`
+chosen by an untrusted program -- it could aim the kernel's own register dump at
+anything, or point somewhere unmapped so the trap itself faults. So the
+convention is: `sscratch` = this thread's kernel sp while in USER mode, and 0
+while in KERNEL mode. `trap_entry` opens with `csrrw sp, sscratch, sp` and
+branches on whether the result is zero, which is the only way to obtain a usable
+stack without already having one. On the way out it re-arms `sscratch` and
+restores the user's own sp from the frame.
+
+**SUM (sstatus bit 18) is OFF by default and that is load-bearing.** With it
+off, a stray kernel dereference of a user pointer *faults* rather than quietly
+succeeding, so accidents stay loud. It is enabled for the duration of a single
+byte inside `copy_from_user` and turned straight back off. Verified: the kernel
+reading the mapped user page with SUM off raises a load page fault.
+
+**`user_range_ok` validates every user pointer** before it is touched, using the
+`probe()` written at milestone 6. The rule is not "is it mapped" but **"is it
+mapped for THEM"** -- the U bit -- because kernel pages are mapped and readable
+and must still be refused. It checks overflow, rejects anything at or above
+2^38, and walks EVERY page in the range: a valid pointer with a length running
+off the end of its mapping is the classic hole. All four cases verified against
+a deliberately hostile user program.
 
 User mode composes with the scheduler for free: the timer preempts the user
 program, its frame lands on its own stack, and the kernel switches to other
@@ -481,10 +495,10 @@ innovation budget is spent at Phase V.
 7. ✅ kernel heap: free list, first fit, splitting, two-way coalescing
 8. ✅ kernel threads + cooperative context switch
 9. ✅ preemption + spinlocks that disable interrupts
-10. ✅ 10a program embedded; ✅ 10b runs in user mode and makes syscalls
-    ⬅ **current** — 10c sscratch + kernel stack swap, 10d pointer validation
+10. ✅ user mode, syscalls, sscratch kernel stacks, SUM discipline, pointer
+    validation
+11. ⬅ **current** — process creation
 8. kernel threads + context switch
-11. process creation
 12. **the object store**, in RAM first: indexes, query, versioning
 13. virtio-blk + persist the store as an append-only log
 14. userspace shell whose commands are queries, not paths
