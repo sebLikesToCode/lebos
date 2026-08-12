@@ -3174,7 +3174,11 @@ extern "C" fn shell() -> ! {
 
             // "if you see me use ubuntu, i might say hi,
             //   but if you see me using arch, i'm a talkative guy"
-            //                                          -- Sebastian, 2026
+            //        -- "Too Late I Already Deleted Windows", parody, via Seb
+            //
+            // Which is the correct song to quote in the one shell on earth
+            // where deleting Windows would not be enough -- the paths would
+            // still be there.
             "ubuntu" => println!("  hi"),
             "arch" => println!("  blah blah blah"),
 

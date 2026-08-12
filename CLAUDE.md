@@ -232,9 +232,12 @@ Already present:
 - `0xd00dfeed` ("dude feed"), inherited from the FDT spec
 - `0x5EBB1E` (SEBBIE) — `BLOCK_MAGIC`, the heap free-block validity marker
 - `0xF01DAB1E` (FOLDABLE) — `LEBOS_MAGIC`, the on-disk format signature
-- `ubuntu` -> "hi" and `arch` -> "blah blah blah" in the shell: *"if you see me
-  use ubuntu, i might say hi, but if you see me using arch, i'm a talkative
-  guy."* Free slot — the unknown-command arm had to be written anyway.
+- `ubuntu` -> "hi" and `arch` -> "blah blah blah" in the shell. From the parody
+  **"Too Late I Already Deleted Windows"**: *"if you see me use ubuntu, i might
+  say hi, but if you see me using arch, i'm a talkative guy."* Attribute it to
+  the song, not to the author. Free slot — the unknown-command arm had to be
+  written anyway, and the joke lands harder in the one shell where deleting
+  Windows would not be enough, because the paths would still be there.
 
 **On `0xF01DAB1E`.** The principle the author landed on after rejecting a dozen
 candidates: *a good magic number is a pun on what the format IS*, the way
