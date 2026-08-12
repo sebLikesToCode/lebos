@@ -327,9 +327,8 @@ innovation budget is spent at Phase V.
 6. ✅ 6a MMU on via Sv39 identity map; ✅ 6b rebuilt at 4 KiB granularity with
    W^X enforced; unhandled exceptions are now fatal
    ✅ 6c-i higher-half direct map alongside the identity map, aliasing proven
-   ✅ 6c-ii the kernel now executes in the higher half (PC, sp, stvec all high)
-   ⬅ **current** — relink at high VMA so the identity map can be dropped
-7. kernel heap
+   ✅ 6c the kernel executes in the higher half and the identity map is gone
+7. ⬅ **current** — kernel heap (GlobalAlloc, unlocks Vec/Box/BTreeMap)
 8. kernel threads + context switch
 9. preemptive scheduler, spinlocks, wait queues — *policy/mechanism split
    starts here*

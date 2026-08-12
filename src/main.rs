@@ -252,6 +252,13 @@ extern "C" fn kmain_high() -> ! {
     }
     println!("reloc: identity map removed -- the low half is free for user programs");
 
+    let rp = ROOT.load(Ordering::Relaxed);
+    println!("map:");
+    explain(rp, here());
+    explain(rp, va(UART0_PHYS));
+    explain(rp, &BANNER as *const _ as usize);
+    explain(rp, 0x8020_0000);
+
     // Schedule the first timer interrupt one tick out.
     sbi_set_timer(now() + TICK_INTERVAL);
 
@@ -387,6 +394,69 @@ const PTE_W: usize = 1 << 2; // writable
 const PTE_X: usize = 1 << 3; // executable
 const PTE_A: usize = 1 << 6; // accessed  (hardware sets this)
 const PTE_D: usize = 1 << 7; // dirty     (hardware sets this)
+
+// Bits 8-9 are RSW: "reserved for software". The spec guarantees the hardware
+// ignores them entirely, which makes them two free bits on every single page.
+//
+// Spent here on recording WHY a page was mapped. When a fault arrives with
+// nothing but an address, `probe()` can answer "that's device MMIO" or "that's
+// kernel text" instead of leaving you to grep the source for the range.
+//
+// Real kernels use these for things like marking copy-on-write pages, which
+// is where these will probably end up eventually.
+const RSW_SHIFT: usize = 8;
+#[allow(dead_code)] // the zero tag; here for completeness
+const RSW_NONE: usize = 0 << RSW_SHIFT;
+const RSW_TEXT: usize = 1 << RSW_SHIFT;
+const RSW_DEV: usize = 2 << RSW_SHIFT;
+const RSW_DATA: usize = 3 << RSW_SHIFT;
+
+fn rsw_name(pte: usize) -> &'static str {
+    match pte & (3 << RSW_SHIFT) {
+        RSW_TEXT => "kernel text",
+        RSW_DEV => "device mmio",
+        RSW_DATA => "data/heap",
+        _ => "untagged",
+    }
+}
+
+/// Walk the page table by hand for one virtual address -- exactly what the MMU
+/// does, but visible. Returns the leaf entry, or None if nothing is mapped.
+///
+/// This is the tool for "why did that address fault?", and the reason the RSW
+/// tags above are worth spending.
+fn probe(root_pa: usize, addr: usize) -> Option<usize> {
+    let mut table = va(root_pa) as *const usize;
+    for level in [2_usize, 1, 0] {
+        let idx = (addr >> (12 + 9 * level)) & 0x1ff;
+        let entry = unsafe { *table.add(idx) };
+        if entry & PTE_V == 0 {
+            return None;
+        }
+        // A leaf: any of R/W/X set. Branches have all three clear.
+        if entry & (PTE_R | PTE_W | PTE_X) != 0 {
+            return Some(entry);
+        }
+        table = va(pte_to_pa(entry)) as *const usize;
+    }
+    None
+}
+
+/// Print what a virtual address resolves to, and why it exists.
+fn explain(root_pa: usize, addr: usize) {
+    match probe(root_pa, addr) {
+        None => println!("  {:#018x} -> UNMAPPED", addr),
+        Some(e) => println!(
+            "  {:#018x} -> {:#012x}  {}{}{}  {}",
+            addr,
+            pte_to_pa(e) | (addr & (PAGE_SIZE - 1)),
+            if e & PTE_R != 0 { 'r' } else { '-' },
+            if e & PTE_W != 0 { 'w' } else { '-' },
+            if e & PTE_X != 0 { 'x' } else { '-' },
+            rsw_name(e),
+        ),
+    }
+}
 
 /// Build an entry pointing at physical address `pa`.
 ///
@@ -531,18 +601,18 @@ fn paging_init(ram_end: usize) {
     // --- the identity map, still what the kernel actually runs on ---
 
     // Devices. Read/write, never executable.
-    map_range(root, 0x1000_0000, 0x1000_1000, 0, PTE_R | PTE_W); // UART0
-    map_range(root, 0x0200_0000, 0x0201_0000, 0, PTE_R | PTE_W); // CLINT
-    map_range(root, 0x0c00_0000, 0x0c60_0000, 0, PTE_R | PTE_W); // PLIC
+    map_range(root, 0x1000_0000, 0x1000_1000, 0, PTE_R | PTE_W | RSW_DEV); // UART0
+    map_range(root, 0x0200_0000, 0x0201_0000, 0, PTE_R | PTE_W | RSW_DEV); // CLINT
+    map_range(root, 0x0c00_0000, 0x0c60_0000, 0, PTE_R | PTE_W | RSW_DEV); // PLIC
 
     // Kernel code: executable, NOT writable.
-    map_range(root, text_start, text_end, 0, PTE_R | PTE_X);
+    map_range(root, text_start, text_end, 0, PTE_R | PTE_X | RSW_TEXT);
     // Constants and string literals: read only. Not writable, not executable.
-    map_range(root, rodata_start, rodata_end, 0, PTE_R);
+    map_range(root, rodata_start, rodata_end, 0, PTE_R | RSW_DATA);
     // Globals, .bss and the boot stack: writable, NOT executable.
-    map_range(root, data_start, kernel_end, 0, PTE_R | PTE_W);
+    map_range(root, data_start, kernel_end, 0, PTE_R | PTE_W | RSW_DATA);
     // Everything the frame allocator hands out: writable, not executable.
-    map_range(root, kernel_end, ram_end, 0, PTE_R | PTE_W);
+    map_range(root, kernel_end, ram_end, 0, PTE_R | PTE_W | RSW_DATA);
 
     // --- the higher-half alias of the same physical memory ---
     //
@@ -553,13 +623,49 @@ fn paging_init(ram_end: usize) {
     // stone to relocating the kernel: it means the kernel can reach ANY
     // physical page by adding a constant. At milestone 11, editing another
     // process's page tables becomes arithmetic instead of a special case.
-    map_range(root, 0x1000_0000, 0x1000_1000, HIGH_BASE, PTE_R | PTE_W);
-    map_range(root, 0x0200_0000, 0x0201_0000, HIGH_BASE, PTE_R | PTE_W);
-    map_range(root, 0x0c00_0000, 0x0c60_0000, HIGH_BASE, PTE_R | PTE_W);
-    map_range(root, text_start, text_end, HIGH_BASE, PTE_R | PTE_X);
-    map_range(root, rodata_start, rodata_end, HIGH_BASE, PTE_R);
-    map_range(root, data_start, kernel_end, HIGH_BASE, PTE_R | PTE_W);
-    map_range(root, kernel_end, ram_end, HIGH_BASE, PTE_R | PTE_W);
+    map_range(
+        root,
+        0x1000_0000,
+        0x1000_1000,
+        HIGH_BASE,
+        PTE_R | PTE_W | RSW_DEV,
+    );
+    map_range(
+        root,
+        0x0200_0000,
+        0x0201_0000,
+        HIGH_BASE,
+        PTE_R | PTE_W | RSW_DEV,
+    );
+    map_range(
+        root,
+        0x0c00_0000,
+        0x0c60_0000,
+        HIGH_BASE,
+        PTE_R | PTE_W | RSW_DEV,
+    );
+    map_range(
+        root,
+        text_start,
+        text_end,
+        HIGH_BASE,
+        PTE_R | PTE_X | RSW_TEXT,
+    );
+    map_range(root, rodata_start, rodata_end, HIGH_BASE, PTE_R | RSW_DATA);
+    map_range(
+        root,
+        data_start,
+        kernel_end,
+        HIGH_BASE,
+        PTE_R | PTE_W | RSW_DATA,
+    );
+    map_range(
+        root,
+        kernel_end,
+        ram_end,
+        HIGH_BASE,
+        PTE_R | PTE_W | RSW_DATA,
+    );
 
     println!("  text   {:#x}..{:#x}  R-X", text_start, text_end);
     println!("  rodata {:#x}..{:#x}  R--", rodata_start, rodata_end);
