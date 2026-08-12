@@ -384,6 +384,46 @@ extern "C" fn kmain_high() -> ! {
 
     store_demo();
 
+    // Milestone 13a: prove the disk works before trusting it with the store.
+    if virtio_blk_init() {
+        println!(
+            "disk: virtio-blk found at {:#x}",
+            BLK_BASE.load(Ordering::Relaxed)
+        );
+        let buf = frame_alloc().expect("no frame for a disk buffer") as usize;
+        unsafe {
+            let p = va(buf) as *mut u8;
+            core::ptr::write_bytes(p, 0, SECTOR);
+            // 0xF11E1E55 spells FILELESS. First four bytes of every LeBOS disk.
+            core::ptr::write_volatile(p as *mut u32, 0xF11E_1E55);
+            for (i, b) in b"LeBOS -- no files. no paths. no regrets."
+                .iter()
+                .enumerate()
+            {
+                core::ptr::write_volatile(p.add(4 + i), *b);
+            }
+        }
+        let wrote = blk_rw(0, buf, true);
+
+        // Scrub the buffer so a successful read cannot be the old contents.
+        unsafe { core::ptr::write_bytes(va(buf) as *mut u8, 0xAA, SECTOR) };
+        let read = blk_rw(0, buf, false);
+
+        unsafe {
+            let p = va(buf) as *const u8;
+            let magic = core::ptr::read_volatile(p as *const u32);
+            println!("disk: wrote={} read={} magic={:#x}", wrote, read, magic);
+            print!("disk: sector 0 says \"");
+            for i in 0..40 {
+                putchar(core::ptr::read_volatile(p.add(4 + i)));
+            }
+            println!("\"");
+        }
+        frame_free(buf as *mut u8);
+    } else {
+        println!("disk: no virtio-blk device found");
+    }
+
     // 10a: a second binary now exists inside the kernel image. It is not
     // running -- there is no user mode yet, and nothing has mapped it. This
     // just proves the toolchain produced it and the kernel can see it.
@@ -1381,6 +1421,8 @@ fn paging_init(ram_end: usize) {
 
     // Devices. Read/write, never executable.
     map_range(root, 0x1000_0000, 0x1000_1000, 0, PTE_R | PTE_W | RSW_DEV); // UART0
+                                                                           // Eight virtio-mmio slots, immediately above the UART.
+    map_range(root, 0x1000_1000, 0x1000_9000, 0, PTE_R | PTE_W | RSW_DEV);
     map_range(root, 0x0200_0000, 0x0201_0000, 0, PTE_R | PTE_W | RSW_DEV); // CLINT
     map_range(root, 0x0c00_0000, 0x0c60_0000, 0, PTE_R | PTE_W | RSW_DEV); // PLIC
 
@@ -1406,6 +1448,15 @@ fn paging_init(ram_end: usize) {
         root,
         0x1000_0000,
         0x1000_1000,
+        HIGH_BASE,
+        PTE_R | PTE_W | RSW_DEV,
+    );
+    // Eight virtio-mmio slots, immediately above the UART. Needed in the HIGH
+    // map specifically -- the driver runs long after the identity map is gone.
+    map_range(
+        root,
+        0x1000_1000,
+        0x1000_9000,
         HIGH_BASE,
         PTE_R | PTE_W | RSW_DEV,
     );
@@ -2432,6 +2483,281 @@ fn store_query(conds: &[Cond]) -> alloc::vec::Vec<ObjId> {
     // id, and a query for hidden = 1 finds them -- that view IS the
     // "Cluttered" folder.
     ids.into_iter().filter(|id| !is_hidden(*id)).collect()
+}
+
+// ===========================================================================
+// virtio-blk -- milestone 13
+//
+// Real disk controllers are decades of accumulated registers and quirks, so
+// virtual machines use virtio instead: rather than emulating hardware, the
+// guest and hypervisor agree on a shared-memory protocol.
+//
+// The whole device is three arrays we share with QEMU:
+//
+//   descriptors   { physical address, length, flags, next }
+//   available     indices the DRIVER has queued
+//   used          indices the DEVICE has finished
+//
+// A restaurant pass: descriptors are the shelf of trays, `available` is the
+// order rail, `used` is the done rail.
+//
+// THE IMPORTANT PART: the device does DMA. It does not go through the MMU.
+// Every address in a descriptor is PHYSICAL, and the device writes straight to
+// physical memory -- no page table, no permission bits, no U bit, no SUM.
+// Everything milestone 6 built to control what may touch what does not apply
+// to hardware. A wrong descriptor address is unbounded silent corruption with
+// no fault to catch it. (Real machines put an IOMMU in front of devices for
+// exactly this; using QEMU's is a much later problem.)
+// ===========================================================================
+
+/// QEMU's virt board puts eight virtio-mmio slots here, 0x1000 apart.
+const VIRTIO_MMIO_BASE: usize = 0x1000_1000;
+const VIRTIO_MMIO_STRIDE: usize = 0x1000;
+const VIRTIO_MMIO_SLOTS: usize = 8;
+
+const VIRTIO_MAGIC: u32 = 0x7472_6976; // "virt"
+const VIRTIO_ID_BLOCK: u32 = 2;
+
+// Register offsets, virtio-mmio version 2.
+const R_MAGIC: usize = 0x000;
+const R_VERSION: usize = 0x004;
+const R_DEVICE_ID: usize = 0x008;
+const R_DEVICE_FEATURES: usize = 0x010;
+const R_DEVICE_FEATURES_SEL: usize = 0x014;
+const R_DRIVER_FEATURES: usize = 0x020;
+const R_DRIVER_FEATURES_SEL: usize = 0x024;
+const R_QUEUE_SEL: usize = 0x030;
+const R_QUEUE_NUM_MAX: usize = 0x034;
+const R_QUEUE_NUM: usize = 0x038;
+const R_QUEUE_READY: usize = 0x044;
+const R_QUEUE_NOTIFY: usize = 0x050;
+const R_INTERRUPT_STATUS: usize = 0x060;
+const R_INTERRUPT_ACK: usize = 0x064;
+const R_STATUS: usize = 0x070;
+const R_QUEUE_DESC_LOW: usize = 0x080;
+const R_QUEUE_DESC_HIGH: usize = 0x084;
+const R_QUEUE_DRIVER_LOW: usize = 0x090;
+const R_QUEUE_DRIVER_HIGH: usize = 0x094;
+const R_QUEUE_DEVICE_LOW: usize = 0x0a0;
+const R_QUEUE_DEVICE_HIGH: usize = 0x0a4;
+
+// Status bits, written in this order during negotiation.
+const S_ACKNOWLEDGE: u32 = 1;
+const S_DRIVER: u32 = 2;
+const S_DRIVER_OK: u32 = 4;
+const S_FEATURES_OK: u32 = 8;
+
+const VRING_DESC_F_NEXT: u16 = 1;
+const VRING_DESC_F_WRITE: u16 = 2; // device writes, i.e. we are reading
+
+const QUEUE_SIZE: usize = 8;
+const SECTOR: usize = 512;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct VringDesc {
+    addr: u64, // PHYSICAL -- the device does not use our page tables
+    len: u32,
+    flags: u16,
+    next: u16,
+}
+
+#[repr(C)]
+struct BlkReqHeader {
+    kind: u32, // 0 = read, 1 = write
+    reserved: u32,
+    sector: u64,
+}
+
+/// Base address of the block device, once found. 0 = none.
+static BLK_BASE: AtomicUsize = AtomicUsize::new(0);
+/// Physical address of the queue's frame.
+static BLK_QUEUE: AtomicUsize = AtomicUsize::new(0);
+
+fn vio_read(base: usize, off: usize) -> u32 {
+    unsafe { core::ptr::read_volatile(va(base + off) as *const u32) }
+}
+
+fn vio_write(base: usize, off: usize, v: u32) {
+    unsafe { core::ptr::write_volatile(va(base + off) as *mut u32, v) }
+}
+
+// The queue lives in one physical frame, laid out by hand:
+//     0      descriptor table   8 * 16 = 128 bytes
+//   256      available ring
+//   512      used ring
+// All three well inside a page and correctly aligned.
+const OFF_DESC: usize = 0;
+const OFF_AVAIL: usize = 256;
+const OFF_USED: usize = 512;
+
+/// Find the block device and bring it up.
+///
+/// The negotiation order is fixed by the spec: acknowledge, claim the driver
+/// role, agree features, confirm, set up the queue, then say we are ready.
+/// Deviating silently gets ignored by the device rather than reported.
+fn virtio_blk_init() -> bool {
+    let mut base = 0;
+    for i in 0..VIRTIO_MMIO_SLOTS {
+        let b = VIRTIO_MMIO_BASE + i * VIRTIO_MMIO_STRIDE;
+        if vio_read(b, R_MAGIC) == VIRTIO_MAGIC
+            && vio_read(b, R_VERSION) == 2
+            && vio_read(b, R_DEVICE_ID) == VIRTIO_ID_BLOCK
+        {
+            base = b;
+            break;
+        }
+    }
+    if base == 0 {
+        println!("disk: scanning virtio slots --");
+        for i in 0..VIRTIO_MMIO_SLOTS {
+            let b = VIRTIO_MMIO_BASE + i * VIRTIO_MMIO_STRIDE;
+            println!(
+                "  {:#x}  magic={:#x} version={} device_id={}",
+                b,
+                vio_read(b, R_MAGIC),
+                vio_read(b, R_VERSION),
+                vio_read(b, R_DEVICE_ID)
+            );
+        }
+        return false;
+    }
+
+    vio_write(base, R_STATUS, 0); // reset
+    vio_write(base, R_STATUS, S_ACKNOWLEDGE);
+    vio_write(base, R_STATUS, S_ACKNOWLEDGE | S_DRIVER);
+
+    // Accept no optional features: the plain read/write path is all we need,
+    // and every feature accepted is protocol we then have to implement.
+    vio_write(base, R_DEVICE_FEATURES_SEL, 0);
+    let _ = vio_read(base, R_DEVICE_FEATURES);
+    vio_write(base, R_DRIVER_FEATURES_SEL, 0);
+    vio_write(base, R_DRIVER_FEATURES, 0);
+    vio_write(base, R_DRIVER_FEATURES_SEL, 1);
+    vio_write(base, R_DRIVER_FEATURES, 1); // VIRTIO_F_VERSION_1, bit 32
+
+    vio_write(base, R_STATUS, S_ACKNOWLEDGE | S_DRIVER | S_FEATURES_OK);
+    if vio_read(base, R_STATUS) & S_FEATURES_OK == 0 {
+        return false; // the device refused our feature set
+    }
+
+    let q = frame_alloc().expect("no frame for the virtio queue") as usize;
+    unsafe { core::ptr::write_bytes(va(q) as *mut u8, 0, PAGE_SIZE) };
+    BLK_QUEUE.store(q, Ordering::Relaxed);
+
+    vio_write(base, R_QUEUE_SEL, 0);
+    if (vio_read(base, R_QUEUE_NUM_MAX) as usize) < QUEUE_SIZE {
+        return false;
+    }
+    vio_write(base, R_QUEUE_NUM, QUEUE_SIZE as u32);
+
+    // PHYSICAL addresses. The device cannot follow our page tables.
+    vio_write(base, R_QUEUE_DESC_LOW, (q + OFF_DESC) as u32);
+    vio_write(base, R_QUEUE_DESC_HIGH, ((q + OFF_DESC) >> 32) as u32);
+    vio_write(base, R_QUEUE_DRIVER_LOW, (q + OFF_AVAIL) as u32);
+    vio_write(base, R_QUEUE_DRIVER_HIGH, ((q + OFF_AVAIL) >> 32) as u32);
+    vio_write(base, R_QUEUE_DEVICE_LOW, (q + OFF_USED) as u32);
+    vio_write(base, R_QUEUE_DEVICE_HIGH, ((q + OFF_USED) >> 32) as u32);
+    vio_write(base, R_QUEUE_READY, 1);
+
+    vio_write(
+        base,
+        R_STATUS,
+        S_ACKNOWLEDGE | S_DRIVER | S_FEATURES_OK | S_DRIVER_OK,
+    );
+    BLK_BASE.store(base, Ordering::Relaxed);
+    true
+}
+
+/// One sector in or out. `write` selects the direction.
+///
+/// Builds the three-descriptor chain the block device expects: a header it
+/// reads, a data buffer, and a status byte it writes.
+fn blk_rw(sector: u64, buf_phys: usize, write: bool) -> bool {
+    let base = BLK_BASE.load(Ordering::Relaxed);
+    let q = BLK_QUEUE.load(Ordering::Relaxed);
+    if base == 0 {
+        println!("disk: scanning virtio slots --");
+        for i in 0..VIRTIO_MMIO_SLOTS {
+            let b = VIRTIO_MMIO_BASE + i * VIRTIO_MMIO_STRIDE;
+            println!(
+                "  {:#x}  magic={:#x} version={} device_id={}",
+                b,
+                vio_read(b, R_MAGIC),
+                vio_read(b, R_VERSION),
+                vio_read(b, R_DEVICE_ID)
+            );
+        }
+        return false;
+    }
+
+    // Header and status live in the tail of the queue frame -- already
+    // physically contiguous and known to the device.
+    let hdr_phys = q + 1024;
+    let status_phys = q + 1024 + core::mem::size_of::<BlkReqHeader>();
+
+    unsafe {
+        core::ptr::write_volatile(
+            va(hdr_phys) as *mut BlkReqHeader,
+            BlkReqHeader {
+                kind: if write { 1 } else { 0 },
+                reserved: 0,
+                sector,
+            },
+        );
+        core::ptr::write_volatile(va(status_phys) as *mut u8, 0xff);
+
+        let desc = va(q + OFF_DESC) as *mut VringDesc;
+
+        // 0: the request header. The device READS this.
+        *desc.add(0) = VringDesc {
+            addr: hdr_phys as u64,
+            len: core::mem::size_of::<BlkReqHeader>() as u32,
+            flags: VRING_DESC_F_NEXT,
+            next: 1,
+        };
+        // 1: the data. Device WRITES it on a read, reads it on a write.
+        *desc.add(1) = VringDesc {
+            addr: buf_phys as u64,
+            len: SECTOR as u32,
+            flags: VRING_DESC_F_NEXT | if write { 0 } else { VRING_DESC_F_WRITE },
+            next: 2,
+        };
+        // 2: one status byte. The device WRITES it.
+        *desc.add(2) = VringDesc {
+            addr: status_phys as u64,
+            len: 1,
+            flags: VRING_DESC_F_WRITE,
+            next: 0,
+        };
+
+        // Clip the ticket to the order rail: ring[idx % size] = head, then
+        // bump idx. The device reads idx to know how far we have got.
+        let avail = va(q + OFF_AVAIL) as *mut u16;
+        let idx = core::ptr::read_volatile(avail.add(1));
+        core::ptr::write_volatile(avail.add(2 + (idx as usize % QUEUE_SIZE)), 0);
+        core::arch::asm!("fence ow, ow"); // descriptors visible before idx
+        core::ptr::write_volatile(avail.add(1), idx.wrapping_add(1));
+
+        vio_write(base, R_QUEUE_NOTIFY, 0);
+
+        // Watch the done rail. Polling rather than interrupts: the PLIC is not
+        // wired up yet, and a spin is honest for a single blocking read.
+        let used = va(q + OFF_USED) as *const u16;
+        let start = now();
+        loop {
+            core::arch::asm!("fence ir, ir");
+            if core::ptr::read_volatile(used.add(1)) != idx {
+                break;
+            }
+            if now() - start > TIMER_HZ {
+                return false; // one second: the device is not answering
+            }
+        }
+
+        vio_write(base, R_INTERRUPT_ACK, vio_read(base, R_INTERRUPT_STATUS));
+        core::ptr::read_volatile(va(status_phys) as *const u8) == 0
+    }
 }
 
 // ===========================================================================

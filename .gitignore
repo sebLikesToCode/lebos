@@ -16,3 +16,6 @@ src/entry2.S
 # user program build artifacts
 user/target
 user/hello.bin
+
+# disk image
+lebos.img

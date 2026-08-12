@@ -6,8 +6,18 @@ PLAY    := src/main2.rs
 PLAYBIN := target/$(TARGET)/debug/main2
 
 QEMU    := qemu-system-riscv64
+DISK    := lebos.img
+
 QFLAGS  := -machine virt -cpu rv64 -smp 1 -m 128M -nographic \
-           -serial mon:stdio -bios default
+           -serial mon:stdio -bios default \
+           -drive file=$(DISK),if=none,format=raw,id=d0 \
+           -device virtio-blk-device,drive=d0 \
+           -global virtio-mmio.force-legacy=false
+
+## disk    -- create the backing store image if it does not exist
+$(DISK):
+	@qemu-img create -f raw $(DISK) 64M >/dev/null
+	@echo "created $(DISK) (64 MiB)"
 
 .PHONY: build run debug gdb clean objdump nm size dumpdtb check fmt \
         play resync playdiff user
@@ -31,7 +41,7 @@ user: $(USERBIN)
 
 ## build   -- compile the kernel ELF.
 ##            Only --bin lebos, so a broken main2.rs can never block this.
-build: $(USERBIN) $(PLAY)
+build: $(USERBIN) $(PLAY) $(DISK)
 	cargo build --bin lebos
 
 ## run     -- boot the kernel in QEMU. Quit with: Ctrl-A then X
@@ -121,4 +131,4 @@ clean:
 	cargo clean
 	cd user && cargo clean
 	rm -f $(USERBIN)
-	rm -f qemu.log virt.dtb virt.dts
+	rm -f qemu.log virt.dtb virt.dts $(DISK)

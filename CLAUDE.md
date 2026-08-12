@@ -383,6 +383,31 @@ rust-toolchain.toml  pinned to stable — nightly is not needed for rv64
 dev is deliberate — `opt-level = 0` produces stack frames large enough to
 overflow the 64 KiB boot stack.
 
+## The disk
+
+`virtio-blk` over virtio-mmio. Three shared arrays -- descriptors, an available
+ring, a used ring -- and a three-descriptor chain per request: a header the
+device reads, a data buffer, and a status byte it writes.
+
+**The device does DMA and does NOT go through the MMU.** Every address in a
+descriptor is PHYSICAL, and the device writes straight to physical memory --
+no page table, no permission bits, no U bit, no SUM. Everything milestone 6
+built to control what may touch what does not apply to hardware, and a wrong
+descriptor address is unbounded silent corruption with no fault to catch it.
+Real machines put an IOMMU in front of devices for exactly this.
+
+Two things cost real time to find, both worth remembering:
+
+- **The virtio slots are not mapped by default.** They sit at
+  `0x10001000..0x10009000`, just above the UART, and must be in the HIGH map --
+  the driver runs long after the identity map is gone.
+- **QEMU defaults virtio-mmio to LEGACY (version 1)**, which has a completely
+  different register layout (a single `QueuePFN` rather than separate
+  descriptor/available/used addresses). The scan found `device_id=2` at
+  `0x10008000` with `version=1` and the modern setup silently did nothing. Fixed
+  with `-global virtio-mmio.force-legacy=false` in the Makefile. On real
+  hardware you would have to handle whichever version you were given.
+
 ## Store design -- DECIDED, 2026-08-12
 
 Worked out in conversation with the author. These are his calls; do not
@@ -611,7 +636,8 @@ innovation budget is spent at Phase V.
 11. ✅ process creation -- one address space per process
 12. ✅ store: blobs + objects, typed attributes, query, syscalls,
     hide/evict/forget via claims
-13. ⬅ **current** — virtio-blk and persistence (0x1EB05 gets spent here)
+13. ✅ 13a virtio-blk driver: a sector written and read back
+    ⬅ **current** — 13b the store as an append-only log on disk
 
 Known, not yet fixed: `EVENTS` grows without bound (every access appends,
 nothing trims). `SpinLock` is NOT reentrant -- taking the same lock twice
