@@ -306,6 +306,30 @@ extern "C" fn kmain_high() -> ! {
         );
     }
 
+    // =====================================================================
+    //  SCRATCH ZONE
+    //
+    //  Put experiments HERE, in src/main2.rs, then `make play`.
+    //
+    //  By this point everything is up: paging, the heap, println!, traps.
+    //  Code here runs once, before the idle loop below.
+    //
+    //  This marker lives in main.rs so that `make resync` always gives you a
+    //  fresh copy of it. Nothing you write inside it is precious --
+    //  `make resync` wipes main2.rs back to this file.
+    //
+    //  Useful imports:
+    //      use alloc::boxed::Box;
+    //      use alloc::string::String;
+    //      use alloc::vec::Vec;
+    // =====================================================================
+
+    // ---- your experiments go here ----
+
+    // =====================================================================
+    //  END SCRATCH ZONE
+    // =====================================================================
+
     // Schedule the first timer interrupt one tick out.
     sbi_set_timer(now() + TICK_INTERVAL);
 
