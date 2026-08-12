@@ -555,11 +555,17 @@ fn process_spawn(name: &'static str, tag: u8) -> usize {
     ctx.sp = top;
     ctx.s[0] = user_thread_entry as *const () as usize;
 
+    // The heap starts on the first page-aligned address past the program.
+    // Below it: the program, and below that the stack. Above it: nothing yet,
+    // which is exactly what a break means.
+    let brk = USER_BASE + USER_PROG.len().div_ceil(PAGE_SIZE) * PAGE_SIZE;
+
     thread_insert(Thread {
         ctx,
         satp,
         root_pa,
         user_sp,
+        brk,
         name,
         state: ThreadState::Runnable,
         parent: current_addr(),
@@ -1167,6 +1173,11 @@ const PTE_U: usize = 1 << 4; // user mode may access this page
 
 /// Bytes of user stack. One frame is plenty for a program this small.
 const USER_STACK_SIZE: usize = PAGE_SIZE;
+
+/// How far a process may push its break. A cap rather than "until memory runs
+/// out", because one greedy program should not be able to starve the machine
+/// -- and because it makes the overflow check on the request trivially safe.
+const USER_HEAP_MAX: usize = 4 * 1024 * 1024;
 
 /// The kernel's own satp value, so kernel threads can be switched back to it.
 static KERNEL_SATP: AtomicUsize = AtomicUsize::new(0);
@@ -2171,6 +2182,12 @@ struct Thread {
     root_pa: usize,
     /// Initial user stack pointer, for a thread that will drop to user mode.
     user_sp: usize,
+    /// The BREAK: the boundary between this process's mapped memory and
+    /// nothing. One of the oldest names in Unix. `sbrk` moves it outward and
+    /// the kernel maps the land that just came inside the fence. 0 for a
+    /// kernel thread, which has no such boundary -- the kernel heap is one
+    /// fixed region carved out at boot.
+    brk: usize,
     name: &'static str,
     state: ThreadState,
     /// The address of the Thread that spawned this one, or 0 for thread 0.
@@ -2217,6 +2234,7 @@ fn threads_init() {
         satp: KERNEL_SATP.load(Ordering::Relaxed),
         root_pa: 0,
         user_sp: 0,
+        brk: 0,
         name: "main",
         state: ThreadState::Runnable,
         parent: 0, // nothing spawned it; it has been running since _start
@@ -2249,6 +2267,7 @@ fn thread_spawn(name: &'static str, entry: extern "C" fn() -> !) {
         satp: KERNEL_SATP.load(Ordering::Relaxed),
         root_pa: 0,
         user_sp: 0,
+        brk: 0,
         name,
         state: ThreadState::Runnable,
         parent: current_addr(),
@@ -4388,6 +4407,69 @@ extern "C" fn trap_handler(frame: &mut TrapFrame) {
                 // is dismantled and the thread leaves the run queue for good.
                 thread_exit(arg0 as i32);
             }
+            // sbrk(n) -> the OLD break, or usize::MAX on refusal.
+            //
+            // "Move my fence out by n bytes." Only the kernel can do it,
+            // because only the kernel writes page tables.
+            //
+            // The return value is where the fence USED TO BE, which trips
+            // everyone the first time -- but that is the START ADDRESS of the
+            // land just enclosed, and the new far end is of no interest to the
+            // caller. Same convention as Unix has used since the beginning.
+            4 => {
+                let cur = CURRENT.load(Ordering::Relaxed);
+                let old = THREADS.lock()[cur].brk;
+
+                if arg0 == 0 {
+                    // Asking for nothing is how a program finds out where its
+                    // fence currently stands.
+                    old
+                } else if arg0 > USER_HEAP_MAX || old + arg0 > USER_BASE + USER_HEAP_MAX {
+                    // A request that could not possibly be honest. Refusing is
+                    // not politeness -- an untrusted program asking for
+                    // 2^63 bytes must not be allowed to wrap the addition.
+                    println!("user: REFUSED sbrk({}) -- too large", arg0);
+                    usize::MAX
+                } else {
+                    let new = old + arg0;
+                    let mut page = align_up(old, PAGE_SIZE);
+                    let end = align_up(new, PAGE_SIZE);
+                    let root = va(cur_root) as *mut usize;
+                    let mut ok = true;
+
+                    // Only whole pages can be mapped, so a partial page at the
+                    // old break is already there and gets skipped.
+                    while page < end {
+                        match frame_alloc() {
+                            Some(f) => {
+                                // Zero it. A fresh page carries whatever the
+                                // last process left behind, and handing that
+                                // to a new one leaks its memory across a
+                                // security boundary.
+                                unsafe {
+                                    core::ptr::write_bytes(va(f as usize) as *mut u8, 0, PAGE_SIZE)
+                                };
+                                map(root, page, f as usize, PTE_R | PTE_W | PTE_U | RSW_DATA);
+                            }
+                            None => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                        page += PAGE_SIZE;
+                    }
+
+                    if ok {
+                        unsafe { core::arch::asm!("sfence.vma") };
+                        THREADS.lock()[cur].brk = new;
+                        old
+                    } else {
+                        println!("user: sbrk({}) -- out of memory", arg0);
+                        usize::MAX
+                    }
+                }
+            }
+
             // create(buf, len) -> object id, or usize::MAX on refusal.
             //
             // One pointer to validate. Everything nested lives inside the

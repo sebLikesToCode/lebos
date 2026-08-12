@@ -38,6 +38,13 @@ const SYS_EXIT: usize = 0;
 const SYS_WRITE: usize = 1;
 const SYS_CREATE: usize = 2;
 const SYS_QUERY: usize = 3;
+const SYS_SBRK: usize = 4;
+
+/// Ask the kernel to move this program's break outward, and get back where it
+/// USED to be -- which is the first address of the new memory.
+fn sbrk(n: usize) -> usize {
+    unsafe { syscall4(SYS_SBRK, n, 0, 0, 0) }
+}
 
 unsafe fn syscall4(n: usize, a0: usize, a1: usize, a2: usize, a3: usize) -> usize {
     let ret: usize;
@@ -172,6 +179,28 @@ extern "C" fn umain() -> ! {
     write(b"user: malformed create returned ");
     print_num(if r == usize::MAX { 1 } else { 0 });
     write(b" (1 = refused)\n");
+
+    // Milestone 17: memory this program did not have at compile time.
+    //
+    // No allocator yet -- that is the other half. This only proves the fence
+    // moved and the land behind it is real: write a word, read it back.
+    let a = sbrk(0);
+    let p = sbrk(4096);
+    if p == usize::MAX {
+        write(b"user: sbrk refused\n");
+    } else {
+        unsafe { core::ptr::write_volatile(p as *mut usize, 0x1EB05) };
+        let back = unsafe { core::ptr::read_volatile(p as *const usize) };
+        write(b"user: break was ");
+        print_num(a);
+        write(b", sbrk gave ");
+        print_num(p);
+        write(b", now ");
+        print_num(sbrk(0));
+        write(b"\nuser: wrote 0x1eb05 to fresh memory, read back ");
+        print_num(back);
+        write(if back == 0x1EB05 { b" (ok)\n" } else { b" (WRONG)\n" });
+    }
 
     unsafe { syscall4(SYS_EXIT, 0, 0, 0, 0) };
 

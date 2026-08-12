@@ -304,6 +304,14 @@ Syscall ABI, defined in user/src/main.rs:
     1  write(ptr, len)
     2  create(buf, len)                 -> object id, or usize::MAX
     3  query(buf, len, out, out_cap)    -> ids written, or usize::MAX
+    4  sbrk(n)                          -> the OLD break, or usize::MAX
+
+`sbrk(n)` moves the process's BREAK -- the boundary between mapped memory and
+nothing -- outward by n bytes and maps the pages behind it. It returns where
+the fence USED to be, because that is the start address of the new land. Fresh
+frames are zeroed: handing on whatever the last process left there would leak
+memory across a security boundary. Capped at `USER_HEAP_MAX` (4 MiB), which
+also makes the overflow check on an untrusted request trivially safe.
 
 `enter_user` clears `sstatus.SPP` (return to U-mode) and sets SPIE (stay
 preemptible).
@@ -838,8 +846,8 @@ that existed. Phase VI ends with `lebos` being a kernel and nothing else.
 
 15. ✅ PLIC + interrupt-driven console
 16. ✅ process lifecycle: exit, wait, reap, sleep/wake
-17. ⬅ **current** — userspace memory: an `sbrk` syscall, which unlocks
-    `alloc` in user programs
+17. ⬅ **current** — userspace memory. Kernel half DONE (`sbrk`, syscall 4);
+    the userspace bump allocator is Sebastian's half, in progress
 18. the store syscalls a shell needs: get, hide, evict, forget, save, readline
 19. **exec-by-query** — a program is an object with `type=program`, so running
     one means running a QUERY. `execve("/bin/sh")` is a path lookup in every OS
