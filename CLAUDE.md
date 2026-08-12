@@ -93,48 +93,61 @@ Written as `Vec<Thread>` it crashed: spawning the fifth thread grew the Vec past
 capacity 4, every suspended thread's context moved, and the pointers became
 freed memory. Boxing lets the Vec move while the threads never do.
 
-**OPEN BUG, found 2026-08-12. One real cause fixed, at least one remains.**
+## Two open bugs
 
-Only reproduces with `TICK_INTERVAL` at 500 us or shorter; green at the shipped
-10 ms. Must be finished before relying on user mode, which multiplies traps.
+### 1. Heavy preemption crash
 
-**Reproduction:** 500 us quantum plus any thread doing `println!` then
+Reproduces with `TICK_INTERVAL` at 500 us or shorter; green at the shipped
+10 ms. **Reproduction:** short quantum plus any thread doing `println!` then
 `yield_now()`.
 
-**Signature:** a caller-saved register holding a live pointer contains garbage,
-seen in `puts` (a1, the `&str` pointer) and in `SpinLock::lock` (a3, the lock
+**Signature:** a caller-saved register holding a live pointer contains garbage.
+Seen in `puts` (a1, the `&str` pointer) and in `SpinLock::lock` (a3, the lock
 address).
 
-**FIXED -- one real cause.** `sbi_set_timer` declared `in("a0") when`, but an
-SBI call returns `sbiret { error, value }` in **a0 and a1**, so OpenSBI
-overwrites a0. `in(...)` promises the compiler the register survives, letting it
-keep a live value there and reuse OpenSBI's error code afterwards -- as a
-pointer. Now `inout("a0") when => _`. This made the crash take substantially
-longer, so it was real, but did not eliminate it.
+**Fixed along the way, all real:** `sbi_set_timer` declaring `a0` input-only
+when SBI returns in a0 and a1; and three physical-address dereferences that the
+identity map had been hiding (`map()` walking tables, `frame_alloc`/`frame_free`
+touching links, `map_user` zeroing frames). None eliminated the crash.
 
-**Ruled out, each by direct measurement:**
+**Ruled out by direct measurement -- do not re-litigate these:**
 
-- the spinlock and racer threads -- reproduces with neither
-- thread stack overflow -- bottom-of-stack canaries intact at fault time
-- boot stack overflow -- `sp` near the TOP of the boot stack
-- stack size -- still faults at 128 KiB
-- the handler's own `println!` -- still faults with the handler silent
-- `trap_entry`'s save/restore -- audited from the disassembly: x0,x1,x3..x31
-  each stored to slot `x*8`, x1,x3..x31 each loaded from the same slots, x0 and
-  x2 correctly excluded, one deliberate foreign store stashing the original sp
-- **the trap frame being written while parked** -- a tripwire that snapshots all
-  32 slots on handler entry and compares on exit **never fired.** The frame is
-  intact through the whole handler, including across the switch away and back.
+- the spinlock and racer threads (reproduces with neither)
+- thread stack overflow (bottom canaries intact at fault time)
+- boot stack overflow (`sp` near the TOP of the boot stack)
+- stack size (still faults at 128 KiB)
+- the handler's own `println!` (still faults with the handler silent)
+- `trap_entry`'s save/restore lists (audited from the disassembly: x0,x1,x3..x31
+  each stored to slot `x*8`, x1,x3..x31 each loaded from the same slots)
+- `switch`'s save/restore (audited the same way, perfectly symmetric)
+- every `asm!` block in main.rs (only `sbi_set_timer` was wrong)
+- **the frame being written while parked.** TWO tripwires, neither fired: a
+  Rust one snapshotting all 32 slots across `trap_handler`, and an assembly one
+  checksumming the frame right after SAVE_ALL and verifying right before
+  LOAD_ALL. **The frame is provably intact from save to restore.**
 
-That last one matters: it kills the entire "preemption corrupts the interrupted
-code's registers" model. The frame is fine, so the corruption is in the
-**handler's own register state**, i.e. in what Rust believes about an inline asm
-block.
+That last result means the register IS correctly preserved, so the whole
+"preemption corrupts registers" model is wrong. The remaining possibility is
+that the pointer was **already** garbage before the trap -- i.e. `puts` is being
+CALLED with a bad `&str`, which points at `core::fmt` state or the caller's
+stack rather than at the trap path. Investigate from that end.
 
-**Next step, and it is now a narrow one: audit every `asm!` block in the kernel
-for missing clobbers or missing `options`.** `sbi_set_timer` had exactly this
-bug and there may be another. Every block that transfers control elsewhere
-(`ecall`, `sret`, anything jumping) is a candidate.
+### 2. `sstatus.SPP` is not saved per-trap
+
+`trap_entry` reads `sstatus` live on the way out to decide whether to return to
+user or supervisor mode. **`sstatus` is one global CSR.** Between saving and
+restoring, the scheduler can run several other threads, each of which traps and
+overwrites SPP -- so the check describes the last thread to trap, not the one
+being returned to. Currently latent because only one thread ever enters user
+mode; it becomes live at milestone 11.
+
+An attempt to fix it (widen the frame to 272 bytes, save sstatus at offset 256,
+restore from the frame) **destabilised the kernel** -- the user program faulted
+at `sepc 0x103c` with `sp` in another thread's stack, i.e. a mismatched return.
+Reverted to keep the tree green; the change is in the history at the commit
+following ea8ae72's tree if wanted. Fixing it properly probably needs the exit
+path reworked too, since parking a thread inside a trap handler forever
+interacts badly with per-trap sstatus.
 
 Next: milestone 10b, sret into user mode.
 
