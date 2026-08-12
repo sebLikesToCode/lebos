@@ -20,14 +20,30 @@
 OUTPUT_ARCH(riscv)
 ENTRY(_start)
 
+/* Two regions, because every section has two addresses:
+ *
+ *   LMA (load address)    where the bytes physically land. OpenSBI drops the
+ *                         kernel at 0x80200000, so this is not negotiable.
+ *   VMA (virtual address) what the code believes its address is. This is what
+ *                         the linker writes into vtables and any other data
+ *                         holding an absolute pointer.
+ *
+ * Making VMA high is the whole point. code-model=medium already makes CODE
+ * position-independent, but it cannot touch absolute addresses the LINKER
+ * writes into DATA -- and this binary carries ~436 of them in .rodata, mostly
+ * vtables. Those only become high-half addresses if the linker thinks the
+ * kernel lives in the high half.
+ *
+ * `> virt AT> phys` on each section is what separates the two.
+ */
 MEMORY
 {
-    ram (wxa) : ORIGIN = 0x80200000, LENGTH = 126M
+    phys (wxa) : ORIGIN = 0x80200000,         LENGTH = 126M
+    virt (wxa) : ORIGIN = 0xFFFFFFC080200000, LENGTH = 126M
 }
 
 SECTIONS
 {
-    . = ORIGIN(ram);
 
     /* Every section boundary below is 4096-aligned. That is not cosmetic:
      * permissions are granted per page, so if .text and .rodata shared a page
@@ -43,7 +59,7 @@ SECTIONS
         *(.text .text.*)
         . = ALIGN(4096);
         __text_end = .;
-    } > ram
+    } > virt AT> phys
 
     /* Read-only data: string literals, constant tables. Mapped R, no W, no X. */
     .rodata : {
@@ -52,7 +68,7 @@ SECTIONS
         *(.rodata .rodata.*)
         . = ALIGN(4096);
         __rodata_end = .;
-    } > ram
+    } > virt AT> phys
 
     /* Initialised globals. Everything from here to __kernel_end is R+W. */
     .data : {
@@ -60,7 +76,7 @@ SECTIONS
         __data_start = .;
         *(.sdata .sdata.*)
         *(.data .data.*)
-    } > ram
+    } > virt AT> phys
 
     /* Zero-initialised globals. These occupy no space in the ELF file -- the
      * loader is expected to zero them. There is no loader. YOU zero them, in
@@ -72,7 +88,7 @@ SECTIONS
         *(.bss .bss.*)
         . = ALIGN(16);
         __bss_end = .;
-    } > ram
+    } > virt AT> phys
 
     /* The boot stack. RISC-V stacks grow downward, so the stack POINTER is
      * initialised to __stack_top (the high end) and moves down toward

@@ -61,8 +61,43 @@ extern "C" {
     fn trap_entry();
 }
 
+/// One page table, statically allocated so it exists before the frame
+/// allocator does. Lives in .bss, which entry.S has already zeroed.
+#[repr(C, align(4096))]
+struct PageTable([usize; 512]);
+
+static mut BOOT_PT: PageTable = PageTable([0; 512]);
+
+/// Map the high half before doing anything else at all.
+///
+/// This exists because the kernel is linked with its VMA in the high half, so
+/// every absolute address the linker wrote into .rodata -- ~435 of them, all
+/// vtables -- is a high address. `println!` reaches the UART through
+/// `&mut dyn Write`, which is a vtable call. So printing is impossible until
+/// the high half is mapped, which makes this the first thing that must run.
+///
+/// Nothing in here may print, panic, or dynamically dispatch: none of that
+/// works yet. Four 1 GiB leaves, no allocator, no error handling.
+///
+/// # Safety
+/// Must be called exactly once, before anything else, with paging off.
+unsafe fn boot_paging() {
+    let pt = core::ptr::addr_of_mut!(BOOT_PT) as *mut usize;
+    let flags = PTE_V | PTE_R | PTE_W | PTE_X | PTE_A | PTE_D;
+
+    *pt.add(0) = pte(0x0000_0000, flags); // devices, identity
+    *pt.add(2) = pte(0x8000_0000, flags); // RAM, identity
+    *pt.add(256) = pte(0x0000_0000, flags); // devices, high half
+    *pt.add(258) = pte(0x8000_0000, flags); // RAM, high half
+
+    // `addr_of_mut!` is PC-relative, and the PC is still physical, so this is
+    // the physical address of the table -- which is what satp wants.
+    let satp = (8_usize << 60) | ((pt as usize) >> 12);
+    core::arch::asm!("sfence.vma", "csrw satp, {}", "sfence.vma", in(reg) satp);
+}
+
 /// First Rust code to run. Called from `_start` with the two values OpenSBI
-/// left in a0/a1.
+/// left in a0/a1, executing at PHYSICAL addresses with paging off.
 ///
 /// `extern "C"` gives it the C ABI so assembly can call it, and `#[no_mangle]`
 /// keeps the symbol literally named `kmain` so the `call kmain` resolves.
@@ -70,6 +105,9 @@ extern "C" {
 /// It must never return -- hence `-> !`.
 #[no_mangle]
 pub extern "C" fn kmain(hartid: usize, dtb: *const u8) -> ! {
+    // Before literally anything else -- see boot_paging.
+    unsafe { boot_paging() };
+
     // Point stvec at the assembly trampoline in entry.S, not at trap_handler
     // directly: stvec's low two bits are a mode field, so the address must be
     // 4-byte aligned, and Rust cannot align a function.
@@ -196,8 +234,23 @@ extern "C" fn kmain_high() -> ! {
     // higher half, which was the point; the low half simply is not reclaimed
     // yet.
     // ---------------------------------------------------------------------
-    let _ = ROOT.load(Ordering::Relaxed);
-    println!("reloc: running high; identity map retained (see 6c-ii note)");
+    // Burn the bridge. Devices sit below 0x4000_0000 so their identity
+    // mappings live in root slot 0; RAM at 0x8000_0000 lives in slot 2. The
+    // higher-half twins are slots 256 and 258 and are untouched.
+    //
+    // This only became possible once the kernel was relinked with a high VMA:
+    // before that, ~435 vtable entries in .rodata held low addresses and the
+    // first println! after this point jumped into unmapped memory.
+    //
+    // sfence.vma afterwards, because the TLB is still holding translations
+    // that just became lies.
+    let root = va(ROOT.load(Ordering::Relaxed)) as *mut usize;
+    unsafe {
+        *root.add(0) = 0;
+        *root.add(2) = 0;
+        core::arch::asm!("sfence.vma");
+    }
+    println!("reloc: identity map removed -- the low half is free for user programs");
 
     // Schedule the first timer interrupt one tick out.
     sbi_set_timer(now() + TICK_INTERVAL);
