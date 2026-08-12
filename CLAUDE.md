@@ -93,6 +93,26 @@ Written as `Vec<Thread>` it crashed: spawning the fifth thread grew the Vec past
 capacity 4, every suspended thread's context moved, and the pointers became
 freed memory. Boxing lets the Vec move while the threads never do.
 
+## Processes
+
+A process is an address space plus a thread. `proc_pagetable()` allocates one
+frame and **copies root slots 256..511 from the kernel's table** -- the kernel
+occupies identical virtual addresses in every address space, so those few
+8-byte numbers give a new process a complete, correct kernel. Slots 0..255 stay
+empty; that is its private low half.
+
+Each `Thread` carries a `satp`, and `yield_now` switches address space before
+switching registers. That is safe mid-kernel precisely because kernel memory --
+including the stack being used at that moment -- is mapped identically
+everywhere.
+
+**Syscall pointers are validated against the CURRENTLY ACTIVE address space**,
+read from `satp`, not against the kernel's. A pointer only means anything in
+the city its owner lives in.
+
+Verified: two processes running the same binary both map `0x1000`, to different
+physical frames, and each announces itself separately. Holds at a 50 us quantum.
+
 ## RULE: sepc and sstatus are GLOBAL CSRs -- save them per trap
 
 **This caused both of the long-running bugs, and it is the single most
@@ -472,8 +492,8 @@ innovation budget is spent at Phase V.
 9. ✅ preemption + spinlocks that disable interrupts
 10. ✅ user mode, syscalls, sscratch kernel stacks, SUM discipline, pointer
     validation
-11. ⬅ **current** — process creation
+11. ✅ process creation -- one address space per process
+12. ⬅ **current** — the object store
 8. kernel threads + context switch
-12. **the object store**, in RAM first: indexes, query, versioning
 13. virtio-blk + persist the store as an append-only log
 14. userspace shell whose commands are queries, not paths

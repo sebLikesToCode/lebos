@@ -446,12 +446,25 @@ extern "C" fn kmain_high() -> ! {
         }
     );
 
-    // 10b: map the user program and drop to user mode. Never returns -- this
-    // thread becomes the user program, and only a trap brings the kernel back.
-    // The other threads keep running, because the timer still preempts it.
-    let user_sp = map_user(ROOT.load(Ordering::Relaxed));
-    println!("user: dropping to user mode, entry {:#x}", USER_BASE);
-    enter_user(user_sp);
+    // Milestone 11: two processes, each in its own address space.
+    //
+    // Same binary, same virtual address, different physical memory. Neither can
+    // name the other's -- not "is denied", but has no address that reaches it.
+    let a_root = process_spawn("procA", b'A');
+    let b_root = process_spawn("procB", b'B');
+
+    println!("proc: two processes created, both running the same binary");
+    println!(
+        "proc: virtual {:#x} in procA -> physical {:#x}",
+        USER_BASE,
+        probe(a_root, USER_BASE).map(pte_to_pa).unwrap_or(0)
+    );
+    println!(
+        "proc: virtual {:#x} in procB -> physical {:#x}",
+        USER_BASE,
+        probe(b_root, USER_BASE).map(pte_to_pa).unwrap_or(0)
+    );
+    println!("proc: same address, different city");
 
     // =====================================================================
     //  END SCRATCH ZONE
@@ -461,6 +474,50 @@ extern "C" fn kmain_high() -> ! {
         // Wait For Interrupt: idles the core instead of spinning it at 100%.
         unsafe { core::arch::asm!("wfi") };
     }
+}
+
+/// Entry point for every user process's thread.
+///
+/// By the time this runs, `yield_now` has already switched `satp` to this
+/// thread's address space -- so `USER_BASE` here means *this* process's copy of
+/// the program, not anyone else's.
+extern "C" fn user_thread_entry() -> ! {
+    let user_sp = {
+        let t = THREADS.lock();
+        t[CURRENT.load(Ordering::Relaxed)].user_sp
+    };
+    enter_user(user_sp);
+}
+
+/// Create a process: a private address space, the program loaded into it, and
+/// a thread to run it.
+///
+/// Everything here is cheap. The address space is one frame plus 256 copied
+/// entries; the program is a couple of frames; the thread already existed as a
+/// concept. Two processes then run the same binary, at the same virtual
+/// address, in completely different physical memory.
+fn process_spawn(name: &'static str, tag: u8) -> usize {
+    let root_pa = proc_pagetable();
+    let user_sp = map_user_tagged(root_pa, tag);
+    let satp = (8_usize << 60) | (root_pa >> 12);
+
+    let mut stack = alloc::vec![0u8; STACK_SIZE];
+    let top = (stack.as_mut_ptr() as usize + STACK_SIZE) & !15;
+
+    let mut ctx = Context::zeroed();
+    ctx.ra = thread_start as *const () as usize;
+    ctx.sp = top;
+    ctx.s[0] = user_thread_entry as *const () as usize;
+
+    THREADS.lock().push(alloc::boxed::Box::new(Thread {
+        ctx,
+        satp,
+        user_sp,
+        name,
+        _stack: stack,
+    }));
+
+    root_pa
 }
 
 /// Two threads that do nothing but announce themselves and hand the desk
@@ -655,7 +712,12 @@ fn rsw_name(pte: usize) -> &'static str {
 /// This is the tool for "why did that address fault?", and the reason the RSW
 /// tags above are worth spending.
 fn probe(root_pa: usize, addr: usize) -> Option<usize> {
-    let mut table = va(root_pa) as *const usize;
+    probe_in(va(root_pa) as *mut usize, addr)
+}
+
+/// Same walk, but starting from an already-usable table pointer.
+fn probe_in(root: *mut usize, addr: usize) -> Option<usize> {
+    let mut table = root as *const usize;
     for level in [2_usize, 1, 0] {
         let idx = (addr >> (12 + 9 * level)) & 0x1ff;
         let entry = unsafe { *table.add(idx) };
@@ -680,12 +742,57 @@ const PTE_U: usize = 1 << 4; // user mode may access this page
 /// Bytes of user stack. One frame is plenty for a program this small.
 const USER_STACK_SIZE: usize = PAGE_SIZE;
 
+/// The kernel's own satp value, so kernel threads can be switched back to it.
+static KERNEL_SATP: AtomicUsize = AtomicUsize::new(0);
+
+/// Build a fresh address space -- a new city.
+///
+/// The whole cost is one frame plus copying the kernel's high-half root
+/// entries. The kernel occupies the SAME virtual addresses in every address
+/// space, so those few 8-byte numbers give the new city a complete, correct
+/// kernel: the one building that stands at the same street address in every
+/// town.
+///
+/// Root slots 0..255 are the low half and stay empty -- that is the new
+/// process's private space. Slots 256..511 are the high half and are shared.
+fn proc_pagetable() -> usize {
+    let root_pa = frame_alloc().expect("no frame for a process page table") as usize;
+    let root = va(root_pa) as *mut usize;
+    unsafe { core::ptr::write_bytes(root as *mut u8, 0, PAGE_SIZE) };
+
+    let kroot = va(ROOT.load(Ordering::Relaxed)) as *const usize;
+    for i in 256..512 {
+        unsafe { *root.add(i) = *kroot.add(i) };
+    }
+
+    root_pa
+}
+
 /// Copy the embedded user program into fresh frames and map it into the LOW
 /// half with U=1, plus a stack. Returns the initial user stack pointer.
+///
+/// `tag` is written over the program's identity byte, so two processes running
+/// the same binary announce themselves differently.
 ///
 /// The low half is free real estate: the kernel relocated to the high half and
 /// dropped the identity map, so user and kernel share one page table and can
 /// never collide. That is what milestone 6c bought.
+fn map_user_tagged(root_pa: usize, tag: u8) -> usize {
+    let sp = map_user(root_pa);
+
+    // Patch the identity byte. The message ends "X\n", so the X is the
+    // second-to-last byte of the image -- and the image starts at USER_BASE.
+    let off = USER_PROG.len() - 2;
+    let root = va(root_pa) as *mut usize;
+    if let Some(e) = probe_in(root, USER_BASE + off) {
+        let phys = pte_to_pa(e) | ((USER_BASE + off) & (PAGE_SIZE - 1));
+        unsafe { core::ptr::write_volatile(va(phys) as *mut u8, tag) };
+    }
+    sp
+}
+
+/// Copy the embedded user program into fresh frames and map it into the LOW
+/// half with U=1, plus a stack. Returns the initial user stack pointer.
 fn map_user(root_pa: usize) -> usize {
     let root = va(root_pa) as *mut usize;
 
@@ -1090,6 +1197,8 @@ fn paging_init(ram_end: usize) {
         readback >> 60,
         (readback & 0xfff_ffff_ffff) << 12
     );
+    KERNEL_SATP.store(satp, Ordering::Relaxed);
+
     let pt = PT_FRAMES.load(Ordering::Relaxed);
     println!(
         "paging: {} frames of page tables ({} KiB) to describe it all",
@@ -1450,6 +1559,11 @@ fn intr_on() {
 
 struct Thread {
     ctx: Context,
+    /// The address space this thread runs in -- the city it lives in. Kernel
+    /// threads all share the kernel's; each user process has its own.
+    satp: usize,
+    /// Initial user stack pointer, for a thread that will drop to user mode.
+    user_sp: usize,
     name: &'static str,
     /// Owns the thread's stack. Dropping the Thread frees it -- the heap from
     /// milestone 7 doing real work.
@@ -1481,6 +1595,8 @@ static CURRENT: AtomicUsize = AtomicUsize::new(0);
 fn threads_init() {
     THREADS.lock().push(alloc::boxed::Box::new(Thread {
         ctx: Context::zeroed(),
+        satp: KERNEL_SATP.load(Ordering::Relaxed),
+        user_sp: 0,
         name: "main",
         _stack: alloc::vec::Vec::new(), // main runs on the boot stack
     }));
@@ -1508,6 +1624,8 @@ fn thread_spawn(name: &'static str, entry: extern "C" fn() -> !) {
 
     THREADS.lock().push(alloc::boxed::Box::new(Thread {
         ctx,
+        satp: KERNEL_SATP.load(Ordering::Relaxed),
+        user_sp: 0,
         name,
         _stack: stack,
     }));
@@ -1527,7 +1645,7 @@ fn yield_now() {
     // is neither running nor fully saved.
     let was_on = intr_off();
 
-    let (old, new) = {
+    let (old, new, next_satp) = {
         let mut threads = THREADS.lock();
         if threads.len() < 2 {
             drop(threads);
@@ -1551,10 +1669,22 @@ fn yield_now() {
         (
             core::ptr::addr_of!(threads[cur].ctx) as *mut Context,
             core::ptr::addr_of!(threads[next].ctx),
+            threads[next].satp,
         )
     };
     // Lock released here. Interrupts stay off, because they were already off
     // when the guard was taken and Drop restores what it found.
+
+    // Move to the next thread's city BEFORE switching to it. Safe to do while
+    // still executing kernel code, because the kernel occupies identical
+    // addresses in every address space -- including this stack.
+    let cur_satp: usize;
+    unsafe { core::arch::asm!("csrr {}, satp", out(reg) cur_satp) };
+    if next_satp != 0 && next_satp != cur_satp {
+        unsafe {
+            core::arch::asm!("csrw satp, {}", "sfence.vma", in(reg) next_satp);
+        }
+    }
 
     unsafe { switch(old, new) };
 
@@ -1908,7 +2038,14 @@ extern "C" fn trap_handler(frame: &mut TrapFrame) {
             // The pointer is checked before it is touched. This is the office
             // worker reading the request slip and refusing an absurd one.
             1 => {
-                if !user_range_ok(ROOT.load(Ordering::Relaxed), arg0, arg1) {
+                // Validate against the address space that is CURRENTLY active,
+                // not the kernel's. Every process has its own city, and a
+                // pointer is only meaningful in the one its owner lives in.
+                let satp: usize;
+                unsafe { core::arch::asm!("csrr {}, satp", out(reg) satp) };
+                let cur_root = (satp & 0xfff_ffff_ffff) << 12;
+
+                if !user_range_ok(cur_root, arg0, arg1) {
                     println!(
                         "user: REFUSED write({:#x}, {}) -- not user-readable memory",
                         arg0, arg1

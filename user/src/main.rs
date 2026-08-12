@@ -28,7 +28,7 @@ core::arch::global_asm!(
 _start:
         # 1. A legitimate request. Should succeed and return 14.
         lla     a0, msg         # PC-relative, so it works wherever we are mapped
-        li      a1, 14          # length of msg
+        li      a1, 15          # length of msg
         li      a7, 1           # SYS_WRITE
         ecall
 
@@ -61,7 +61,9 @@ _start:
 1:      j       1b
 
 msg:
-        .ascii "hi from user!\n"
+        # The X is patched by the kernel when the program is loaded, so two
+# processes running this same binary can be told apart.
+        .ascii "hi from user X\n"
 "#
 );
 
