@@ -377,6 +377,30 @@ extern "C" fn kmain_high() -> ! {
         current_name()
     );
 
+    // Two threads hammering one counter, preempted at random moments.
+    thread_spawn("race1", thread_racer);
+    thread_spawn("race2", thread_racer);
+    println!(
+        "lock: two threads will each add {} under a spinlock",
+        RACE_ITERS
+    );
+
+    while RACERS_DONE.load(Ordering::Relaxed) < 2 {
+        yield_now();
+    }
+
+    let total = *COUNTER.lock();
+    println!(
+        "lock: expected {}, got {} -- {}",
+        RACE_ITERS * 2,
+        total,
+        if total == RACE_ITERS * 2 {
+            "no updates lost"
+        } else {
+            "UPDATES LOST"
+        }
+    );
+
     // =====================================================================
     //  END SCRATCH ZONE
     // =====================================================================
@@ -1103,6 +1127,92 @@ extern "C" {
     fn thread_start();
 }
 
+// ---------------------------------------------------------------------------
+// Spinlocks
+//
+// One sign on one hook. To hang it you must take it off, and taking it is a
+// single indivisible motion -- `swap` writes "taken" and hands back whatever
+// was there, so there is no gap between looking and claiming for anyone to
+// slip into.
+//
+// Holding one also disables interrupts, and that is not an optimisation. The
+// timer does not respect the sign: it would tap mid-critical-section, the
+// handler would reach for a sign the interrupted code is still holding, and
+// spin forever waiting for a thread that cannot run. One core, one lock,
+// nobody at fault.
+//
+// Release restores the PREVIOUS interrupt state rather than blindly enabling,
+// because the lock may well have been taken somewhere they were already off.
+// ---------------------------------------------------------------------------
+
+/// A lock that guards a value, rather than sitting next to one. Reaching the
+/// data requires holding the lock, so forgetting to lock is a compile error
+/// instead of a race.
+struct SpinLock<T> {
+    locked: core::sync::atomic::AtomicBool,
+    data: core::cell::UnsafeCell<T>,
+}
+
+// Safe because the lock is what provides the exclusion.
+unsafe impl<T: Send> Sync for SpinLock<T> {}
+
+impl<T> SpinLock<T> {
+    const fn new(data: T) -> Self {
+        SpinLock {
+            locked: core::sync::atomic::AtomicBool::new(false),
+            data: core::cell::UnsafeCell::new(data),
+        }
+    }
+
+    fn lock(&self) -> SpinGuard<'_, T> {
+        // Interrupts OFF first, then take the lock. The other order leaves a
+        // window where the timer can land on a thread that already holds it.
+        let intr_was_on = intr_off();
+
+        // swap always writes `true` and reports what was there. Got `false`
+        // back and the sign is yours; got `true` and someone else has it.
+        while self.locked.swap(true, Ordering::Acquire) {
+            core::hint::spin_loop();
+        }
+
+        SpinGuard {
+            lock: self,
+            intr_was_on,
+        }
+    }
+}
+
+/// Proof that the lock is held. Releasing happens in `Drop`, so it is not
+/// possible to forget -- the same trick the `Frame` type will use.
+struct SpinGuard<'a, T> {
+    lock: &'a SpinLock<T>,
+    intr_was_on: bool,
+}
+
+impl<T> core::ops::Deref for SpinGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        unsafe { &*self.lock.data.get() }
+    }
+}
+
+impl<T> core::ops::DerefMut for SpinGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        unsafe { &mut *self.lock.data.get() }
+    }
+}
+
+impl<T> Drop for SpinGuard<'_, T> {
+    fn drop(&mut self) {
+        // Release BEFORE restoring interrupts. The other order lets a timer
+        // land while the lock is still held by code that is done with it.
+        self.lock.locked.store(false, Ordering::Release);
+        if self.intr_was_on {
+            intr_on();
+        }
+    }
+}
+
 /// Turn interrupts off, reporting whether they had been on.
 ///
 /// `csrrci` reads sstatus and clears bit 1 (SIE) in a single instruction, so
@@ -1127,10 +1237,22 @@ struct Thread {
     _stack: alloc::vec::Vec<u8>,
 }
 
-/// Single hart, cooperative scheduling, so a plain static is honest here. It
-/// becomes a lie the moment there is a second core or preemption, which is
-/// milestone 9's problem.
-static mut THREADS: alloc::vec::Vec<Thread> = alloc::vec::Vec::new();
+/// The thread table, behind a lock. `push` is several stores -- bump the
+/// length, write the element -- and the timer landing between them would hand
+/// the scheduler an element that does not exist yet.
+///
+/// `Box<Thread>`, not `Thread`, and that is load-bearing. `yield_now` hands
+/// `switch` raw pointers to contexts, and a suspended thread's context must
+/// stay put while it is switched away. If the threads lived inline, growing
+/// this Vec would reallocate and move every context out from under those
+/// pointers -- which is exactly what happened the first time this was written
+/// as `Vec<Thread>`: spawning the fifth thread grew it past capacity 4 and the
+/// suspended threads' contexts became freed memory.
+///
+/// Boxing means the Vec of pointers can move freely while the threads
+/// themselves never do.
+static THREADS: SpinLock<alloc::vec::Vec<alloc::boxed::Box<Thread>>> =
+    SpinLock::new(alloc::vec::Vec::new());
 static CURRENT: AtomicUsize = AtomicUsize::new(0);
 
 /// Register the currently-executing code as thread 0.
@@ -1138,13 +1260,11 @@ static CURRENT: AtomicUsize = AtomicUsize::new(0);
 /// Its context is left zeroed on purpose: nothing needs to be restored to get
 /// back here, because the first `switch` away will fill it in.
 fn threads_init() {
-    unsafe {
-        (*core::ptr::addr_of_mut!(THREADS)).push(Thread {
-            ctx: Context::zeroed(),
-            name: "main",
-            _stack: alloc::vec::Vec::new(), // main runs on the boot stack
-        });
-    }
+    THREADS.lock().push(alloc::boxed::Box::new(Thread {
+        ctx: Context::zeroed(),
+        name: "main",
+        _stack: alloc::vec::Vec::new(), // main runs on the boot stack
+    }));
 }
 
 /// Create a thread that will begin at `entry` the first time it is scheduled.
@@ -1167,13 +1287,11 @@ fn thread_spawn(name: &'static str, entry: extern "C" fn() -> !) {
     ctx.sp = top;
     ctx.s[0] = entry as *const () as usize;
 
-    unsafe {
-        (*core::ptr::addr_of_mut!(THREADS)).push(Thread {
-            ctx,
-            name,
-            _stack: stack,
-        });
-    }
+    THREADS.lock().push(alloc::boxed::Box::new(Thread {
+        ctx,
+        name,
+        _stack: stack,
+    }));
 }
 
 /// Give up the CPU to the next thread, round robin.
@@ -1185,24 +1303,39 @@ fn thread_spawn(name: &'static str, entry: extern "C" fn() -> !) {
 ///
 /// This is a lock in everything but name, and 9b replaces it with a real one.
 fn yield_now() {
+    // Interrupts stay off for the WHOLE operation, the switch included. A
+    // timer landing midway through swapping contexts would find a thread that
+    // is neither running nor fully saved.
     let was_on = intr_off();
 
-    let threads = unsafe { &mut *core::ptr::addr_of_mut!(THREADS) };
-    if threads.len() < 2 {
-        if was_on {
-            intr_on();
+    let (old, new) = {
+        let mut threads = THREADS.lock();
+        if threads.len() < 2 {
+            drop(threads);
+            if was_on {
+                intr_on();
+            }
+            return;
         }
-        return;
-    }
 
-    let cur = CURRENT.load(Ordering::Relaxed);
-    let next = (cur + 1) % threads.len();
-    CURRENT.store(next, Ordering::Relaxed);
+        let cur = CURRENT.load(Ordering::Relaxed);
+        let next = (cur + 1) % threads.len();
+        CURRENT.store(next, Ordering::Relaxed);
 
-    // Two raw pointers into the same Vec. Taking two &mut would be instant
-    // undefined behaviour, and `switch` only reads one and writes the other.
-    let old = &mut threads[cur].ctx as *mut Context;
-    let new = &threads[next].ctx as *const Context;
+        // Raw pointers, never references: `switch` writes through one while
+        // reading the other, and two live &mut would be instant undefined
+        // behaviour. Two SHARED borrows are fine, so both are taken as
+        // `addr_of!` and one is cast.
+        //
+        // These are safe to hold across the switch only because the threads
+        // are boxed -- see the note on THREADS.
+        (
+            core::ptr::addr_of!(threads[cur].ctx) as *mut Context,
+            core::ptr::addr_of!(threads[next].ctx),
+        )
+    };
+    // Lock released here. Interrupts stay off, because they were already off
+    // when the guard was taken and Drop restores what it found.
 
     unsafe { switch(old, new) };
 
@@ -1215,8 +1348,28 @@ fn yield_now() {
 }
 
 fn current_name() -> &'static str {
-    let threads = unsafe { &*core::ptr::addr_of!(THREADS) };
-    threads[CURRENT.load(Ordering::Relaxed)].name
+    THREADS.lock()[CURRENT.load(Ordering::Relaxed)].name
+}
+
+/// A counter two threads fight over, to demonstrate the lock doing its job.
+static COUNTER: SpinLock<u64> = SpinLock::new(0);
+
+/// How many times each racer increments it.
+const RACE_ITERS: u64 = 20_000;
+
+/// Set when a racer finishes, so main knows when to read the result.
+static RACERS_DONE: AtomicUsize = AtomicUsize::new(0);
+
+extern "C" fn thread_racer() -> ! {
+    for _ in 0..RACE_ITERS {
+        // read-modify-write, entirely inside the lock. Without it, the timer
+        // can land between the read and the write and an update vanishes.
+        *COUNTER.lock() += 1;
+    }
+    RACERS_DONE.fetch_add(1, Ordering::Relaxed);
+    loop {
+        yield_now();
+    }
 }
 
 // ===========================================================================

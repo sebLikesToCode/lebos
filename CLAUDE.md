@@ -81,7 +81,19 @@ everything but name, which 9b replaces.
 zone. It was not, and a greedy thread monopolising the CPU looked exactly like
 a scheduler bug when the real cause was that no timer had ever been scheduled.
 
-Next: 9b, real spinlocks.
+`SpinLock<T>` guards its data rather than sitting beside it, so reaching the
+value requires holding the lock. `lock()` disables interrupts FIRST, then takes
+the sign with an atomic `swap`; the `SpinGuard`'s `Drop` releases the lock and
+then restores the previous interrupt state -- restores, not enables, because
+the lock may have been taken somewhere they were already off.
+
+`THREADS` is `Vec<Box<Thread>>`, and the `Box` is load-bearing. `yield_now`
+hands `switch` raw pointers to contexts that must stay valid across the switch.
+Written as `Vec<Thread>` it crashed: spawning the fifth thread grew the Vec past
+capacity 4, every suspended thread's context moved, and the pointers became
+freed memory. Boxing lets the Vec move while the threads never do.
+
+Next: milestone 10, user mode.
 
 Hard-won details that will bite again if forgotten:
 
@@ -368,10 +380,9 @@ innovation budget is spent at Phase V.
    ✅ 6c the kernel executes in the higher half and the identity map is gone
 7. ✅ kernel heap: free list, first fit, splitting, two-way coalescing
 8. ✅ kernel threads + cooperative context switch
-9. ✅ 9a preemption -- the timer forces switches
-   ⬅ **current** 9b spinlocks that disable interrupts
+9. ✅ preemption + spinlocks that disable interrupts
+10. ⬅ **current** — user mode + syscalls
 8. kernel threads + context switch
-10. user mode + syscalls
 11. process creation
 12. **the object store**, in RAM first: indexes, query, versioning
 13. virtio-blk + persist the store as an append-only log
