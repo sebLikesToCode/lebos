@@ -441,6 +441,13 @@ extern "C" fn kmain_high() -> ! {
         }
     );
 
+    // 10b: map the user program and drop to user mode. Never returns -- this
+    // thread becomes the user program, and only a trap brings the kernel back.
+    // The other threads keep running, because the timer still preempts it.
+    let user_sp = map_user(ROOT.load(Ordering::Relaxed));
+    println!("user: dropping to user mode, entry {:#x}", USER_BASE);
+    enter_user(user_sp);
+
     // =====================================================================
     //  END SCRATCH ZONE
     // =====================================================================
@@ -659,6 +666,97 @@ fn probe(root_pa: usize, addr: usize) -> Option<usize> {
     None
 }
 
+// ===========================================================================
+// User mode -- milestone 10b
+// ===========================================================================
+
+const PTE_U: usize = 1 << 4; // user mode may access this page
+
+/// Bytes of user stack. One frame is plenty for a program this small.
+const USER_STACK_SIZE: usize = PAGE_SIZE;
+
+/// Copy the embedded user program into fresh frames and map it into the LOW
+/// half with U=1, plus a stack. Returns the initial user stack pointer.
+///
+/// The low half is free real estate: the kernel relocated to the high half and
+/// dropped the identity map, so user and kernel share one page table and can
+/// never collide. That is what milestone 6c bought.
+fn map_user(root_pa: usize) -> usize {
+    let root = va(root_pa) as *mut usize;
+
+    // --- the program itself ---
+    let pages = (USER_PROG.len() + PAGE_SIZE - 1) / PAGE_SIZE;
+    for i in 0..pages {
+        let frame = frame_alloc().expect("no frame for the user program");
+        // Zero it through the alias -- `frame` is physical.
+        unsafe { core::ptr::write_bytes(va(frame as usize) as *mut u8, 0, PAGE_SIZE) };
+
+        // Copy through the higher-half alias: `frame` is a PHYSICAL address,
+        // and the identity map is long gone.
+        let dst = va(frame as usize) as *mut u8;
+        let start = i * PAGE_SIZE;
+        let n = core::cmp::min(PAGE_SIZE, USER_PROG.len() - start);
+        unsafe { core::ptr::copy_nonoverlapping(USER_PROG.as_ptr().add(start), dst, n) };
+
+        // R and X but no W: the program's message lives in .text, so it needs
+        // to be readable, and W^X applies to user pages too.
+        map(
+            root,
+            USER_BASE + start,
+            frame as usize,
+            PTE_R | PTE_X | PTE_U | RSW_TEXT,
+        );
+    }
+
+    // --- the user stack, immediately below the program ---
+    let sframe = frame_alloc().expect("no frame for the user stack");
+    unsafe { core::ptr::write_bytes(va(sframe as usize) as *mut u8, 0, PAGE_SIZE) };
+    let stack_va = USER_BASE - USER_STACK_SIZE;
+    map(
+        root,
+        stack_va,
+        sframe as usize,
+        PTE_R | PTE_W | PTE_U | RSW_DATA,
+    );
+
+    unsafe { core::arch::asm!("sfence.vma") };
+
+    println!(
+        "user: mapped {} page(s) at {:#x} r-x U, stack {:#x}..{:#x} rw- U",
+        pages, USER_BASE, stack_va, USER_BASE
+    );
+
+    stack_va + USER_STACK_SIZE
+}
+
+/// Drop to user mode and start the program. Never returns -- from here on this
+/// thread IS the user program, and only a trap brings the kernel back.
+fn enter_user(user_sp: usize) -> ! {
+    unsafe {
+        // SPP (bit 8) = 0  -> sret returns to USER mode, not supervisor
+        core::arch::asm!("csrc sstatus, {}", in(reg) 1_usize << 8);
+        // SPIE (bit 5) = 1 -> interrupts on after sret, so it stays preemptible
+        core::arch::asm!("csrs sstatus, {}", in(reg) 1_usize << 5);
+        // SUM (bit 18) = 1 -> supervisor may touch U=1 pages.
+        //
+        // Needed for two reasons, both temporary: trap_entry pushes the trap
+        // frame onto whatever sp holds, which after a user trap is a USER
+        // stack; and the write syscall has to read the user's string. A real
+        // kernel enables SUM only around explicit copies, and swaps to a
+        // kernel stack via sscratch first. That is 10c.
+        core::arch::asm!("csrs sstatus, {}", in(reg) 1_usize << 18);
+
+        core::arch::asm!(
+            "csrw sepc, {entry}",
+            "mv sp, {usp}",
+            "sret",
+            entry = in(reg) USER_BASE,
+            usp = in(reg) user_sp,
+            options(noreturn),
+        );
+    }
+}
+
 /// Print what a virtual address resolves to, and why it exists.
 fn explain(root_pa: usize, addr: usize) {
     match probe(root_pa, addr) {
@@ -735,13 +833,13 @@ static PT_FRAMES: AtomicUsize = AtomicUsize::new(0);
 /// This is the same walk the hardware does, with one difference: where the
 /// hardware gives up on an empty entry and faults, this builds the missing
 /// table and keeps descending.
-fn map(root: *mut usize, va: usize, pa: usize, flags: usize) {
+fn map(root: *mut usize, vaddr: usize, pa: usize, flags: usize) {
     let mut table = root;
 
     // Levels 2 then 1. The index is just a 9-bit slice of the address:
     //   level 2 -> bits 38..30      level 1 -> bits 29..21
     for level in [2_usize, 1_usize] {
-        let idx = (va >> (12 + 9 * level)) & 0x1ff;
+        let idx = (vaddr >> (12 + 9 * level)) & 0x1ff;
         let slot = unsafe { table.add(idx) };
         let mut entry = unsafe { *slot };
 
@@ -752,7 +850,10 @@ fn map(root: *mut usize, va: usize, pa: usize, flags: usize) {
             // holds its free-list link, and the hardware would follow that
             // as a real entry.
             let next = frame_alloc().expect("out of frames while building page tables");
-            unsafe { core::ptr::write_bytes(next, 0, PAGE_SIZE) };
+            // Erase through the higher-half alias. frame_alloc returns a
+            // PHYSICAL address, and once the identity map is gone a physical
+            // address is not something the kernel can dereference.
+            unsafe { core::ptr::write_bytes(va(next as usize) as *mut u8, 0, PAGE_SIZE) };
             PT_FRAMES.fetch_add(1, Ordering::Relaxed);
 
             // A BRANCH: valid, but R/W/X all clear. That combination is what
@@ -761,14 +862,17 @@ fn map(root: *mut usize, va: usize, pa: usize, flags: usize) {
             unsafe { *slot = entry };
         }
 
-        table = pte_to_pa(entry) as *mut usize;
+        // A page table entry stores a PHYSICAL address, so descending means
+        // converting to the higher-half alias to get something dereferenceable.
+        // This used to work without va() only because the identity map existed.
+        table = va(pte_to_pa(entry)) as *mut usize;
     }
 
     // Level 0: the leaf. Setting any of R/W/X ends the walk.
     //
     // A and D are pre-set because not every implementation updates them in
     // hardware; on those, an unset bit faults on first touch.
-    let idx = (va >> 12) & 0x1ff;
+    let idx = (vaddr >> 12) & 0x1ff;
     unsafe { *table.add(idx) = pte(pa, flags | PTE_V | PTE_A | PTE_D) };
 }
 
@@ -795,13 +899,17 @@ fn map_range(root: *mut usize, start: usize, end: usize, offset: usize, flags: u
 /// carries only the permissions it actually needs, so W^X holds: no page is
 /// both writable and executable.
 fn paging_init(ram_end: usize) {
-    let root = frame_alloc().expect("no frame for the root page table") as *mut usize;
+    // Keep the physical address for satp and for ROOT, but do all the WRITING
+    // through the higher-half alias, so this code works identically before and
+    // after the identity map goes away.
+    let root_pa = frame_alloc().expect("no frame for the root page table") as usize;
+    let root = va(root_pa) as *mut usize;
     unsafe { core::ptr::write_bytes(root as *mut u8, 0, PAGE_SIZE) };
     PT_FRAMES.fetch_add(1, Ordering::Relaxed);
 
     // Remembered as a bare physical number so the relocated kernel can still
     // find it after the identity map is gone.
-    ROOT.store(root as usize, Ordering::Relaxed);
+    ROOT.store(root_pa, Ordering::Relaxed);
 
     let sym = |s: &u8| s as *const u8 as usize;
     let (text_start, text_end, rodata_start, rodata_end, data_start, kernel_end) = unsafe {
@@ -890,7 +998,7 @@ fn paging_init(ram_end: usize) {
     println!("  heap   {:#x}..{:#x}  RW-", kernel_end, ram_end);
 
     // satp: mode 8 (Sv39) in the top 4 bits, root table's page number below.
-    let satp = (8_usize << 60) | ((root as usize) >> 12);
+    let satp = (8_usize << 60) | (root_pa >> 12);
 
     // sfence.vma flushes the MMU's cached translations (the TLB). Required
     // after changing satp, or the hardware may keep using stale answers.
@@ -1606,7 +1714,13 @@ fn frame_alloc() -> Option<*mut u8> {
     }
 
     // Read the link the page is storing, and make that the new head.
-    let next = unsafe { core::ptr::read(head as *const usize) };
+    //
+    // Through the higher-half alias: the LIST holds physical addresses, since
+    // that is what callers want, but the kernel can only dereference virtual
+    // ones once the identity map is gone. This read was unqualified for the
+    // whole project and worked only because the identity map existed -- it
+    // broke the first time anything allocated a frame after relocation.
+    let next = unsafe { core::ptr::read(va(head) as *const usize) };
     FREE_LIST.store(next, Ordering::Relaxed);
 
     Some(head as *mut u8)
@@ -1621,9 +1735,10 @@ fn frame_free(page: *mut u8) {
     );
 
     // Write the current head into this page's first 8 bytes, then point the
-    // list at this page. Classic linked-list push.
+    // list at this page. Classic linked-list push -- through the higher-half
+    // alias, for the same reason as frame_alloc.
     let head = FREE_LIST.load(Ordering::Relaxed);
-    unsafe { core::ptr::write(addr as *mut usize, head) };
+    unsafe { core::ptr::write(va(addr) as *mut usize, head) };
     FREE_LIST.store(addr, Ordering::Relaxed);
 }
 
@@ -1701,8 +1816,61 @@ extern "C" fn trap_handler(frame: &mut TrapFrame) {
         return;
     }
 
-    // An exception. Every one of these is currently a kernel bug -- there is
-    // no user mode yet, so nothing faults legitimately.
+    // scause 8 -- ecall from USER mode. This is a syscall, and it is the first
+    // exception that is not a bug: a user program legitimately asking for
+    // something.
+    if !is_interrupt && code == 8 {
+        let num = frame.x[17]; // a7 = which syscall
+        let arg0 = frame.x[10]; // a0
+        let arg1 = frame.x[11]; // a1
+
+        let ret: usize = match num {
+            // write(ptr, len)
+            //
+            // NO VALIDATION. `ptr` came from an untrusted program and is being
+            // dereferenced on faith. It could be a kernel address, and reading
+            // through it works right now only because SUM is set. Checking it
+            // is 10d, and it is the single most important thing in the
+            // milestone.
+            1 => {
+                for i in 0..arg1 {
+                    let b = unsafe { core::ptr::read_volatile((arg0 + i) as *const u8) };
+                    putchar(b);
+                }
+                arg1
+            }
+            // exit(code)
+            0 => {
+                println!("user: program exited with code {}", arg0);
+                // Step over the ecall FIRST. There is nothing to return to yet
+                // -- no process table, no parent -- so this thread parks. But
+                // if anything ever does resume through this frame, sepc must
+                // already point past the ecall or it re-executes exit forever.
+                unsafe { core::arch::asm!("csrw sepc, {}", in(reg) sepc + 4) };
+                loop {
+                    yield_now();
+                }
+            }
+            _ => {
+                println!("user: unknown syscall {}", num);
+                usize::MAX
+            }
+        };
+
+        // The answer goes into the SAVED a0, not the live register: trap_entry
+        // is about to overwrite all 32 registers from this frame on the way
+        // out, so anything left in a live register would be wiped.
+        frame.x[10] = ret;
+
+        // A syscall is an EXCEPTION -- the ecall executed and did its whole
+        // job. Not advancing sepc would re-execute it forever. Interrupts get
+        // the opposite treatment, which is the branch above.
+        unsafe { core::arch::asm!("csrw sepc, {}", in(reg) sepc + 4) };
+        return;
+    }
+
+    // An exception that is not a syscall. Every one of these is a kernel bug
+    // or a misbehaving user program.
     //
     // This used to print and then step over the faulting instruction, which
     // was right while deliberately executing `unimp`. Now that page faults are

@@ -239,6 +239,21 @@ object store's on-disk magic number at milestone 12 — the format signature is
 permanent and the most visible constant the project will ever have. Do not
 spend it on something smaller.
 
+## RULE: everything frame_alloc returns is PHYSICAL
+
+Once the identity map was dropped, a physical address stopped being something
+the kernel can dereference. **Anything from `frame_alloc` must go through `va()`
+before it is read or written.** Page table entries also store physical
+addresses, so descending a table needs `va(pte_to_pa(entry))`.
+
+This bit three separate places, all latent since milestone 6c and all exposed
+one at a time as each code path first ran after relocation: `map()` walking
+tables, `frame_alloc`/`frame_free` touching free-list links, and `map_user`
+zeroing frames. The identity map had been hiding every one of them.
+
+Linker symbols are the opposite: `&some_symbol` is PC-relative and already
+yields whichever alias is executing. Never adjust those.
+
 ## The user program
 
 `user/` is a **standalone crate**, deliberately outside the kernel's workspace:
@@ -261,6 +276,22 @@ Syscall ABI, defined in user/src/main.rs:
     a7      = syscall number      1 = write(ptr, len)
     a0..a5  = arguments           0 = exit(code)
     a0      = return value
+
+`enter_user` clears `sstatus.SPP` (return to U-mode), sets SPIE (stay
+preemptible) and sets **SUM** (bit 18), which permits supervisor code to touch
+`U=1` pages. SUM is currently on permanently, and that is a deliberate
+shortcut: `trap_entry` pushes the frame onto whatever `sp` holds, which after a
+user trap is an untrusted USER stack, and `write` reads the user's string
+directly. Both are fixed the same way -- swap to a kernel stack via `sscratch`
+first, and enable SUM only around explicit copies. That is 10c.
+
+**`write` does no pointer validation.** The address comes from an untrusted
+program and is dereferenced on faith. That is 10d and it is the whole point of
+the milestone.
+
+User mode composes with the scheduler for free: the timer preempts the user
+program, its frame lands on its own stack, and the kernel switches to other
+threads and back.
 
 ## Setup
 
@@ -450,8 +481,8 @@ innovation budget is spent at Phase V.
 7. ✅ kernel heap: free list, first fit, splitting, two-way coalescing
 8. ✅ kernel threads + cooperative context switch
 9. ✅ preemption + spinlocks that disable interrupts
-10. ✅ 10a user program built and embedded
-    ⬅ **current** — 10b sret into user mode
+10. ✅ 10a program embedded; ✅ 10b runs in user mode and makes syscalls
+    ⬅ **current** — 10c sscratch + kernel stack swap, 10d pointer validation
 8. kernel threads + context switch
 11. process creation
 12. **the object store**, in RAM first: indexes, query, versioning
