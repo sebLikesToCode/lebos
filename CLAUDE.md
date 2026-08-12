@@ -93,82 +93,44 @@ Written as `Vec<Thread>` it crashed: spawning the fifth thread grew the Vec past
 capacity 4, every suspended thread's context moved, and the pointers became
 freed memory. Boxing lets the Vec move while the threads never do.
 
-## Two open bugs
+## RULE: sepc and sstatus are GLOBAL CSRs -- save them per trap
 
-### 1. Heavy preemption crash
+**This caused both of the long-running bugs, and it is the single most
+important thing in the kernel's trap path.**
 
-Reproduces with `TICK_INTERVAL` at 500 us or shorter; green at the shipped
-10 ms. **Reproduction:** short quantum plus any thread doing `println!` then
-`yield_now()`.
+The hardware has exactly one `sepc` and one `sstatus`. A trap sets them; `sret`
+reads them. That is fine with no scheduler. With one, the sequence becomes:
 
-**Signature:** a caller-saved register holding a live pointer contains garbage.
-Seen in `puts` (a1, the `&str` pointer) and in `SpinLock::lock` (a3, the lock
-address).
+    thread A traps          sepc = A's PC, SPP = A's privilege
+    handler -> yield_now -> switch to thread B
+    B's handler finishes -> sret
+    sret reads sepc/sstatus -- which now describe A, not B
 
-**Fixed along the way, all real:** `sbi_set_timer` declaring `a0` input-only
-when SBI returns in a0 and a1; and three physical-address dereferences that the
-identity map had been hiding (`map()` walking tables, `frame_alloc`/`frame_free`
-touching links, `map_user` zeroing frames). None eliminated the crash.
+So `sret` jumps to **another thread's program counter, at another thread's
+privilege level**. Both are saved in `TrapFrame` (offsets 256 and 264) and
+written back by `trap_entry` on the way out. `trap_handler` reads and edits
+`frame.sepc`, never the CSR.
 
-**Ruled out by direct measurement -- do not re-litigate these:**
+Symptoms this produced, which looked like completely unrelated bugs:
 
-- the spinlock and racer threads (reproduces with neither)
-- thread stack overflow (bottom canaries intact at fault time)
-- boot stack overflow (`sp` near the TOP of the boot stack)
-- stack size (still faults at 128 KiB)
-- the handler's own `println!` (still faults with the handler silent)
-- `trap_entry`'s save/restore lists (audited from the disassembly: x0,x1,x3..x31
-  each stored to slot `x*8`, x1,x3..x31 each loaded from the same slots)
-- `switch`'s save/restore (audited the same way, perfectly symmetric)
-- every `asm!` block in main.rs (only `sbi_set_timer` was wrong)
-- **the frame being written while parked.** TWO tripwires, neither fired: a
-  Rust one snapshotting all 32 slots across `trap_handler`, and an assembly one
-  checksumming the frame right after SAVE_ALL and verifying right before
-  LOAD_ALL. **The frame is provably intact from save to restore.**
+- A thread resuming at another thread's PC with its own registers -- which
+  presents exactly as "a caller-saved register holding a live pointer contains
+  garbage." Chased for hours through two tripwires, a full `asm!` audit, and
+  disassembly-level audits of `trap_entry` and `switch`, all of which were
+  clean, because nothing was corrupting anything.
+- A kernel thread `sret`ing into *user* code from supervisor mode, faulting on
+  the `U=1` page.
 
-That last result means the register IS correctly preserved, so the whole
-"preemption corrupts registers" model is wrong. The remaining possibility is
-that the pointer was **already** garbage before the trap -- i.e. `puts` is being
-CALLED with a bad `&str`, which points at `core::fmt` state or the caller's
-stack rather than at the trap path. Investigate from that end.
+Both only appeared under short quanta, because that is when a switch is likely
+to happen inside a handler.
 
-### 2. `sstatus.SPP` is not saved per-trap
+**Verified fixed:** a 50 us quantum -- 200x more aggressive than the shipped
+10 ms -- survives 600,000 timer interrupts with the lock check passing and the
+user program running. That configuration previously died within a second.
 
-`trap_entry` reads `sstatus` live on the way out to choose the user-vs-supervisor
-return path. **`sstatus` is one global CSR.** Between save and restore the
-scheduler can run other threads that trap and overwrite SPP, so the check can
-describe the wrong thread. Latent while only one thread enters user mode; live at
-milestone 11.
-
-**ATTEMPTED TWICE, REVERTED TWICE.** The change is: widen the frame to 272
-(`.equ FRAME, 272`, `.equ SSTATUS_OFF, 256`), `csrr t0, sstatus; sd t0,
-SSTATUS_OFF(sp)` after SAVE_ALL, then `ld t0, SSTATUS_OFF(sp); csrw sstatus, t0`
-and branch on that value instead of the live CSR. Add `sstatus` and `_pad` to
-`TrapFrame`.
-
-**The assembly was verified correct from the disassembly** -- `addi sp, sp,
--0x110`, `sd t0, 0x100(sp)`, `ld t0, 0x100(sp)`, `andi t0, t0, 0x100`, both
-branches right. It is faithfully implemented and still breaks.
-
-**Failure mode, and it is the lead worth chasing:**
-
-    instruction page fault, scause 0xc
-    sepc  0x103c    <- a USER address (the program's spin loop, mapped R-X-U)
-    sp    0xffffffc087f0c1a0  <- inside GREEDY's kernel stack, not main's
-
-An instruction fetch from *supervisor* mode on a `U=1` page faults, so this is a
-return to the wrong privilege level. And `sp` proves **`sscratch` was armed by
-the wrong thread**: only the "back to USER" path writes `sscratch`, so some
-kernel thread took that path when it should have taken the supervisor one.
-
-`sscratch` is *also* a single global CSR, and the kernel path leaves it at 0
-while the user path arms it. Start there: instrument which thread arms
-`sscratch` and with what, and print SPP at every trap entry and exit.
-
-Also note the exit path interacts: parking a thread inside a handler forever
-means its saved sstatus is never restored. Changing exit to return normally did
-NOT fix this, but it is probably still required.
-
+`stval` and `scause` are read at the top of the handler before any switch, so
+they are safe today; anything that reads them after a `yield_now` must save
+them too.
 
 ## Returning after a break
 

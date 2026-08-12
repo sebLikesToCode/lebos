@@ -151,6 +151,25 @@ switch:
         ret
 
 
+# Trap frame layout. MUST match TrapFrame in main.rs.
+#
+#     0..255   x0..x31
+#   256..263   sstatus at the moment of the trap
+#   264..271   sepc    at the moment of the trap
+#
+# sstatus and sepc are saved for the same reason, and it is the reason a
+# scheduler makes them dangerous: THEY ARE SINGLE GLOBAL CSRs. Between this
+# trap being taken and its return, the scheduler can run several other threads,
+# each of which traps and overwrites both. Reading them live on the way out
+# describes the LAST thread to trap, not the one being returned to.
+#
+# For sepc that means `sret` jumps to another thread's program counter. For
+# sstatus it means returning at another thread's privilege level. Combine them
+# and a kernel thread sret's into user code from supervisor mode.
+.equ FRAME, 272
+.equ SSTATUS_OFF, 256
+.equ SEPC_OFF, 264
+
 .macro SAVE_GP i
         sd      x\i, \i*8(sp)
 .endm
@@ -202,41 +221,53 @@ trap_entry:
         # sscratch was 0, so we came from the kernel and sp is fine. Undo the
         # swap to get it back, and leave sscratch at 0.
         csrrw   sp, sscratch, sp
-        addi    sp, sp, -256
+        addi    sp, sp, -FRAME
         SAVE_ALL
         # The interrupted sp is just above the frame. Safe to clobber t0, it is
         # already saved.
-        addi    t0, sp, 256
+        addi    t0, sp, FRAME
         sd      t0, 2*8(sp)
         j       2f
 
 1:      # We came from USER. sp is now this thread's kernel stack, and the
         # user's own sp is sitting in sscratch.
-        addi    sp, sp, -256
+        addi    sp, sp, -FRAME
         SAVE_ALL
         csrr    t0, sscratch
         sd      t0, 2*8(sp)             # record the USER sp in the frame
         csrw    sscratch, zero          # we are in the kernel now
 
-2:      # First argument to trap_handler: a pointer to the frame.
+2:      # Save the two global CSRs into the frame -- see the layout note above.
+        csrr    t0, sstatus
+        sd      t0, SSTATUS_OFF(sp)
+        csrr    t0, sepc
+        sd      t0, SEPC_OFF(sp)
+
+        # First argument to trap_handler: a pointer to the frame.
         mv      a0, sp
         call    trap_handler
 
-        # Decide where we are returning to BEFORE restoring registers, while t0
-        # is still ours to clobber. SPP is bit 8 of sstatus: 1 = supervisor.
-        csrr    t0, sstatus
+        # Put both CSRs back from the frame. The handler may have edited
+        # frame.sepc -- stepping over a faulting instruction, or past an ecall.
+        ld      t0, SEPC_OFF(sp)
+        csrw    sepc, t0
+        ld      t0, SSTATUS_OFF(sp)
+        csrw    sstatus, t0
+
+        # Decide where we are returning to from the SAVED value, not the live
+        # register. SPP is bit 8: 1 = supervisor.
         andi    t0, t0, 0x100
         beqz    t0, 3f
 
         # --- back to supervisor ---
         LOAD_ALL
-        addi    sp, sp, 256
+        addi    sp, sp, FRAME
         sret
 
 3:      # --- back to USER ---
         # Re-arm sscratch with this thread's kernel sp while we still know it,
         # so the next user trap can find a stack.
-        addi    t0, sp, 256
+        addi    t0, sp, FRAME
         csrw    sscratch, t0
         LOAD_ALL
         ld      sp, 2*8(sp)             # the user's own sp, from the frame

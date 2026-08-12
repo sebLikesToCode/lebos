@@ -1821,22 +1821,35 @@ fn panic(info: &PanicInfo) -> ! {
     }
 }
 
+/// Must match the layout asserted in entry.S. 34 words = 272 bytes, already a
+/// multiple of 16, so no padding is needed.
 #[repr(C)]
 pub struct TrapFrame {
     pub x: [usize; 32],
+    /// `sstatus` at the moment of the trap. Its SPP bit says which privilege
+    /// level to return to.
+    pub sstatus: usize,
+    /// `sepc` at the moment of the trap -- where to resume.
+    ///
+    /// The handler EDITS this to step over a faulting instruction or past an
+    /// `ecall`, and `trap_entry` writes it back to the CSR on the way out.
+    pub sepc: usize,
 }
 
 #[no_mangle]
 extern "C" fn trap_handler(frame: &mut TrapFrame) {
     let scause: usize;
-    let sepc: usize;
     let stval: usize;
 
     unsafe {
         core::arch::asm!("csrr {}, scause", out(reg) scause);
-        core::arch::asm!("csrr {}, sepc",   out(reg) sepc);
         core::arch::asm!("csrr {}, stval",  out(reg) stval);
     }
+
+    // sepc comes from the FRAME, never from the live CSR. Between this trap and
+    // its return the scheduler may run other threads that trap and overwrite
+    // it; reading it live would give another thread's program counter.
+    let sepc = frame.sepc;
 
     // scause's top bit: set means interrupt, clear means exception.
     // Reinterpreting as signed makes "top bit set" the same as "negative".
@@ -1917,10 +1930,12 @@ extern "C" fn trap_handler(frame: &mut TrapFrame) {
                 // -- no process table, no parent -- so this thread parks. But
                 // if anything ever does resume through this frame, sepc must
                 // already point past the ecall or it re-executes exit forever.
-                unsafe { core::arch::asm!("csrw sepc, {}", in(reg) sepc + 4) };
-                loop {
-                    yield_now();
-                }
+                // Return normally: the instruction after the ecall is the
+                // program's own spin loop, and it gets preempted like anything
+                // else. Parking inside the handler would leave a thread
+                // permanently mid-trap, so its saved sepc and sstatus would
+                // never be written back.
+                0
             }
             _ => {
                 println!("user: unknown syscall {}", num);
@@ -1936,7 +1951,7 @@ extern "C" fn trap_handler(frame: &mut TrapFrame) {
         // A syscall is an EXCEPTION -- the ecall executed and did its whole
         // job. Not advancing sepc would re-execute it forever. Interrupts get
         // the opposite treatment, which is the branch above.
-        unsafe { core::arch::asm!("csrw sepc, {}", in(reg) sepc + 4) };
+        frame.sepc = sepc + 4;
         return;
     }
 
