@@ -11,3 +11,4 @@ questions.py
 qemu.log
 virt.dtb
 virt.dts
+src/entry2.S

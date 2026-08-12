@@ -30,7 +30,9 @@ run: build
 # Created on demand so a fresh checkout works without extra steps.
 $(PLAY):
 	@cp src/main.rs $(PLAY)
-	@echo "created $(PLAY) from src/main.rs"
+	@cp src/entry.S src/entry2.S
+	@sed -i 's|include_str!("entry.S")|include_str!("entry2.S")|' $(PLAY)
+	@echo "created $(PLAY) + src/entry2.S from the real kernel"
 
 ## play    -- build and run the scratch copy instead of the real kernel
 play: $(PLAY)
@@ -39,9 +41,13 @@ play: $(PLAY)
 
 ## resync  -- overwrite the scratch copy with the current main.rs.
 ##            DISCARDS whatever you were experimenting with.
+##            Also refreshes src/entry2.S, the scratch copy of the assembly,
+##            so bugs can be planted there without touching the real kernel.
 resync:
 	@cp src/main.rs $(PLAY)
-	@echo "$(PLAY) reset to match src/main.rs"
+	@cp src/entry.S src/entry2.S
+	@sed -i 's|include_str!("entry.S")|include_str!("entry2.S")|' $(PLAY)
+	@echo "$(PLAY) + src/entry2.S reset to match the real kernel"
 
 ## playdiff -- show what you changed in the scratch copy vs the real kernel
 playdiff: $(PLAY)
