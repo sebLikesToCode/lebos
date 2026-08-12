@@ -174,7 +174,13 @@ extern "C" fn umain() -> ! {
     write(b" (1 = refused)\n");
 
     unsafe { syscall4(SYS_EXIT, 0, 0, 0, 0) };
-    loop {}
+
+    // exit returns, since there is no parent to reap this program yet. Spin
+    // until the scheduler stops picking us; the timer preempts it, so this
+    // costs a slice rather than the machine.
+    loop {
+        core::hint::spin_loop();
+    }
 }
 
 #[panic_handler]

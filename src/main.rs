@@ -2198,14 +2198,16 @@ fn matches(obj: &Object, c: &Cond) -> bool {
     }
 }
 
-/// Parse a create request. Returns None on anything malformed -- a user
-/// program is allowed to send nonsense, and the kernel's job is to notice.
-fn parse_create(
-    buf: &[u8],
-) -> Option<(
+/// What a parsed create request contains: the content, and everything said
+/// about it.
+type CreateReq = (
     alloc::vec::Vec<u8>,
     alloc::vec::Vec<(alloc::string::String, Value)>,
-)> {
+);
+
+/// Parse a create request. Returns None on anything malformed -- a user
+/// program is allowed to send nonsense, and the kernel's job is to notice.
+fn parse_create(buf: &[u8]) -> Option<CreateReq> {
     let mut r = Reader::new(buf);
     let content_len = r.u32()? as usize;
     let content = r.take(content_len)?.to_vec();
