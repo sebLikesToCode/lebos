@@ -93,6 +93,18 @@ Written as `Vec<Thread>` it crashed: spawning the fifth thread grew the Vec past
 capacity 4, every suspended thread's context moved, and the pointers became
 freed memory. Boxing lets the Vec move while the threads never do.
 
+**OPEN BUG, found 2026-08-12, not yet diagnosed.** Shortening TICK_INTERVAL
+from 10 ms to 500 us or less crashes the kernel under the threading demo:
+
+    store page fault, scause 0xf, stval 0x18
+    sp is inside a thread stack (heap region), so the stack itself is fine
+
+`stval 0x18` is a write through a null pointer at offset 0x18, which is `s[1]`
+in `Context` -- i.e. `switch` being called with `old == NULL`. At 10 ms it never
+reproduces. Worth chasing before milestone 10, because user mode will make
+traps far more frequent and this is exactly the class of bug that gets much
+more likely.
+
 Next: milestone 10, user mode.
 
 Hard-won details that will bite again if forgotten:
