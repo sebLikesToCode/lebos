@@ -93,59 +93,53 @@ Written as `Vec<Thread>` it crashed: spawning the fifth thread grew the Vec past
 capacity 4, every suspended thread's context moved, and the pointers became
 freed memory. Boxing lets the Vec move while the threads never do.
 
-**OPEN BUG, found 2026-08-12. Narrowed, not solved.**
+**OPEN BUG, found 2026-08-12. Heavily narrowed, not solved.**
 
-Shortening `TICK_INTERVAL` from 10 ms to 500 us reliably crashes the threading
-demo. At 10 ms it never reproduces, so `make run` is unaffected -- but user mode
-multiplies the trap rate, and this is exactly the class of bug that gets worse
-under pressure. Worth finishing before milestone 10.
+Only reproduces with `TICK_INTERVAL` at 500 us or shorter; at the shipped 10 ms
+it never happens, so `make run` is green. Must be fixed before milestone 10 --
+user mode multiplies the trap rate.
 
-Symptom:
+**Minimal reproduction:** a 500 us quantum plus any thread doing
+`println!` then `yield_now()`. No locks, no racer threads, and no printing from
+the timer handler are needed.
 
-    store page fault, scause 0xf, stval 0x10
-    sepc inside thread_racer / a thread's println
-    a0 = a1 = a2 = 0, s1 = 0
-    sp is inside a thread stack, so the stack pointer itself is sane
+**Signature:** a *caller-saved* register holding a live pointer contains garbage
+after a preemption. Seen twice, in different code:
 
-Disassembly at the faulting instruction:
+    lbu a5, 0x0(a1)         inside puts; a1 is the &str pointer  -> stval 0x34f9e5eb444a00a1
+    amoor.w.aq a2, a0, (a3) inside SpinLock::lock; a3 = &lock    -> stval 0x10
 
-    addi   a3, a1, 0x40        <- a3 = &COUNTER.locked, computed ONCE
-    andi   a3, a3, -0x4           before the loop
-    ...loop...
-    csrrci a5, sstatus, 0x2     <- intr_off()
-    amoor.w.aq a2, a0, (a3)     <- faults; stval says a3 == 0x10
+Caller-saved registers are preserved by the **trap frame**, not by `switch`.
 
-So a **caller-saved** register holding a valid address is garbage after a
-preemption. Caller-saved registers are preserved by the *trap frame*, not by
-`switch`, which points at trap_entry's save/restore or at the frame being
-overwritten.
+**Ruled out, each by direct test:**
 
-What has been ruled out, each by direct test:
+- The spinlock and racer threads -- reproduces with neither.
+- Thread stack overflow -- a canary at the bottom of every thread stack is
+  still intact when the fault hits.
+- Boot stack overflow -- `sp` at fault time sits near the TOP of the boot
+  stack, i.e. main is shallow.
+- Stack size -- still faults with 128 KiB stacks instead of 16 KiB.
+- The handler's own `println!` -- still faults with the handler silent.
+- **`trap_entry`'s save/restore lists** -- audited from the disassembly, not by
+  reading the macro. x0,x1,x3..x31 are each stored to their own slot `x*8`;
+  x1,x3..x31 are each loaded from the same slot. x0 saved and not restored
+  (correct, hardwired). x2 in neither (correct, the `addi` restores it). The
+  one store to a foreign slot is the deliberate `sd t0, 16(sp)` stashing the
+  original sp. **The frame is correct.**
 
-- **Not the spinlock or the racers** -- reproduces with only main/alpha/beta/
-  greedy and no locks in play.
-- **Not stack size** -- still faults with 128 KiB stacks instead of 16 KiB.
-- **Not the handler's `println!`** -- still faults with the handler printing
-  nothing at all.
+**Leading hypothesis:** the handler takes longer than the quantum, so the timer
+is already overdue when `sret` runs and fires again immediately. Back-to-back
+traps at the same stack location should be harmless, so something in that path
+is not re-entrant. Unproven.
 
-What is consistent: it faults **while a thread is inside `println!`** (output
-cuts off mid-word, e.g. `[gr*** TRAP ***`), under a quantum short enough that
-the timer fires repeatedly during one formatting call.
-
-Leading hypotheses, untested:
-
-1. trap_entry's save or restore list is subtly wrong for some register, and
-   only deep frequent traps expose it.
-2. The timer becomes overdue while the handler runs, so it re-fires immediately
-   on `sret`, and something about back-to-back traps is not re-entrant.
-3. `main`'s `Context` starts fully zeroed (`ra = 0`, `sp = 0`), so anything
-   that switches TO main before main has ever switched away would load a null
-   ra and sp. Believed impossible on the current path, but unproven.
-
-Next diagnostic step: dump all 32 registers from the trap frame plus the
-current thread's stack bounds, and check whether sp is inside them.
+**Next diagnostic -- do this one, it is decisive:** `make debug`, then set a
+hardware watchpoint on the trap frame slot for the corrupted register (a1 is
+x11, so offset 11*8 = 88 from the frame base) and let GDB catch whoever writes
+it. That identifies the corrupting instruction directly instead of inferring
+from the victim.
 
 Next: milestone 10, user mode.
+
 
 
 Hard-won details that will bite again if forgotten:
