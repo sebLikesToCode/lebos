@@ -508,6 +508,63 @@ three times instead of forever, and the timer no longer announces each second.
 Both were proof the scheduler worked and became a machine talking over its
 user the moment there was a user.
 
+## Process lifecycle (milestone 16)
+
+`ThreadState` is `Runnable | Sleeping(chan) | Zombie(code) | Free`, and
+`yield_now` only ever picks `Runnable`.
+
+**A channel is the ADDRESS of the thing being waited for** — the console
+buffer's address for input, the parent's own address for `wait`. Addresses are
+already unique, so wait queues need no registry and no allocation.
+
+**The lost wakeup** is the reason `sleep` is delicate:
+
+    if console_is_empty() {   // (1) check
+                              // (2) <- the interrupt lands HERE
+        sleep(CONSOLE);       // (3) sleep forever
+    }
+
+At (2) the handler shouts into an empty room, because nobody is asleep yet.
+It needs a one-instruction window, so it passes every test and hangs in front
+of an audience. (1)(2)(3) must be indivisible; on one hart that is exactly
+`intr_off()`. **`sleep` therefore requires interrupts to be off already**, and
+off continuously since the condition was tested.
+
+**Why zombies exist, physically:** a thread cannot free its own kernel stack,
+because it is standing on it. So death is two phases —
+
+| phase | who | what goes |
+|---|---|---|
+| `thread_exit` | the dying thread | the address space |
+| `thread_wait` | somebody else | the 16 KiB stack, and the slot |
+
+**Two orderings inside `exit` that are not negotiable:**
+
+- Switch `satp` to the kernel's table BEFORE calling `free_user_space`. The
+  dying code is executing *through* the table it is dismantling.
+- `free_user_space` walks slots **0..256 only**. Slots 256..511 are the kernel,
+  copied into every address space at milestone 11; freeing those deletes the
+  kernel out from under every process, including the one doing the freeing.
+
+**Slots are reused, never removed** — `CURRENT` and every `parent` are indices
+or addresses into the table, and a `remove` would silently renumber them. That
+means an address can be reused too, so `exit` **re-parents orphans to init**
+first. This is the PID-reuse problem, solved the way Unix solves it.
+
+Thread 0 is init: it loops on `thread_wait`, and an orphan nobody collects is a
+slot and 16 KiB held forever.
+
+**Boot-order landmine, cost an hour:** the timer is armed before
+`threads_init`, so early traps reach `yield_now` with an EMPTY table. The old
+code had `if threads.len() < 2 { return }` covering this by accident. Without
+a guard, the scan finds nothing runnable, takes the idle path, and parks the
+core on `wfi` forever — one tick into boot, having printed just enough to make
+the hang look like it was in the store or the disk driver.
+
+Verified: `ps` shows main `sleeping on 0x...` (blocked in wait) and reaped
+slots as `-- free slot --`; a later `run` lands in procA's old slot; the heap
+gains ~32 KiB, which is two kernel stacks coming back.
+
 ## The on-disk format (milestone 13b)
 
 ```
@@ -780,10 +837,9 @@ result list are pure policy sitting in ring 0 because that was the only place
 that existed. Phase VI ends with `lebos` being a kernel and nothing else.
 
 15. ✅ PLIC + interrupt-driven console
-16. ⬅ **current** — process lifecycle: `exit`, `wait`, reap. Nothing frees a
-    dead process's frames, and `exit` currently returns and spins. Also the
-    sleep/wake primitive that lets a blocked thread stop spinning.
-17. userspace memory: an `sbrk` syscall, which unlocks `alloc` in user programs
+16. ✅ process lifecycle: exit, wait, reap, sleep/wake
+17. ⬅ **current** — userspace memory: an `sbrk` syscall, which unlocks
+    `alloc` in user programs
 18. the store syscalls a shell needs: get, hide, evict, forget, save, readline
 19. **exec-by-query** — a program is an object with `type=program`, so running
     one means running a QUERY. `execve("/bin/sh")` is a path lookup in every OS

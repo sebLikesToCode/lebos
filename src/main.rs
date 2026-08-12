@@ -507,8 +507,17 @@ extern "C" fn kmain_high() -> ! {
     // Milestone 14: hand the machine over to whoever is typing.
     thread_spawn("shell", shell);
 
+    // Thread 0 is now init. Everything spawned at boot is its child, and a
+    // zombie nobody collects is a table slot and 16 KiB held forever -- which
+    // is exactly what an orphaned process is in any Unix, and exactly why init
+    // has this job there too.
     loop {
-        // Wait For Interrupt: idles the core instead of spinning it at 100%.
+        while let Some((name, code)) = thread_wait() {
+            println!("init: reaped {} (exit {})", name, code);
+        }
+        // No children left. Idle -- and yield first, because wfi with a
+        // runnable thread waiting would park the core instead of running it.
+        yield_now();
         unsafe { core::arch::asm!("wfi") };
     }
 }
@@ -546,13 +555,16 @@ fn process_spawn(name: &'static str, tag: u8) -> usize {
     ctx.sp = top;
     ctx.s[0] = user_thread_entry as *const () as usize;
 
-    THREADS.lock().push(alloc::boxed::Box::new(Thread {
+    thread_insert(Thread {
         ctx,
         satp,
+        root_pa,
         user_sp,
         name,
-        _stack: stack,
-    }));
+        state: ThreadState::Runnable,
+        parent: current_addr(),
+        stack,
+    });
 
     root_pa
 }
@@ -962,39 +974,52 @@ fn plic_complete(irq: u32) {
 /// remind you.
 fn console_interrupt() {
     let base = UART_BASE.load(Ordering::Relaxed) as *mut u8;
+    let mut got = false;
     unsafe {
         while core::ptr::read_volatile(base.add(UART_LSR)) & UART_LSR_RX_READY != 0 {
             console_push(core::ptr::read_volatile(base));
             CONSOLE_IRQS.fetch_add(1, Ordering::Relaxed);
+            got = true;
         }
+    }
+    // Shout the channel. Anyone dozing on the console buffer stands up.
+    if got {
+        wakeup(chan_console());
     }
 }
 
-/// Take one byte from the console.
-///
-/// It no longer touches the UART. Milestone 14 read the chip directly and
-/// milestone 15 moved that read into the interrupt handler, so this now pops
-/// from a buffer the hardware filled while nobody was looking. The byte
-/// arrived because the UART asked to be heard, not because anyone checked.
-fn getchar() -> Option<u8> {
-    console_pop()
+/// The console's channel: the address of the thing being waited for.
+fn chan_console() -> usize {
+    core::ptr::addr_of!(CONSOLE) as usize
 }
 
-/// Wait for a keystroke, letting everything else run in the meantime.
+/// Wait for a keystroke. The thread stops running entirely until one arrives.
 ///
-/// `yield_now()` rather than a spin: a human types at maybe 5 characters a
-/// second, and the CPU can do tens of millions of things between two of them.
-/// The scheduler built at milestone 8 is what makes waiting cheap.
+/// Milestone 14 spun around `yield_now`, which worked but meant being handed
+/// the CPU, finding nothing, and giving it back, over and over, for as long as
+/// you took to decide what to type. Now the thread leaves the run queue and
+/// the interrupt handler puts it back.
 ///
-/// This still spins around the scheduler, which is honest but not free -- the
-/// real answer is to block the thread and have the interrupt wake it, and that
-/// needs a sleep/wake primitive the kernel does not have yet. Milestone 16.
+/// Interrupts go off BEFORE the buffer is checked and stay off until `sleep`
+/// has marked this thread Sleeping. That window is the lost wakeup, and this
+/// is the whole defence against it.
 fn getchar_blocking() -> u8 {
     loop {
-        if let Some(c) = getchar() {
-            return c;
+        let was_on = intr_off();
+        match console_pop() {
+            Some(c) => {
+                if was_on {
+                    intr_on();
+                }
+                return c;
+            }
+            None => {
+                sleep(chan_console());
+                if was_on {
+                    intr_on();
+                }
+            }
         }
-        yield_now();
     }
 }
 
@@ -2110,17 +2135,52 @@ fn intr_on() {
     unsafe { core::arch::asm!("csrsi sstatus, 2") };
 }
 
+/// What a thread is currently doing, which is mostly about what it is NOT
+/// doing: only `Runnable` threads are ever handed the CPU.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ThreadState {
+    /// Wants the CPU.
+    Runnable,
+    /// Waiting for something, identified by a CHANNEL -- and a channel is
+    /// just the address of the thing being waited for. Addresses are already
+    /// unique, so this gives collision-free wait queues for free. Waiting on
+    /// keyboard input? Sleep on the address of the console buffer.
+    Sleeping(usize),
+    /// Exited, but nobody has collected the exit code yet.
+    ///
+    /// This state exists for one physical reason: a thread CANNOT free its own
+    /// kernel stack, because it is standing on it. Freeing 16 KiB of stack and
+    /// then executing one more instruction -- which pushes to that stack --
+    /// writes into memory the heap has already given to someone else. So death
+    /// is two phases: the dying thread drops its address space, and somebody
+    /// else drops the stack afterwards. That gap IS the zombie.
+    Zombie(i32),
+    /// Reaped. The slot is reusable, which is why threads are never removed
+    /// from the table -- `CURRENT` and every `parent` field are indices into
+    /// it, and removing an element would silently renumber them all.
+    Free,
+}
+
 struct Thread {
     ctx: Context,
     /// The address space this thread runs in -- the city it lives in. Kernel
     /// threads all share the kernel's; each user process has its own.
     satp: usize,
+    /// The root page table's PHYSICAL address, or 0 for a kernel thread that
+    /// borrows the kernel's. Kept so `exit` knows what to dismantle.
+    root_pa: usize,
     /// Initial user stack pointer, for a thread that will drop to user mode.
     user_sp: usize,
     name: &'static str,
-    /// Owns the thread's stack. Dropping the Thread frees it -- the heap from
-    /// milestone 7 doing real work.
-    _stack: alloc::vec::Vec<u8>,
+    state: ThreadState,
+    /// The address of the Thread that spawned this one, or 0 for thread 0.
+    /// An ADDRESS rather than an index because boxed threads never move,
+    /// so it stays valid even as the table grows.
+    parent: usize,
+    /// Owns the thread's stack. Replacing this with an empty Vec is what
+    /// actually returns the 16 KiB -- the heap from milestone 7 doing real
+    /// work, and only ever from a thread that is not standing on it.
+    stack: alloc::vec::Vec<u8>,
 }
 
 /// The thread table, behind a lock. `push` is several stores -- bump the
@@ -2155,9 +2215,12 @@ fn threads_init() {
     THREADS.lock().push(alloc::boxed::Box::new(Thread {
         ctx: Context::zeroed(),
         satp: KERNEL_SATP.load(Ordering::Relaxed),
+        root_pa: 0,
         user_sp: 0,
         name: "main",
-        _stack: alloc::vec::Vec::new(), // main runs on the boot stack
+        state: ThreadState::Runnable,
+        parent: 0, // nothing spawned it; it has been running since _start
+        stack: alloc::vec::Vec::new(), // main runs on the boot stack
     }));
 }
 
@@ -2181,13 +2244,41 @@ fn thread_spawn(name: &'static str, entry: extern "C" fn() -> !) {
     ctx.sp = top;
     ctx.s[0] = entry as *const () as usize;
 
-    THREADS.lock().push(alloc::boxed::Box::new(Thread {
+    thread_insert(Thread {
         ctx,
         satp: KERNEL_SATP.load(Ordering::Relaxed),
+        root_pa: 0,
         user_sp: 0,
         name,
-        _stack: stack,
-    }));
+        state: ThreadState::Runnable,
+        parent: current_addr(),
+        stack,
+    });
+}
+
+/// Put a thread in the table, reusing a reaped slot if there is one.
+///
+/// Reuse rather than push-forever because nothing is ever REMOVED: `CURRENT`
+/// and every `parent` field would be silently renumbered by a `remove`.
+fn thread_insert(t: Thread) -> usize {
+    let mut threads = THREADS.lock();
+    if let Some(i) = threads.iter().position(|x| x.state == ThreadState::Free) {
+        *threads[i] = t;
+        return i;
+    }
+    threads.push(alloc::boxed::Box::new(t));
+    threads.len() - 1
+}
+
+/// This thread's stable identity: the address of its box. Threads are boxed
+/// precisely so this never changes, however much the table grows.
+fn current_addr() -> usize {
+    let threads = THREADS.lock();
+    let cur = CURRENT.load(Ordering::Relaxed);
+    match threads.get(cur) {
+        Some(t) => &**t as *const Thread as usize,
+        None => 0,
+    }
 }
 
 /// Give up the CPU to the next thread, round robin.
@@ -2204,18 +2295,63 @@ fn yield_now() {
     // is neither running nor fully saved.
     let was_on = intr_off();
 
-    let (old, new, next_satp) = {
+    // Loop, because "nothing is runnable" is now a real state rather than an
+    // impossibility. Every thread can be asleep at once -- the shell waiting
+    // on a keystroke while everything else waits on it -- and the only thing
+    // that can change that is an interrupt. So idle with interrupts ON and
+    // wait for one, rather than scanning a table that cannot change.
+    let (old, new, next_satp) = loop {
+        let found = {
+            let threads = THREADS.lock();
+            let cur = CURRENT.load(Ordering::Relaxed);
+            let n = threads.len();
+
+            // No thread table yet. The timer is armed before `threads_init`
+            // runs, so early boot traps land here with nothing to schedule --
+            // and this code has no thread to switch away FROM. Falling into
+            // the idle path instead would park the core forever, one timer
+            // tick into the boot, having printed just enough to look like the
+            // hang was somewhere else entirely.
+            if n == 0 {
+                drop(threads);
+                if was_on {
+                    intr_on();
+                }
+                return;
+            }
+
+            // Start at cur+1 so it is round robin, and go all the way round to
+            // cur itself -- a lone runnable thread must be allowed to keep
+            // running rather than falling through to the idle path.
+            (1..=n)
+                .map(|k| (cur + k) % n)
+                .find(|&i| threads[i].state == ThreadState::Runnable)
+        };
+
+        let next = match found {
+            Some(i) => i,
+            None => {
+                // Nothing to run. wfi parks the core until an interrupt
+                // arrives; interrupts must be ON for one to be delivered, and
+                // OFF again before re-examining the table.
+                intr_on();
+                unsafe { core::arch::asm!("wfi") };
+                intr_off();
+                continue;
+            }
+        };
+
         let threads = THREADS.lock();
-        if threads.len() < 2 {
+        let cur = CURRENT.load(Ordering::Relaxed);
+        if next == cur {
+            // Already running the only runnable thread; a switch to yourself
+            // would save a context on top of the one being restored.
             drop(threads);
             if was_on {
                 intr_on();
             }
             return;
         }
-
-        let cur = CURRENT.load(Ordering::Relaxed);
-        let next = (cur + 1) % threads.len();
         CURRENT.store(next, Ordering::Relaxed);
 
         // Raw pointers, never references: `switch` writes through one while
@@ -2225,11 +2361,11 @@ fn yield_now() {
         //
         // These are safe to hold across the switch only because the threads
         // are boxed -- see the note on THREADS.
-        (
+        break (
             core::ptr::addr_of!(threads[cur].ctx) as *mut Context,
             core::ptr::addr_of!(threads[next].ctx),
             threads[next].satp,
-        )
+        );
     };
     // Lock released here. Interrupts stay off, because they were already off
     // when the guard was taken and Drop restores what it found.
@@ -2252,6 +2388,214 @@ fn yield_now() {
     // callee-saved registers or on this thread's own stack.
     if was_on {
         intr_on();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sleep and wake -- milestone 16
+//
+// A channel is the ADDRESS of the thing being waited for. Addresses are
+// already unique, so this gives collision-free wait queues with no registry
+// and no allocation: waiting on input sleeps on the console buffer's address,
+// waiting on a child sleeps on the parent's own address.
+//
+// THE LOST WAKEUP, which is the whole reason this is delicate:
+//
+//     if console_is_empty() {      // (1) check
+//                                  // (2) <-- the interrupt lands HERE
+//         sleep(CONSOLE);          // (3) sleep
+//     }
+//
+// At (2) a key is pressed, the handler pushes the byte and shouts -- into an
+// empty room, because nobody is asleep yet. Then (3) sleeps forever with the
+// keystroke sitting one instruction away. It needs the interrupt to land in a
+// one-instruction window, so it passes every test and hangs in front of an
+// audience.
+//
+// The fix is that (1)(2)(3) must be indivisible. On a single hart that is
+// exactly `intr_off()`: the shout cannot happen because the interrupt cannot.
+// So sleep() REQUIRES interrupts to be off already -- the caller turns them
+// off before testing the condition, and they stay off until this thread is
+// genuinely marked Sleeping. Same discipline as SpinLock, wider window.
+// ---------------------------------------------------------------------------
+
+/// Sleep on `chan`. **Interrupts must already be off**, and must have been off
+/// since the condition was tested -- see the lost wakeup above.
+fn sleep(chan: usize) {
+    {
+        let mut threads = THREADS.lock();
+        let cur = CURRENT.load(Ordering::Relaxed);
+        threads[cur].state = ThreadState::Sleeping(chan);
+    }
+    // Not runnable any more, so this hands the CPU away and does not come back
+    // until someone shouts our channel. yield_now leaves interrupts off,
+    // because they were off when it was entered.
+    yield_now();
+}
+
+/// Wake everyone waiting on `chan`. Safe from an interrupt handler: every
+/// holder of THREADS has interrupts off, so this can never arrive mid-update.
+fn wakeup(chan: usize) {
+    let mut threads = THREADS.lock();
+    for t in threads.iter_mut() {
+        if t.state == ThreadState::Sleeping(chan) {
+            t.state = ThreadState::Runnable;
+        }
+    }
+}
+
+/// Tear down a process's address space: its frames, and the tables describing
+/// them.
+///
+/// **Only slots 0..256.** Slots 256..511 are the KERNEL, copied into every
+/// address space at milestone 11 -- freeing those would delete the kernel out
+/// from under every process on the machine, including the one doing the
+/// freeing.
+///
+/// Every address in a page table is PHYSICAL, so descending one needs `va()`
+/// before the read. The rule that bit three separate places at milestone 6c.
+fn free_user_space(root_pa: usize) {
+    unsafe {
+        let root = va(root_pa) as *mut usize;
+        for i in 0..256 {
+            let e1 = *root.add(i);
+            if e1 & PTE_V == 0 {
+                continue;
+            }
+            let l1 = va(pte_to_pa(e1)) as *mut usize;
+            for j in 0..512 {
+                let e2 = *l1.add(j);
+                if e2 & PTE_V == 0 {
+                    continue;
+                }
+                let l0 = va(pte_to_pa(e2)) as *mut usize;
+                for k in 0..512 {
+                    let e3 = *l0.add(k);
+                    if e3 & PTE_V != 0 {
+                        frame_free(pte_to_pa(e3) as *mut u8);
+                    }
+                }
+                frame_free(pte_to_pa(e2) as *mut u8);
+            }
+            frame_free(pte_to_pa(e1) as *mut u8);
+        }
+        frame_free(root_pa as *mut u8);
+    }
+}
+
+/// End this thread. Never returns.
+///
+/// Phase one of two. The address space goes here; the kernel stack cannot,
+/// because this code is standing on it. What is left -- a table slot and an
+/// exit code -- is the zombie, and `thread_wait` collects it.
+fn thread_exit(code: i32) -> ! {
+    let (root_pa, parent) = {
+        let threads = THREADS.lock();
+        let cur = CURRENT.load(Ordering::Relaxed);
+        (threads[cur].root_pa, threads[cur].parent)
+    };
+
+    if root_pa != 0 {
+        // ORDER MATTERS ABSOLUTELY. This code is executing THROUGH the page
+        // table it is about to free -- every instruction fetch goes through
+        // it. Move into the kernel's address space first, then dismantle the
+        // old one from outside. Freeing first means the next instruction has
+        // nowhere to come from.
+        let ksatp = KERNEL_SATP.load(Ordering::Relaxed);
+        unsafe { core::arch::asm!("csrw satp, {}", "sfence.vma", in(reg) ksatp) };
+        free_user_space(root_pa);
+    }
+
+    {
+        let mut threads = THREADS.lock();
+        let cur = CURRENT.load(Ordering::Relaxed);
+        let me = &*threads[cur] as *const Thread as usize;
+
+        // Hand any surviving children to init BEFORE dying.
+        //
+        // Slots are reused, so a Thread's address is reused -- and `parent` is
+        // an address. A child that outlived its parent would otherwise be
+        // adopted by whatever thread lands in that slot next, which is the
+        // PID-reuse bug wearing different clothes. Unix re-parents orphans to
+        // init for exactly this reason.
+        let init = &*threads[0] as *const Thread as usize;
+        for t in threads.iter_mut() {
+            if t.parent == me {
+                t.parent = init;
+            }
+        }
+
+        threads[cur].satp = KERNEL_SATP.load(Ordering::Relaxed);
+        threads[cur].root_pa = 0;
+        threads[cur].state = ThreadState::Zombie(code);
+    }
+
+    // Tell whoever is waiting for us. The parent sleeps on its OWN address,
+    // so that is what gets shouted.
+    if parent != 0 {
+        wakeup(parent);
+    }
+
+    // Not runnable, so this never comes back. The loop is not optimism, it is
+    // the guarantee: if some future bug makes a zombie runnable, it lands here
+    // rather than running off the end of a function that promised never to
+    // return.
+    loop {
+        yield_now();
+    }
+}
+
+/// Collect one dead child. Returns its name and exit code, or None if this
+/// thread has no children left at all.
+///
+/// Phase two. The stack is freed HERE, from a thread that is not standing on
+/// it, and the slot goes back in the pool.
+fn thread_wait() -> Option<(&'static str, i32)> {
+    let me = current_addr();
+    loop {
+        // Interrupts off BEFORE looking, and still off when we sleep: between
+        // finding no zombie and going to sleep, a child could exit and shout
+        // into an empty room.
+        let was_on = intr_off();
+
+        let found = {
+            let threads = THREADS.lock();
+            threads.iter().enumerate().find_map(|(i, t)| match t.state {
+                ThreadState::Zombie(c) if t.parent == me => Some((i, c, t.name)),
+                _ => None,
+            })
+        };
+
+        if let Some((i, code, name)) = found {
+            let mut threads = THREADS.lock();
+            threads[i].state = ThreadState::Free;
+            // The 16 KiB nobody could free from the inside. Dropping the Vec
+            // returns it to the heap.
+            threads[i].stack = alloc::vec::Vec::new();
+            drop(threads);
+            if was_on {
+                intr_on();
+            }
+            return Some((name, code));
+        }
+
+        let any_children = {
+            let threads = THREADS.lock();
+            threads
+                .iter()
+                .any(|t| t.parent == me && t.state != ThreadState::Free)
+        };
+        if !any_children {
+            if was_on {
+                intr_on();
+            }
+            return None;
+        }
+
+        sleep(me);
+        if was_on {
+            intr_on();
+        }
     }
 }
 
@@ -3327,6 +3671,29 @@ extern "C" fn shell() -> ! {
 
             "stats" => shell_stats(),
 
+            "ps" => {
+                let threads = THREADS.lock();
+                for (i, t) in threads.iter().enumerate() {
+                    let state = match t.state {
+                        ThreadState::Runnable => alloc::string::String::from("runnable"),
+                        ThreadState::Sleeping(c) => alloc::format!("sleeping on {:#x}", c),
+                        ThreadState::Zombie(c) => alloc::format!("zombie (exit {})", c),
+                        ThreadState::Free => alloc::string::String::from("-- free slot --"),
+                    };
+                    println!("  {:>2}  {:<8} {}", i, t.name, state);
+                }
+            }
+
+            // Spawn the embedded program and collect it. Not exec-by-query
+            // yet -- that is 19, and it needs the program to be an OBJECT.
+            "run" => {
+                process_spawn("child", b'C');
+                match thread_wait() {
+                    Some((name, code)) => println!("  {} exited with {}", name, code),
+                    None => println!("  nothing to wait for"),
+                }
+            }
+
             // The commands people will reach for out of muscle memory. Every
             // one of them is a path operation, and none of them can mean
             // anything here -- so say why rather than "command not found".
@@ -4015,16 +4382,11 @@ extern "C" fn trap_handler(frame: &mut TrapFrame) {
             // exit(code)
             0 => {
                 println!("user: program exited with code {}", arg0);
-                // Step over the ecall FIRST. There is nothing to return to yet
-                // -- no process table, no parent -- so this thread parks. But
-                // if anything ever does resume through this frame, sepc must
-                // already point past the ecall or it re-executes exit forever.
-                // Return normally: the instruction after the ecall is the
-                // program's own spin loop, and it gets preempted like anything
-                // else. Parking inside the handler would leave a thread
-                // permanently mid-trap, so its saved sepc and sstatus would
-                // never be written back.
-                0
+                // Never returns. Milestone 14 returned here and let the
+                // program fall into its own spin loop -- a corpse the
+                // scheduler kept handing the CPU to. Now the address space
+                // is dismantled and the thread leaves the run queue for good.
+                thread_exit(arg0 as i32);
             }
             // create(buf, len) -> object id, or usize::MAX on refusal.
             //
