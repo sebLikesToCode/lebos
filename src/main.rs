@@ -11,6 +11,12 @@
 #![no_std]
 #![no_main]
 
+// `alloc` is the part of the standard library that needs a heap but not an OS:
+// Vec, Box, String, BTreeMap. It refuses to exist until something is marked
+// #[global_allocator], which is what milestone 7 provides.
+extern crate alloc;
+
+use core::alloc::{GlobalAlloc, Layout};
 use core::fmt::{self, Write};
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -127,16 +133,30 @@ pub extern "C" fn kmain(hartid: usize, dtb: *const u8) -> ! {
         ram_size / 1024 / 1024
     );
 
-    let free = frame_init(ram_base + ram_size);
+    // Carve the heap off the top of RAM BEFORE the frame allocator claims
+    // anything, so the two can never fight over the same bytes.
+    let ram_end = ram_base + ram_size;
+    let heap_phys = ram_end - HEAP_SIZE;
+
+    let free = frame_init(heap_phys);
     println!(
         "memory: {} frames free ({} MiB)",
         free,
         free * PAGE_SIZE / 1024 / 1024
     );
+    println!(
+        "heap:   reserved {:#x}..{:#x} ({} KiB)",
+        heap_phys,
+        ram_end,
+        HEAP_SIZE / 1024
+    );
 
     println!("paging: building kernel page table...");
     paging_init(ram_base + ram_size);
     println!("paging: MMU is on -- this line was fetched through a page table");
+
+    // Virtual, not physical -- the heap has to outlive the identity map.
+    heap_init(va(heap_phys), HEAP_SIZE);
 
     // Prove the higher-half alias is real: write through the low address,
     // read it back through the high one. If they are the same memory, the
@@ -258,6 +278,33 @@ extern "C" fn kmain_high() -> ! {
     explain(rp, va(UART0_PHYS));
     explain(rp, &BANNER as *const _ as usize);
     explain(rp, 0x8020_0000);
+
+    // The payoff: collections that were impossible ten minutes ago.
+    {
+        use alloc::boxed::Box;
+        use alloc::string::String;
+        use alloc::vec::Vec;
+
+        let heap_start = HEAP_END.load(Ordering::Relaxed) - HEAP_SIZE;
+
+        let mut v: Vec<u64> = Vec::new();
+        for i in 1..=8u64 {
+            v.push(i * i);
+        }
+        println!("heap: Vec    {:?}", v);
+
+        let b = Box::new(0x1EB05_u64);
+        println!("heap: Box    at {:p} holds {:#x}", b, *b);
+
+        let s = String::from("allocated on a heap in an OS I wrote");
+        println!("heap: String \"{}\"", s);
+
+        println!(
+            "heap: {} of {} bytes used",
+            heap_used(heap_start),
+            HEAP_SIZE
+        );
+    }
 
     // Schedule the first timer interrupt one tick out.
     sbi_set_timer(now() + TICK_INTERVAL);
@@ -706,6 +753,76 @@ fn paging_init(ram_end: usize) {
         pt,
         pt * PAGE_SIZE / 1024
     );
+}
+
+// ===========================================================================
+// Kernel heap -- 7a, the bump allocator
+//
+// The frame allocator hands out 4096 bytes, always. This hands out any size.
+//
+// A bump allocator is the simplest thing that can possibly work: one pointer
+// that only ever moves forward. Allocating means rounding up to the required
+// alignment and advancing. Freeing does nothing at all.
+//
+// Using the curb picture: this parks vehicles nose to tail down the street and
+// NEVER lets anyone leave. It works perfectly until the street ends, and then
+// it is over -- no gaps are ever reclaimed, because gaps are never created.
+//
+// That is deliberate. It makes Vec and Box work in ~30 lines, and its single
+// flaw is exactly the thing 7b exists to fix.
+// ===========================================================================
+
+/// How much RAM to reserve for the heap, carved off the top before the frame
+/// allocator claims anything.
+const HEAP_SIZE: usize = 1024 * 1024; // 1 MiB
+
+/// Next free byte, and one past the last. Virtual (higher-half) addresses, so
+/// they stay valid after the kernel relocates.
+static HEAP_NEXT: AtomicUsize = AtomicUsize::new(0);
+static HEAP_END: AtomicUsize = AtomicUsize::new(0);
+
+fn heap_init(start: usize, size: usize) {
+    HEAP_NEXT.store(start, Ordering::Relaxed);
+    HEAP_END.store(start + size, Ordering::Relaxed);
+}
+
+struct BumpAllocator;
+
+unsafe impl GlobalAlloc for BumpAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let next = HEAP_NEXT.load(Ordering::Relaxed);
+
+        // Round up to the requested alignment -- the same trick as page
+        // alignment, with a different power of two. A u64 landing on an odd
+        // address would fault, so this is not optional.
+        let start = (next + layout.align() - 1) & !(layout.align() - 1);
+        let end = start + layout.size();
+
+        if end > HEAP_END.load(Ordering::Relaxed) {
+            // Returning null is how GlobalAlloc reports failure. Rust turns
+            // that into a panic through the default allocation error handler.
+            return core::ptr::null_mut();
+        }
+
+        HEAP_NEXT.store(end, Ordering::Relaxed);
+        start as *mut u8
+    }
+
+    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {
+        // Nothing. A bump allocator cannot reclaim: it has no idea what is
+        // still parked between `start` and `next`, only where the end is.
+        //
+        // Note what Rust hands us that C never does -- `layout`, so the size
+        // is known without a hidden header before the block. 7b uses that.
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: BumpAllocator = BumpAllocator;
+
+/// Bytes handed out so far, for the demo.
+fn heap_used(start: usize) -> usize {
+    HEAP_NEXT.load(Ordering::Relaxed) - start
 }
 
 // ===========================================================================

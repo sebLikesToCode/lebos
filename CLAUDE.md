@@ -42,7 +42,12 @@ those.
 `probe()` / `explain()` walk the table by hand and report a translation with
 its permissions and RSW tag. Reach for them first when an address faults.
 
-Next: milestone 7, the kernel heap.
+A 1 MiB heap is carved off the top of RAM before `frame_init` claims anything,
+and `heap_init` is given its **virtual** address so it outlives the identity
+map. `BumpAllocator` implements `GlobalAlloc`, so `extern crate alloc` works
+and Vec/Box/String/BTreeMap are available. It never frees -- that is 7b.
+
+Next: 7b, a real free list.
 
 Hard-won details that will bite again if forgotten:
 
@@ -320,7 +325,8 @@ innovation budget is spent at Phase V.
    W^X enforced; unhandled exceptions are now fatal
    ✅ 6c-i higher-half direct map alongside the identity map, aliasing proven
    ✅ 6c the kernel executes in the higher half and the identity map is gone
-7. ⬅ **current** — kernel heap (GlobalAlloc, unlocks Vec/Box/BTreeMap)
+7. ✅ 7a bump allocator -- Vec/Box/String work; ⬅ **current** 7b free list with
+   coalescing, plus canaries
 8. kernel threads + context switch
 9. preemptive scheduler, spinlocks, wait queues — *policy/mechanism split
    starts here*
