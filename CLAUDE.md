@@ -134,41 +134,41 @@ stack rather than at the trap path. Investigate from that end.
 
 ### 2. `sstatus.SPP` is not saved per-trap
 
-`trap_entry` reads `sstatus` live on the way out to decide whether to return to
-user or supervisor mode. **`sstatus` is one global CSR.** Between saving and
-restoring, the scheduler can run several other threads, each of which traps and
-overwrites SPP -- so the check describes the last thread to trap, not the one
-being returned to. Currently latent because only one thread ever enters user
-mode; it becomes live at milestone 11.
+`trap_entry` reads `sstatus` live on the way out to choose the user-vs-supervisor
+return path. **`sstatus` is one global CSR.** Between save and restore the
+scheduler can run other threads that trap and overwrite SPP, so the check can
+describe the wrong thread. Latent while only one thread enters user mode; live at
+milestone 11.
 
-An attempt to fix it (widen the frame to 272 bytes, save sstatus at offset 256,
-restore from the frame) **destabilised the kernel** -- the user program faulted
-at `sepc 0x103c` with `sp` in another thread's stack, i.e. a mismatched return.
-Reverted to keep the tree green; the change is in the history at the commit
-following ea8ae72's tree if wanted. Fixing it properly probably needs the exit
-path reworked too, since parking a thread inside a trap handler forever
-interacts badly with per-trap sstatus.
+**ATTEMPTED TWICE, REVERTED TWICE.** The change is: widen the frame to 272
+(`.equ FRAME, 272`, `.equ SSTATUS_OFF, 256`), `csrr t0, sstatus; sd t0,
+SSTATUS_OFF(sp)` after SAVE_ALL, then `ld t0, SSTATUS_OFF(sp); csrw sstatus, t0`
+and branch on that value instead of the live CSR. Add `sstatus` and `_pad` to
+`TrapFrame`.
 
-Next: milestone 10b, sret into user mode.
+**The assembly was verified correct from the disassembly** -- `addi sp, sp,
+-0x110`, `sd t0, 0x100(sp)`, `ld t0, 0x100(sp)`, `andi t0, t0, 0x100`, both
+branches right. It is faithfully implemented and still breaks.
 
+**Failure mode, and it is the lead worth chasing:**
 
+    instruction page fault, scause 0xc
+    sepc  0x103c    <- a USER address (the program's spin loop, mapped R-X-U)
+    sp    0xffffffc087f0c1a0  <- inside GREEDY's kernel stack, not main's
 
+An instruction fetch from *supervisor* mode on a `U=1` page faults, so this is a
+return to the wrong privilege level. And `sp` proves **`sscratch` was armed by
+the wrong thread**: only the "back to USER" path writes `sscratch`, so some
+kernel thread took that path when it should have taken the supervisor one.
 
-Hard-won details that will bite again if forgotten:
+`sscratch` is *also* a single global CSR, and the kernel path leaves it at 0
+while the user path arms it. Start there: instrument which thread arms
+`sscratch` and with what, and print SPP at every trap entry and exit.
 
-- `stvec`'s low two bits are a MODE field, so the trap vector must be at
-  least 4-byte aligned. `riscv64gc` functions are only 2-byte aligned
-  (compressed instructions) and Rust cannot align a function, which is why
-  `trap_entry` lives in assembly.
-- `sepc` points **at** the faulting instruction, not past it. The handler
-  must advance it or the CPU re-executes the fault forever. Instruction
-  length is 4 bytes if the low two bits are `0b11`, else 2.
-- Interrupts get the opposite treatment: **never** advance `sepc` for one.
-  The instruction there has not run yet.
-- The timer interrupt is **level-triggered** on `time >= timecmp`. Rearming
-  it is how you acknowledge it, not merely how you schedule the next one —
-  skip the rearm and it re-fires at every instruction boundary forever
-  (measured: 494k ticks in 3 seconds).
+Also note the exit path interacts: parking a thread inside a handler forever
+means its saved sstatus is never restored. Changing exit to return normally did
+NOT fix this, but it is probably still required.
+
 
 ## Returning after a break
 
