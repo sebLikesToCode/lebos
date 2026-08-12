@@ -120,6 +120,13 @@ changes the job:
 - **Break-it experiments beat quizzes.** Change something in `make play`,
   predict, then run. This is how the level-triggered timer flood and the
   double-free self-loop got discovered.
+- **Plant bugs for him to diagnose (his idea, and a good one).** Introduce a
+  deliberate defect in `src/main2.rs`, show him the output, and let him work
+  out the cause from the symptom WITHOUT reading the source. Reveal the source
+  only once he has committed to a theory. Pick bugs with legible but
+  non-obvious symptoms -- e.g. removing backward coalescing from the heap
+  leaves the free byte count identical while the block count climbs. This
+  trains the exact skill the project exists to build.
 - xv6-riscv is the canonical reference implementation to point at. It solves
   nearly every problem this project will hit, in ~9k lines of readable C.
 
