@@ -382,46 +382,35 @@ extern "C" fn kmain_high() -> ! {
 
     // ---- your experiments go here ----
 
-    store_demo();
-
-    // Milestone 13a: prove the disk works before trusting it with the store.
+    // Milestone 13: persistence.
     if virtio_blk_init() {
         println!(
-            "disk: virtio-blk found at {:#x}",
+            "disk: virtio-blk at {:#x}",
             BLK_BASE.load(Ordering::Relaxed)
         );
-        let buf = frame_alloc().expect("no frame for a disk buffer") as usize;
-        unsafe {
-            let p = va(buf) as *mut u8;
-            core::ptr::write_bytes(p, 0, SECTOR);
-            // 0xF11E1E55 spells FILELESS. First four bytes of every LeBOS disk.
-            core::ptr::write_volatile(p as *mut u32, 0xF11E_1E55);
-            for (i, b) in b"LeBOS -- no files. no paths. no regrets."
-                .iter()
-                .enumerate()
-            {
-                core::ptr::write_volatile(p.add(4 + i), *b);
-            }
-        }
-        let wrote = blk_rw(0, buf, true);
 
-        // Scrub the buffer so a successful read cannot be the old contents.
-        unsafe { core::ptr::write_bytes(va(buf) as *mut u8, 0xAA, SECTOR) };
-        let read = blk_rw(0, buf, false);
-
-        unsafe {
-            let p = va(buf) as *const u8;
-            let magic = core::ptr::read_volatile(p as *const u32);
-            println!("disk: wrote={} read={} magic={:#x}", wrote, read, magic);
-            print!("disk: sector 0 says \"");
-            for i in 0..40 {
-                putchar(core::ptr::read_volatile(p.add(4 + i)));
-            }
-            println!("\"");
+        // Is there already a LeBOS store on this disk?
+        match store_load() {
+            Some((b, o, c)) => println!(
+                "disk: LOADED an existing store -- {} blobs, {} objects, {} claims",
+                b, o, c
+            ),
+            None => println!("disk: no LeBOS store found, this disk is new"),
         }
-        frame_free(buf as *mut u8);
+
+        store_demo();
+
+        if store_save() {
+            println!(
+                "disk: saved {} objects. reboot and they will still be here.",
+                STORE.lock().len()
+            );
+        } else {
+            println!("disk: SAVE FAILED");
+        }
     } else {
         println!("disk: no virtio-blk device found");
+        store_demo();
     }
 
     // 10a: a second binary now exists inside the kernel image. It is not
@@ -2758,6 +2747,305 @@ fn blk_rw(sector: u64, buf_phys: usize, write: bool) -> bool {
         vio_write(base, R_INTERRUPT_ACK, vio_read(base, R_INTERRUPT_STATUS));
         core::ptr::read_volatile(va(status_phys) as *const u8) == 0
     }
+}
+
+// ===========================================================================
+// Persistence -- milestone 13b
+//
+// The store is already append-only and immutable, so the on-disk format writes
+// itself: a header, then a stream of records. Recovery is "replay it".
+//
+// That is not laziness, it is what buys crash safety almost for free. A torn
+// record at the end fails to parse and gets discarded, and there is no
+// half-updated structure to repair because nothing is ever updated. No fsck.
+// Journalling filesystems bolt a log onto a mutable structure to get this;
+// there is no mutable structure here to bolt it to.
+//
+// Current version serialises the whole store on save. True incremental
+// appending -- only writing records that are new -- is the next refinement,
+// and the format is already shaped for it.
+// ===========================================================================
+
+/// First four bytes of every LeBOS disk, forever.
+///
+/// 0xF01DAB1E spells FOLDABLE, on an operating system with no folders. In the
+/// tradition of 0xCAFEBABE (Java, named after coffee) and 0xD00DFEED (the
+/// device tree you parsed at milestone 5) -- a magic number should be a pun on
+/// what the format is.
+///
+/// It is also not quite a lie: the files app's folders exist as saved queries.
+const LEBOS_MAGIC: u32 = 0xF01D_AB1E;
+const LEBOS_VERSION: u32 = 1;
+
+const REC_BLOB: u8 = 1;
+const REC_OBJECT: u8 = 2;
+const REC_CLAIM: u8 = 3;
+const REC_END: u8 = 0;
+
+/// Appends to a growing byte stream. The mirror of `Reader`.
+struct Writer(alloc::vec::Vec<u8>);
+
+impl Writer {
+    fn new() -> Self {
+        Writer(alloc::vec::Vec::new())
+    }
+    fn u8v(&mut self, v: u8) {
+        self.0.push(v);
+    }
+    fn u32(&mut self, v: u32) {
+        self.0.extend_from_slice(&v.to_le_bytes());
+    }
+    fn u64(&mut self, v: u64) {
+        self.0.extend_from_slice(&v.to_le_bytes());
+    }
+    fn i64(&mut self, v: i64) {
+        self.0.extend_from_slice(&v.to_le_bytes());
+    }
+    fn blob(&mut self, b: &[u8]) {
+        self.u32(b.len() as u32);
+        self.0.extend_from_slice(b);
+    }
+    fn value(&mut self, v: &Value) {
+        match v {
+            Value::Int(n) => {
+                self.u8v(0);
+                self.i64(*n);
+            }
+            Value::Text(t) => {
+                self.u8v(1);
+                self.blob(t.as_bytes());
+            }
+            Value::Id(i) => {
+                self.u8v(2);
+                self.u64(i.0);
+            }
+            Value::Bytes(b) => {
+                self.u8v(3);
+                self.blob(b);
+            }
+        }
+    }
+}
+
+fn read_value(r: &mut Reader) -> Option<Value> {
+    Some(match r.u8()? {
+        0 => Value::Int(r.i64()?),
+        1 => Value::Text(r.text()?),
+        2 => Value::Id(ObjId(u64::from_le_bytes({
+            let mut a = [0u8; 8];
+            a.copy_from_slice(r.take(8)?);
+            a
+        }))),
+        3 => {
+            let n = r.u32()? as usize;
+            Value::Bytes(r.take(n)?.to_vec())
+        }
+        _ => return None,
+    })
+}
+
+fn read_u64(r: &mut Reader) -> Option<u64> {
+    let mut a = [0u8; 8];
+    a.copy_from_slice(r.take(8)?);
+    Some(u64::from_le_bytes(a))
+}
+
+/// Turn the whole store into one byte stream.
+fn serialize_store() -> alloc::vec::Vec<u8> {
+    let mut w = Writer::new();
+
+    for (id, bytes) in BLOBS.lock().iter() {
+        w.u8v(REC_BLOB);
+        w.u64(id.0);
+        w.blob(bytes);
+    }
+    for (id, o) in STORE.lock().iter() {
+        w.u8v(REC_OBJECT);
+        w.u64(id.0);
+        w.u64(o.content.0);
+        w.u32(o.attrs.len() as u32);
+        for (k, v) in &o.attrs {
+            w.blob(k.as_bytes());
+            w.value(v);
+        }
+    }
+    for c in CLAIMS.lock().iter() {
+        w.u8v(REC_CLAIM);
+        w.u64(c.at);
+        w.u64(c.id.0);
+        w.blob(c.key.as_bytes());
+        w.value(&c.value);
+    }
+    w.u8v(REC_END);
+    w.0
+}
+
+/// Replay a byte stream back into the store.
+///
+/// Anything malformed stops the replay rather than failing the boot -- a torn
+/// record at the end of a log is the expected result of losing power mid-write,
+/// not a corrupt disk. Everything before it is still good.
+fn deserialize_store(buf: &[u8]) -> (usize, usize, usize) {
+    let mut r = Reader::new(buf);
+    let (mut blobs, mut objects, mut claims) = (0, 0, 0);
+
+    loop {
+        match r.u8() {
+            Some(REC_BLOB) => {
+                let (id, n) = match (read_u64(&mut r), r.u32()) {
+                    (Some(a), Some(b)) => (a, b as usize),
+                    _ => break,
+                };
+                match r.take(n) {
+                    Some(b) => {
+                        BLOBS.lock().insert(ObjId(id), b.to_vec());
+                        blobs += 1;
+                    }
+                    None => break,
+                }
+            }
+            Some(REC_OBJECT) => {
+                let (id, content, na) = match (read_u64(&mut r), read_u64(&mut r), r.u32()) {
+                    (Some(a), Some(b), Some(c)) => (a, b, c as usize),
+                    _ => break,
+                };
+                if na > buf.len() {
+                    break;
+                }
+                let mut attrs = alloc::vec::Vec::with_capacity(na);
+                let mut ok = true;
+                for _ in 0..na {
+                    match (r.text(), read_value(&mut r)) {
+                        (Some(k), Some(v)) => attrs.push((k, v)),
+                        _ => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if !ok {
+                    break;
+                }
+                STORE.lock().insert(
+                    ObjId(id),
+                    Object {
+                        id: ObjId(id),
+                        content: ObjId(content),
+                        attrs,
+                    },
+                );
+                objects += 1;
+            }
+            Some(REC_CLAIM) => {
+                let (at, id) = match (read_u64(&mut r), read_u64(&mut r)) {
+                    (Some(a), Some(b)) => (a, b),
+                    _ => break,
+                };
+                let key = match r.text() {
+                    Some(k) => k,
+                    None => break,
+                };
+                let value = match read_value(&mut r) {
+                    Some(v) => v,
+                    None => break,
+                };
+                // Claim keys are &'static str in memory; map the known ones
+                // back and drop anything unrecognised.
+                let k: &'static str = match key.as_str() {
+                    "hidden" => "hidden",
+                    "evicted" => "evicted",
+                    "forgotten" => "forgotten",
+                    _ => continue,
+                };
+                CLAIMS.lock().push(Claim {
+                    at,
+                    id: ObjId(id),
+                    key: k,
+                    value,
+                });
+                claims += 1;
+            }
+            _ => break, // REC_END, or a torn record: stop cleanly
+        }
+    }
+    (blobs, objects, claims)
+}
+
+/// Write the store to disk, one sector at a time through a bounce buffer.
+///
+/// A single frame is used because DMA needs physically contiguous memory and
+/// one page is the largest run the frame allocator can promise.
+fn store_save() -> bool {
+    let data = serialize_store();
+    let buf = match frame_alloc() {
+        Some(b) => b as usize,
+        None => return false,
+    };
+    let p = va(buf) as *mut u8;
+
+    // Sector 0: the header.
+    unsafe {
+        core::ptr::write_bytes(p, 0, SECTOR);
+        core::ptr::write_volatile(p as *mut u32, LEBOS_MAGIC);
+        core::ptr::write_volatile((p as *mut u32).add(1), LEBOS_VERSION);
+        core::ptr::write_volatile((p as *mut u64).add(1), data.len() as u64);
+    }
+    let mut ok = blk_rw(0, buf, true);
+
+    // Sectors 1..: the records.
+    let mut off = 0;
+    let mut sector = 1u64;
+    while off < data.len() && ok {
+        let n = core::cmp::min(SECTOR, data.len() - off);
+        unsafe {
+            core::ptr::write_bytes(p, 0, SECTOR);
+            core::ptr::copy_nonoverlapping(data.as_ptr().add(off), p, n);
+        }
+        ok = blk_rw(sector, buf, true);
+        off += n;
+        sector += 1;
+    }
+
+    frame_free(buf as *mut u8);
+    ok
+}
+
+/// Read the store back off disk. Returns None if this is not a LeBOS disk.
+fn store_load() -> Option<(usize, usize, usize)> {
+    let buf = frame_alloc()? as usize;
+    let p = va(buf) as *mut u8;
+
+    if !blk_rw(0, buf, false) {
+        frame_free(buf as *mut u8);
+        return None;
+    }
+    let (magic, version, len) = unsafe {
+        (
+            core::ptr::read_volatile(p as *const u32),
+            core::ptr::read_volatile((p as *const u32).add(1)),
+            core::ptr::read_volatile((p as *const u64).add(1)) as usize,
+        )
+    };
+    if magic != LEBOS_MAGIC || version != LEBOS_VERSION || len > 32 * 1024 * 1024 {
+        frame_free(buf as *mut u8);
+        return None;
+    }
+
+    let mut data = alloc::vec::Vec::with_capacity(len);
+    let mut sector = 1u64;
+    while data.len() < len {
+        if !blk_rw(sector, buf, false) {
+            break;
+        }
+        let n = core::cmp::min(SECTOR, len - data.len());
+        for i in 0..n {
+            data.push(unsafe { core::ptr::read_volatile(p.add(i)) });
+        }
+        sector += 1;
+    }
+
+    frame_free(buf as *mut u8);
+    Some(deserialize_store(&data))
 }
 
 // ===========================================================================

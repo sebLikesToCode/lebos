@@ -226,13 +226,26 @@ anyway, so the joke is free:
 - RSW bits — RISC-V reserves PTE bits 8–9 for software use
 - comments, in the `/* You are not expected to understand this */` tradition
 
-Already present: `PANIC! AT THE KERNEL` (Panic! At The Disco), and inherited
-from the FDT spec, `0xd00dfeed` ("dude feed").
+Already present:
 
-**Reserved:** `0x1EB05` spells LEBOS in hex (1=L, 0=O, 5=S). Earmarked for the
-object store's on-disk magic number at milestone 12 — the format signature is
-permanent and the most visible constant the project will ever have. Do not
-spend it on something smaller.
+- `PANIC! AT THE KERNEL` (Panic! At The Disco)
+- `0xd00dfeed` ("dude feed"), inherited from the FDT spec
+- `0x5EBB1E` (SEBBIE) — `BLOCK_MAGIC`, the heap free-block validity marker
+- `0xF01DAB1E` (FOLDABLE) — `LEBOS_MAGIC`, the on-disk format signature
+
+**On `0xF01DAB1E`.** The principle the author landed on after rejecting a dozen
+candidates: *a good magic number is a pun on what the format IS*, the way
+`0xCAFEBABE` is a pun on Java being named after coffee. FOLDABLE is that pun
+inverted — an operating system with no folders, whose disk opens by claiming to
+be foldable. It reads as an ordinary product descriptor for about half a second
+before it lands, and that delay is where the joke lives. It also is not entirely
+a lie: folders exist in LeBOS as saved queries.
+
+Rejected along the way: `0xF11E1E55` (FILELESS — announces itself too fast,
+and merely asserts a fact), `0xBADIDEA5`, `0xA11F11E5` (ALLFILES).
+
+**Still unspent:** `0x1EB05` (LEBOS) and `0xDEBB1E` (DEBBIE). Both want a slot
+as visible as the one FOLDABLE took.
 
 ## RULE: everything frame_alloc returns is PHYSICAL
 
@@ -407,6 +420,38 @@ Two things cost real time to find, both worth remembering:
   `0x10008000` with `version=1` and the modern setup silently did nothing. Fixed
   with `-global virtio-mmio.force-legacy=false` in the Makefile. On real
   hardware you would have to handle whichever version you were given.
+
+## The on-disk format (milestone 13b)
+
+```
+sector 0    u32 magic = 0xF01DAB1E   (FOLDABLE)
+            u32 version = 1
+            u64 payload length in bytes
+sector 1..  a stream of records, then REC_END
+```
+
+Records are tag-prefixed: `1` blob, `2` object, `3` claim, `0` end. Recovery is
+`deserialize_store` walking the stream — literally replay.
+
+**This fell out of the design rather than being engineered.** Because the store
+is append-only and immutable, crash safety is close to free: a torn record at
+the tail fails to parse and gets discarded, and there is no half-updated
+structure to repair because nothing is ever updated. No fsck, no journal. A
+journalling filesystem bolts a log onto a mutable structure to buy this
+property; here there is no mutable structure to bolt it to. Malformed input
+therefore stops the replay rather than panicking — losing power mid-write is
+expected, not corruption.
+
+Two honest limits of version 1:
+
+- **Saves are whole-store, not incremental.** The format is already shaped for
+  appending only new records; the code does not do it yet.
+- **Claims accumulate across boots.** Objects and blobs dedupe perfectly
+  (content-addressing: four boots of the demo converge at 9 blobs / 10
+  objects), but the demo re-issues its hide/evict/forget every boot and each is
+  a genuinely new fact — "at t1 someone hid this", "at t2 someone hid it
+  again". Correct append-only behaviour, and the reason compaction is a real
+  future milestone rather than an optimisation.
 
 ## Store design -- DECIDED, 2026-08-12
 
