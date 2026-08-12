@@ -10,47 +10,39 @@ in Rust, run under QEMU. It is a learning project with a real design thesis
 follow-along. Named for its author, Sebastian LeBlanc; `LeBOS` in prose,
 `lebos` as the crate and binary name.
 
-Status: milestone 6b done — **the MMU is on and W^X is enforced.** Boots under
-OpenSBI; formatted serial output (`putchar` → `puts` → `impl core::fmt::Write
-for Uart` → `println!`); traps via a full 32-register frame saved in `entry.S`;
-timer interrupts at 100 Hz through an SBI `ecall`; a physical frame allocator
-over a range read from the **device tree** (`-m 512M` correctly finds 130504
-frames, no code change); and an Sv39 page table, with page faults arriving in
-the milestone 3 trap handler unmodified.
+Status: **milestone 6 complete.** Boots under OpenSBI; formatted serial output
+(`putchar` -> `puts` -> `impl core::fmt::Write for Uart` -> `println!`); traps
+via a full 32-register frame saved in `entry.S`, with unhandled exceptions
+fatal and decoded to English; timer interrupts at 100 Hz through an SBI
+`ecall`; a physical frame allocator over a range read from the **device tree**;
+and Sv39 paging with the kernel **executing in the higher half**, W^X enforced,
+and the low half unmapped and reserved for user programs.
 
-The map is built from 4 KiB pages by a `map()` that walks all three levels and
-creates missing tables as it descends. Each region carries only the rights it
-needs — text `R-X`, rodata `R--`, data and heap `RW-` — so **W^X holds**:
-writing to kernel code raises a store page fault and panics. Describing all
-128 MiB costs 71 frames (284 KiB) of page tables.
+Boot sequence, which is subtle and worth not rediscovering:
 
-Every physical address P is also mapped at `HIGH_BASE + P`
-(`0xFFFF_FFC0_0000_0000`), verified by writing through the low address and
-reading it back through the high one. That is a **direct map**: the kernel can
-reach any physical page by adding a constant, which makes editing another
-process's page tables arithmetic rather than a special case at milestone 11.
-The root table splits exactly in half — slots 0–255 are the low half (user),
-256–511 the high half (kernel). Both maps together cost 141 frames (564 KiB).
+1. `entry.S` sets `sp`, zeroes `.bss`, calls `kmain` -- all at PHYSICAL
+   addresses, paging off. `la` is PC-relative so symbols resolve physically
+   for free despite being linked high.
+2. `kmain` calls `boot_paging()` **first**, before any print. The kernel is
+   linked with a high VMA, so ~435 absolute addresses in `.rodata` (vtables)
+   are high, and `println!` dispatches through one -- printing is impossible
+   until the high half exists. `boot_paging` uses a static `BOOT_PT` in `.bss`
+   and four 1 GiB leaves, and must never print, panic, or dynamically
+   dispatch.
+3. Normal boot: banner, device tree, frame allocator, then `paging_init`
+   builds the real 4 KiB-granular table (identity + higher-half direct map).
+4. The kernel adds `HIGH_BASE` to `sp` and jumps to the high alias of its own
+   code, moves `stvec` and `UART_BASE` up, then clears root slots 0 and 2.
 
-The kernel **executes in the higher half**: after paging is on it adds
-`HIGH_BASE` to `sp` and jumps to the high alias of its own code, then moves
-`stvec` and the UART base up too. `code-model=medium` makes this work without
-relinking, because all code is PC-relative and resolves against whichever alias
-the PC is in.
+`va()` / `pa()` convert between the two. Note the asymmetry: `frame_alloc`
+returns PHYSICAL addresses and needs `va()` before use, while `&some_symbol`
+is PC-relative and already yields whichever alias is executing -- never adjust
+those.
 
-**The identity map cannot be dropped yet, and the reason is measured.** Clearing
-root slots 0 and 2 boots and relocates, then dies on the first `println!` from
-the trap handler. `code-model=medium` fixes *code*, not *data the linker fills
-with absolute addresses* — this binary carries **436 absolute low addresses in
-`.rodata`**, which are vtables. `core::fmt` reaches the UART through
-`&mut dyn Write`, and that call jumps to `0x802xxxxx`. Direct calls survive
-(bare `putchar` ticks fine); dynamically dispatched ones do not.
+`probe()` / `explain()` walk the table by hand and report a translation with
+its permissions and RSW tag. Reach for them first when an address faults.
 
-Next: relink with VMA in the high half and LMA at `0x80200000` (`> virt AT>
-phys` in linker.ld) so the linker writes high addresses into those 436 slots.
-Early boot still reaches symbols physically for free, because `la` is
-PC-relative. Then the identity map can go and the low half is free for user
-programs.
+Next: milestone 7, the kernel heap.
 
 Hard-won details that will bite again if forgotten:
 
