@@ -232,6 +232,9 @@ Already present:
 - `0xd00dfeed` ("dude feed"), inherited from the FDT spec
 - `0x5EBB1E` (SEBBIE) — `BLOCK_MAGIC`, the heap free-block validity marker
 - `0xF01DAB1E` (FOLDABLE) — `LEBOS_MAGIC`, the on-disk format signature
+- `ubuntu` -> "hi" and `arch` -> "blah blah blah" in the shell: *"if you see me
+  use ubuntu, i might say hi, but if you see me using arch, i'm a talkative
+  guy."* Free slot — the unknown-command arm had to be written anyway.
 
 **On `0xF01DAB1E`.** The principle the author landed on after rejecting a dozen
 candidates: *a good magic number is a pun on what the format IS*, the way
@@ -420,6 +423,48 @@ Two things cost real time to find, both worth remembering:
   `0x10008000` with `version=1` and the modern setup silently did nothing. Fixed
   with `-global virtio-mmio.force-legacy=false` in the Makefile. On real
   hardware you would have to handle whichever version you were given.
+
+## The shell (milestone 14)
+
+`getchar()` is the mirror of `putchar` on the same 16550: writing offset 0
+transmits, **reading offset 0 receives**, and LSR (offset 5) bit 0 says whether
+a byte is actually waiting. `getchar_blocking()` calls `yield_now()` between
+polls rather than spinning — a human types ~5 characters a second and the CPU
+can do tens of millions of things in between. The scheduler is what makes
+waiting cheap.
+
+The terminal is raw. Nothing echoes unless `readline` echoes it, backspace is
+the byte `0x7f` rather than an action, and erasing means printing `\x08 \x08`
+(left, space, left). Everything a terminal appears to do for free is done here.
+
+**The shell is the design thesis made typeable.** Every other shell resolves a
+NAME to a LOCATION; this one cannot, so an argument is one of exactly two
+things:
+
+    a QUERY                      find type=python created_at>100
+    an INDEX into the last set   hide 2
+
+`LAST` — the numbered result list — is the path replacement. Ephemeral,
+contextual, meaningless a minute later, and that is fine because you are
+looking at it while you use it. It is "narrow to ~20 so a human can scan"
+turned into an interface.
+
+Predicates: `k=v` exact, `k~v` substring, `k>n` / `k<n` integer range. `t` and
+`n` are aliases for `created_at` and `name`. **Aliasing a label is safe in a
+way aliasing a path never is** — expand to an attribute nothing has and the
+query returns nothing; there is no wrong directory to land in.
+
+Friction matches consequence, as decided at milestone 12: `hide` is silent,
+`evict` and `forget` each say what they did.
+
+Verified end to end across a reboot: an evicted object comes back with its
+record intact, zero bytes, and an `[evicted]` marker; a forgotten object does
+not come back at all.
+
+The milestone-9 demo threads had to be quietened — `thread_greedy` now reports
+three times instead of forever, and the timer no longer announces each second.
+Both were proof the scheduler worked and became a machine talking over its
+user the moment there was a user.
 
 ## The on-disk format (milestone 13b)
 
@@ -683,8 +728,7 @@ innovation budget is spent at Phase V.
     hide/evict/forget via claims
 13. ✅ 13a virtio-blk driver: a sector written and read back
     ✅ 13b the store persists: header + record stream, replay on boot
-14. ⬅ **current** — userspace shell whose commands are queries, not paths.
-    Needs `getchar` first: the machine has never read a single byte of input.
+14. ✅ `getchar` + a shell whose commands are queries, not paths
 
 Known, not yet fixed: `EVENTS` grows without bound (every access appends,
 nothing trims). `SpinLock` is NOT reentrant -- taking the same lock twice
