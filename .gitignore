@@ -12,3 +12,7 @@ qemu.log
 virt.dtb
 virt.dts
 src/entry2.S
+
+# user program build artifacts
+user/target
+user/hello.bin

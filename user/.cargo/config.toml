@@ -1,0 +1,12 @@
+# Only the target lives here.
+#
+# rustflags deliberately do NOT: cargo MERGES `.cargo/config.toml` up the
+# directory tree, so anything set here would be combined with the kernel's
+# flags in ../.cargo/config.toml -- and the kernel passes -Tlinker.ld, which
+# would link this program into the higher half.
+#
+# The Makefile sets RUSTFLAGS in the environment instead. That REPLACES config
+# rustflags rather than merging with them, which is the only way to get a clean
+# set for a crate nested inside another.
+[build]
+target = "riscv64gc-unknown-none-elf"

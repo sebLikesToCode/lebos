@@ -25,6 +25,21 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 /// correct once there is more than one hart.
 static TICKS: AtomicU64 = AtomicU64::new(0);
 
+/// The first user program, baked into the kernel image.
+///
+/// Built by the Makefile from the standalone crate in `user/`: linked at
+/// 0x1000 in the LOW half, then flattened from ELF to raw bytes with objcopy.
+///
+/// Embedding is the simplest way to get a second binary into memory when there
+/// is no disk driver yet -- xv6 does exactly this with its `initcode`. Loading
+/// from storage waits for milestone 13.
+static USER_PROG: &[u8] = include_bytes!("../user/hello.bin");
+
+/// Where user programs are mapped. Not 0, so that a null dereference faults
+/// rather than silently reading whatever sits at address zero. Must match
+/// `. = 0x1000` in user/user.ld.
+const USER_BASE: usize = 0x1000;
+
 /// Printed at boot, directly under OpenSBI's banner and deliberately in the
 /// same style.
 ///
@@ -361,6 +376,31 @@ extern "C" fn kmain_high() -> ! {
     // =====================================================================
 
     // ---- your experiments go here ----
+
+    // 10a: a second binary now exists inside the kernel image. It is not
+    // running -- there is no user mode yet, and nothing has mapped it. This
+    // just proves the toolchain produced it and the kernel can see it.
+    println!(
+        "user: {} bytes of program embedded, to be mapped at {:#x}",
+        USER_PROG.len(),
+        USER_BASE
+    );
+    print!("user: first instructions:");
+    for b in USER_PROG.iter().take(12) {
+        print!(" {:02x}", b);
+    }
+    println!();
+    // The message it intends to print, still just data inside the kernel.
+    let tail = &USER_PROG[USER_PROG.len() - 14..];
+    print!("user: its message is \"");
+    for &b in tail {
+        if b == b'\n' {
+            print!("\\n");
+        } else {
+            putchar(b);
+        }
+    }
+    println!("\"");
 
     threads_init();
     thread_spawn("alpha", thread_alpha);

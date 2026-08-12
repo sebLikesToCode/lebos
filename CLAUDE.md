@@ -240,6 +240,29 @@ object store's on-disk magic number at milestone 12 — the format signature is
 permanent and the most visible constant the project will ever have. Do not
 spend it on something smaller.
 
+## The user program
+
+`user/` is a **standalone crate**, deliberately outside the kernel's workspace:
+the kernel is linked into the high half with its own linker script, while a user
+program must live in the low half that the kernel gave up when it relocated.
+
+`user/user.ld` links it at `0x1000` -- not 0, so a null dereference faults.
+
+**Gotcha:** cargo MERGES `.cargo/config.toml` up the directory tree, so the
+kernel's `-Tlinker.ld` leaks into any nested crate. `user/.cargo/config.toml`
+therefore holds only the target, and the Makefile sets `RUSTFLAGS` in the
+environment, which REPLACES config rustflags instead of merging with them.
+
+`make user` builds it and flattens the ELF to raw bytes with objcopy; the kernel
+bakes those in with `include_bytes!`, the same trick xv6 uses for `initcode`.
+Loading from storage waits for milestone 13.
+
+Syscall ABI, defined in user/src/main.rs:
+
+    a7      = syscall number      1 = write(ptr, len)
+    a0..a5  = arguments           0 = exit(code)
+    a0      = return value
+
 ## Setup
 
 ```
@@ -428,7 +451,8 @@ innovation budget is spent at Phase V.
 7. ✅ kernel heap: free list, first fit, splitting, two-way coalescing
 8. ✅ kernel threads + cooperative context switch
 9. ✅ preemption + spinlocks that disable interrupts
-10. ⬅ **current** — user mode + syscalls
+10. ✅ 10a user program built and embedded
+    ⬅ **current** — 10b sret into user mode
 8. kernel threads + context switch
 11. process creation
 12. **the object store**, in RAM first: indexes, query, versioning

@@ -10,11 +10,28 @@ QFLAGS  := -machine virt -cpu rv64 -smp 1 -m 128M -nographic \
            -serial mon:stdio -bios default
 
 .PHONY: build run debug gdb clean objdump nm size dumpdtb check fmt \
-        play resync playdiff
+        play resync playdiff user
+
+USERELF := user/target/$(TARGET)/debug/hello
+USERBIN := user/hello.bin
+
+## user    -- build the user program and flatten it to a raw binary.
+##            The kernel bakes this in with include_bytes!, so it must exist
+##            before the kernel compiles.
+#            RUSTFLAGS is set in the environment rather than in
+#            user/.cargo/config.toml because cargo MERGES config files up the
+#            directory tree -- the kernel's -Tlinker.ld would otherwise leak in
+#            and link this into the higher half. The env var replaces them.
+$(USERBIN): user/src/main.rs user/user.ld
+	cd user && RUSTFLAGS="-C code-model=medium -C link-arg=-Tuser.ld" cargo build
+	rust-objcopy -O binary $(USERELF) $(USERBIN)
+	@echo "user program: $$(stat -c%s $(USERBIN)) bytes"
+
+user: $(USERBIN)
 
 ## build   -- compile the kernel ELF.
 ##            Only --bin lebos, so a broken main2.rs can never block this.
-build: $(PLAY)
+build: $(USERBIN) $(PLAY)
 	cargo build --bin lebos
 
 ## run     -- boot the kernel in QEMU. Quit with: Ctrl-A then X
@@ -102,4 +119,6 @@ fmt:
 
 clean:
 	cargo clean
+	cd user && cargo clean
+	rm -f $(USERBIN)
 	rm -f qemu.log virt.dtb virt.dts
