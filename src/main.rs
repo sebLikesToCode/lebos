@@ -555,7 +555,7 @@ extern "C" fn thread_greedy() -> ! {
     let mut spins: u64 = 0;
     loop {
         spins = spins.wrapping_add(1);
-        if spins % 4_000_000 == 0 {
+        if spins.is_multiple_of(4_000_000) {
             println!("[greedy] {}M spins, never yielded once", spins / 1_000_000);
         }
         // Note the absence of yield_now(). That is the whole point.
@@ -574,7 +574,7 @@ fn store_demo() {
     const WED: i64 = 102;
     const LAST_MONTH: i64 = 40;
 
-    let mut put = |name: &str, kind: &str, day: i64, origin: &str, body: &str| {
+    let put = |name: &str, kind: &str, day: i64, origin: &str, body: &str| {
         store_create(
             body.as_bytes().to_vec(),
             vec![
@@ -638,7 +638,7 @@ fn store_demo() {
             "  => {:?}  name={:?}  {} bytes",
             o.id,
             o.attr("name"),
-            o.bytes.len()
+            blob_len(o.content)
         );
     }
 
@@ -646,9 +646,30 @@ fn store_demo() {
     let a = store_create(b"duplicate".to_vec(), vec![]);
     let b = store_create(b"duplicate".to_vec(), vec![]);
     println!(
-        "dedup: stored the same bytes twice -> {} ids, {} objects total",
-        if a == b { "1" } else { "2" },
-        STORE.lock().len()
+        "dedup: same bytes + same attrs -> {} id",
+        if a == b { "1" } else { "2" }
+    );
+
+    // The bug this split exists to fix: identical content, different metadata.
+    let tax = store_create(
+        b"ok".to_vec(),
+        vec![("name".to_string(), Value::Text("tax return".to_string()))],
+    );
+    let shop = store_create(
+        b"ok".to_vec(),
+        vec![("name".to_string(), Value::Text("shopping list".to_string()))],
+    );
+    let store = STORE.lock();
+    println!(
+        "split: same bytes, different names -> distinct: {}  ({:?} / {:?})",
+        tax != shop,
+        store[&tax].attr("name"),
+        store[&shop].attr("name")
+    );
+    println!(
+        "       {} objects but only {} blobs -- content stored once",
+        store.len(),
+        BLOBS.lock().len()
     );
 
     // The usage log: reading things is itself recorded.
@@ -898,7 +919,7 @@ fn map_user(root_pa: usize) -> usize {
     let root = va(root_pa) as *mut usize;
 
     // --- the program itself ---
-    let pages = (USER_PROG.len() + PAGE_SIZE - 1) / PAGE_SIZE;
+    let pages = USER_PROG.len().div_ceil(PAGE_SIZE);
     for i in 0..pages {
         let frame = frame_alloc().expect("no frame for the user program");
         // Zero it through the alias -- `frame` is physical.
@@ -1710,6 +1731,12 @@ struct Thread {
 ///
 /// Boxing means the Vec of pointers can move freely while the threads
 /// themselves never do.
+// clippy suggests Vec<Thread> here. Do NOT take that advice: the Box is what
+// keeps each Thread at a FIXED ADDRESS. yield_now hands `switch` raw pointers
+// to contexts that must stay valid across the switch, and as Vec<Thread> the
+// fifth spawn reallocated, moved every suspended thread's context, and turned
+// those pointers into freed memory.
+#[allow(clippy::vec_box)]
 static THREADS: SpinLock<alloc::vec::Vec<alloc::boxed::Box<Thread>>> =
     SpinLock::new(alloc::vec::Vec::new());
 static CURRENT: AtomicUsize = AtomicUsize::new(0);
@@ -1772,7 +1799,7 @@ fn yield_now() {
     let was_on = intr_off();
 
     let (old, new, next_satp) = {
-        let mut threads = THREADS.lock();
+        let threads = THREADS.lock();
         if threads.len() < 2 {
             drop(threads);
             if was_on {
@@ -1879,13 +1906,28 @@ extern "C" fn thread_racer() -> ! {
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 struct ObjId(u64);
 
-fn hash_bytes(bytes: &[u8]) -> ObjId {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV offset basis
-    for &b in bytes {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3); // FNV prime
+/// Streaming FNV-1a, so an id can be computed over several pieces.
+struct Hasher(u64);
+
+impl Hasher {
+    fn new() -> Self {
+        Hasher(0xcbf2_9ce4_8422_2325) // FNV offset basis
     }
-    ObjId(h)
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 ^= b as u64;
+            self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3); // FNV prime
+        }
+    }
+    fn finish(self) -> ObjId {
+        ObjId(self.0)
+    }
+}
+
+fn hash_bytes(bytes: &[u8]) -> ObjId {
+    let mut h = Hasher::new();
+    h.write(bytes);
+    h.finish()
 }
 
 /// What an attribute holds.
@@ -1896,6 +1938,7 @@ fn hash_bytes(bytes: &[u8]) -> ObjId {
 /// alphabetically and "9" sorts after "1754870400". Time is the axis that
 /// narrows hardest, so it is precisely the one that must be typed.
 #[derive(Clone, PartialEq, Debug)]
+#[allow(dead_code)] // Id and Bytes are part of the schema; nothing stores them yet
 enum Value {
     Int(i64),
     Text(alloc::string::String),
@@ -1903,9 +1946,22 @@ enum Value {
     Bytes(alloc::vec::Vec<u8>),
 }
 
+/// An object is a STATEMENT ABOUT content, not the content itself.
+///
+/// Splitting these apart fixes a real data-loss bug. Hashing only the bytes
+/// meant two genuinely different documents that happened to contain identical
+/// content collapsed into one, and the second one's metadata was silently
+/// discarded -- a shopping list could overwrite a tax return's name.
+///
+/// So: the BYTES are addressed by their own hash and stored once (dedup still
+/// free, and it is the bytes that are large). The OBJECT is addressed by a
+/// hash of its metadata plus which blob it points at, so two objects sharing
+/// content stay distinct. Git does exactly this: blobs are content-addressed,
+/// and trees and commits are separate objects that reference them.
 struct Object {
     id: ObjId,
-    bytes: alloc::vec::Vec<u8>,
+    /// Which blob holds this object's bytes.
+    content: ObjId,
     attrs: alloc::vec::Vec<(alloc::string::String, Value)>,
 }
 
@@ -1920,6 +1976,11 @@ impl Object {
 static STORE: SpinLock<alloc::collections::BTreeMap<ObjId, Object>> =
     SpinLock::new(alloc::collections::BTreeMap::new());
 
+/// The content itself, addressed by its own hash and stored exactly once no
+/// matter how many objects point at it.
+static BLOBS: SpinLock<alloc::collections::BTreeMap<ObjId, alloc::vec::Vec<u8>>> =
+    SpinLock::new(alloc::collections::BTreeMap::new());
+
 /// What happened. Append-only, and the kernel never interprets it.
 ///
 /// Creation stamps say where an object CAME FROM. This says what was happening
@@ -1928,6 +1989,7 @@ static STORE: SpinLock<alloc::collections::BTreeMap<ObjId, Object>> =
 /// these raw events into sessions and co-occurrence; the kernel only writes
 /// down that something happened.
 #[derive(Clone, Copy)]
+#[allow(dead_code)] // written by the kernel, read by userspace, which does not exist yet
 struct Event {
     time: u64,
     process: usize,
@@ -1951,10 +2013,48 @@ fn store_create(
     bytes: alloc::vec::Vec<u8>,
     attrs: alloc::vec::Vec<(alloc::string::String, Value)>,
 ) -> ObjId {
-    let id = hash_bytes(&bytes);
-    let mut store = STORE.lock();
-    store.entry(id).or_insert(Object { id, bytes, attrs });
+    // The content goes in once, under its own hash. Storing the same bytes
+    // again stores nothing -- dedup, where it actually matters.
+    let content = hash_bytes(&bytes);
+    BLOBS.lock().entry(content).or_insert(bytes);
+
+    // The object's id covers which blob it points at AND everything said about
+    // it, so two objects sharing content stay distinct.
+    let mut h = Hasher::new();
+    h.write(&content.0.to_le_bytes());
+    for (k, v) in &attrs {
+        h.write(k.as_bytes());
+        match v {
+            Value::Int(n) => {
+                h.write(b"i");
+                h.write(&n.to_le_bytes());
+            }
+            Value::Text(t) => {
+                h.write(b"t");
+                h.write(t.as_bytes());
+            }
+            Value::Id(i) => {
+                h.write(b"r");
+                h.write(&i.0.to_le_bytes());
+            }
+            Value::Bytes(b) => {
+                h.write(b"b");
+                h.write(b);
+            }
+        }
+    }
+    let id = h.finish();
+
+    STORE
+        .lock()
+        .entry(id)
+        .or_insert(Object { id, content, attrs });
     id
+}
+
+/// How many bytes an object's content occupies.
+fn blob_len(content: ObjId) -> usize {
+    BLOBS.lock().get(&content).map(|b| b.len()).unwrap_or(0)
 }
 
 /// Does this object satisfy one condition?
@@ -2199,7 +2299,7 @@ fn frame_alloc() -> Option<*mut u8> {
 fn frame_free(page: *mut u8) {
     let addr = page as usize;
     assert!(
-        addr % PAGE_SIZE == 0,
+        addr.is_multiple_of(PAGE_SIZE),
         "frame_free: address not page aligned"
     );
 
@@ -2274,7 +2374,7 @@ extern "C" fn trap_handler(frame: &mut TrapFrame) {
         // Ticking at 100 Hz, so print once a second rather than flooding the
         // serial line. The counter itself is the kernel's notion of uptime.
         let n = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
-        if n % 100 == 0 {
+        if n.is_multiple_of(100) {
             println!("tick {} -- up {}s", n, n / 100);
         }
 

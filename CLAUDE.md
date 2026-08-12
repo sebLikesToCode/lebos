@@ -374,6 +374,18 @@ overflow the 64 KiB boot stack.
 Worked out in conversation with the author. These are his calls; do not
 relitigate them without him.
 
+**Content and statements-about-content are SEPARATE.** Hashing only the bytes
+caused real data loss: two different documents that happened to contain
+identical content collapsed into one and the second's metadata was silently
+discarded -- a shopping list overwrote a tax return's name. So:
+
+    BLOBS    hash(bytes)                     -> bytes      stored once, dedup
+    STORE    hash(blob_id + all attributes)  -> Object     distinct per statement
+
+Git does exactly this: blobs are content-addressed, trees and commits reference
+them. Dedup survives where it matters (the bytes are the large part) and two
+objects sharing content stay distinct.
+
 **An id is a CONTENT HASH.** Identical bytes get an identical id on every
 machine forever. Buys dedup free, makes an id globally meaningful (so "that
 object lives on my desktop" is expressible, and distribution stays possible),
@@ -562,8 +574,12 @@ innovation budget is spent at Phase V.
 10. ✅ user mode, syscalls, sscratch kernel stacks, SUM discipline, pointer
     validation
 11. ✅ process creation -- one address space per process
-12. ✅ 12a store in RAM: content-addressed objects, typed attributes, query
+12. ✅ 12a store in RAM: blobs + objects, typed attributes, query
     ⬅ **current** — 12b syscalls, hidden/forget/evict, indexes
+
+Known, not yet fixed: `EVENTS` grows without bound (every access appends,
+nothing trims). `SpinLock` is NOT reentrant -- taking the same lock twice
+deadlocks, and no current path does, but it is a landmine.
 8. kernel threads + context switch
 13. virtio-blk + persist the store as an append-only log
 14. userspace shell whose commands are queries, not paths
