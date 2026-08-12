@@ -44,10 +44,17 @@ its permissions and RSW tag. Reach for them first when an address faults.
 
 A 1 MiB heap is carved off the top of RAM before `frame_init` claims anything,
 and `heap_init` is given its **virtual** address so it outlives the identity
-map. `BumpAllocator` implements `GlobalAlloc`, so `extern crate alloc` works
-and Vec/Box/String/BTreeMap are available. It never frees -- that is 7b.
+map. `Heap` implements `GlobalAlloc` over an address-sorted free list: first fit,
+split when the leftover can hold its own header, and coalesce in **both**
+directions on free. Allocated blocks carry no header at all -- Rust returns
+the size in `Layout`, so only gaps need signs. Every free block header holds
+`BLOCK_MAGIC` (`0x5EBB1E`), checked on every walk, which catches a write past
+the end of an allocation at the next allocation rather than a thousand later.
 
-Next: 7b, a real free list.
+Verified: a freed block is handed straight back to the next request, and after
+everything drops the heap returns to exactly one free block of 1048576 bytes.
+
+Next: milestone 8, threads and context switching.
 
 Hard-won details that will bite again if forgotten:
 
@@ -325,8 +332,8 @@ innovation budget is spent at Phase V.
    W^X enforced; unhandled exceptions are now fatal
    ✅ 6c-i higher-half direct map alongside the identity map, aliasing proven
    ✅ 6c the kernel executes in the higher half and the identity map is gone
-7. ✅ 7a bump allocator -- Vec/Box/String work; ⬅ **current** 7b free list with
-   coalescing, plus canaries
+7. ✅ kernel heap: free list, first fit, splitting, two-way coalescing
+8. ⬅ **current** — kernel threads + context switch
 8. kernel threads + context switch
 9. preemptive scheduler, spinlocks, wait queues — *policy/mechanism split
    starts here*

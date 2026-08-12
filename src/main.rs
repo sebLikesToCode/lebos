@@ -285,7 +285,8 @@ extern "C" fn kmain_high() -> ! {
         use alloc::string::String;
         use alloc::vec::Vec;
 
-        let heap_start = HEAP_END.load(Ordering::Relaxed) - HEAP_SIZE;
+        let (n0, f0) = heap_stats();
+        println!("heap: {} free block, {} bytes free", n0, f0);
 
         let mut v: Vec<u64> = Vec::new();
         for i in 1..=8u64 {
@@ -293,17 +294,32 @@ extern "C" fn kmain_high() -> ! {
         }
         println!("heap: Vec    {:?}", v);
 
-        let b = Box::new(0x1EB05_u64);
-        println!("heap: Box    at {:p} holds {:#x}", b, *b);
+        let boxed = Box::new(0x1EB05_u64);
+        println!("heap: Box    at {:p} holds {:#x}", boxed, *boxed);
 
-        let s = String::from("allocated on a heap in an OS I wrote");
-        println!("heap: String \"{}\"", s);
+        let text = String::from("allocated on a heap in an OS I wrote");
+        println!("heap: String \"{}\"", text);
 
-        println!(
-            "heap: {} of {} bytes used",
-            heap_used(heap_start),
-            HEAP_SIZE
-        );
+        let (n1, f1) = heap_stats();
+        println!("heap: {} free blocks, {} bytes free (in use)", n1, f1);
+
+        // What the bump allocator could not do: hand the same space back.
+        let x = Box::new(1u64);
+        let px = &*x as *const u64;
+        drop(x);
+        let y = Box::new(2u64);
+        println!("heap: freed {:p}, next alloc {:p}", px, &*y);
+
+        drop(v);
+        drop(boxed);
+        drop(text);
+        drop(y);
+
+        // If coalescing works, every gap merges back into one and the heap
+        // looks untouched. If it did not, this would report a pile of
+        // separate fragments.
+        let (n2, f2) = heap_stats();
+        println!("heap: {} free block, {} bytes free (all released)", n2, f2);
     }
 
     // =====================================================================
@@ -800,54 +816,181 @@ fn paging_init(ram_end: usize) {
 /// allocator claims anything.
 const HEAP_SIZE: usize = 1024 * 1024; // 1 MiB
 
-/// Next free byte, and one past the last. Virtual (higher-half) addresses, so
-/// they stay valid after the kernel relocates.
-static HEAP_NEXT: AtomicUsize = AtomicUsize::new(0);
-static HEAP_END: AtomicUsize = AtomicUsize::new(0);
+/// Everything in the heap is rounded to this. Keeps every block address a
+/// multiple of 16, which satisfies the alignment of anything normal.
+const HEAP_ALIGN: usize = 16;
 
-fn heap_init(start: usize, size: usize) {
-    HEAP_NEXT.store(start, Ordering::Relaxed);
-    HEAP_END.store(start + size, Ordering::Relaxed);
+/// Written into every FREE block's header. If a block turns up on the list
+/// without it, something wrote past the end of its allocation and trampled
+/// the neighbour -- catching that here beats discovering it a thousand
+/// allocations later.
+///
+/// 0x5EBB1E spells SEBBIE. (0xDEBB1E is still unspent.)
+const BLOCK_MAGIC: usize = 0x5EBB1E;
+
+/// Header sitting at the start of every FREE block.
+///
+/// Allocated blocks carry NO header at all: Rust hands the size back in
+/// `Layout` on dealloc, so unlike C there is nothing to hide in front of the
+/// pointer. Only gaps need signs, and gaps have room for them -- exactly the
+/// trick the frame allocator uses, plus a length.
+#[repr(C)]
+struct FreeBlock {
+    magic: usize,
+    size: usize, // total bytes in this block, header included
+    next: usize, // address of the next free block, 0 = end of list
 }
 
-struct BumpAllocator;
+/// The smallest block worth tracking: anything under this cannot hold its own
+/// sign, so it can never go back on the list.
+const MIN_BLOCK: usize = core::mem::size_of::<FreeBlock>();
 
-unsafe impl GlobalAlloc for BumpAllocator {
+/// Head of the free list, kept sorted by ADDRESS so neighbouring gaps end up
+/// adjacent in the list and coalescing is a comparison rather than a search.
+static FREE_HEAD: AtomicUsize = AtomicUsize::new(0);
+
+fn align_up(x: usize, a: usize) -> usize {
+    (x + a - 1) & !(a - 1)
+}
+
+/// Turn the reserved region into one enormous free block.
+fn heap_init(start: usize, size: usize) {
+    unsafe {
+        let blk = start as *mut FreeBlock;
+        (*blk).magic = BLOCK_MAGIC;
+        (*blk).size = size;
+        (*blk).next = 0;
+    }
+    FREE_HEAD.store(start, Ordering::Relaxed);
+}
+
+/// Free blocks and free bytes. Watching the block COUNT is how you see
+/// coalescing working -- without it the count only ever climbs.
+fn heap_stats() -> (usize, usize) {
+    let mut blocks = 0;
+    let mut bytes = 0;
+    let mut cur = FREE_HEAD.load(Ordering::Relaxed);
+    while cur != 0 {
+        let blk = cur as *const FreeBlock;
+        unsafe {
+            blocks += 1;
+            bytes += (*blk).size;
+            cur = (*blk).next;
+        }
+    }
+    (blocks, bytes)
+}
+
+struct Heap;
+
+unsafe impl GlobalAlloc for Heap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let next = HEAP_NEXT.load(Ordering::Relaxed);
-
-        // Round up to the requested alignment -- the same trick as page
-        // alignment, with a different power of two. A u64 landing on an odd
-        // address would fault, so this is not optional.
-        let start = (next + layout.align() - 1) & !(layout.align() - 1);
-        let end = start + layout.size();
-
-        if end > HEAP_END.load(Ordering::Relaxed) {
-            // Returning null is how GlobalAlloc reports failure. Rust turns
-            // that into a panic through the default allocation error handler.
+        // Every block is 16-aligned, so anything asking for more than that
+        // would need front-padding this allocator does not do. Nothing normal
+        // does -- Box, Vec, BTreeMap all want 8 or less.
+        if layout.align() > HEAP_ALIGN {
             return core::ptr::null_mut();
         }
 
-        HEAP_NEXT.store(end, Ordering::Relaxed);
-        start as *mut u8
+        // A block must be able to hold a sign again once it is freed, so
+        // nothing smaller than a header is ever handed out.
+        let want = align_up(layout.size().max(MIN_BLOCK), HEAP_ALIGN);
+
+        // First fit: walk the curb, take the first gap long enough.
+        let mut prev = 0usize;
+        let mut cur = FREE_HEAD.load(Ordering::Relaxed);
+
+        while cur != 0 {
+            let blk = cur as *mut FreeBlock;
+            assert!(
+                (*blk).magic == BLOCK_MAGIC,
+                "heap corruption: free block at {:#x} has magic {:#x}, expected {:#x} -- something wrote past the end of its allocation",
+                cur,
+                (*blk).magic,
+                BLOCK_MAGIC
+            );
+
+            let have = (*blk).size;
+            if have >= want {
+                let next = (*blk).next;
+
+                let replacement = if have - want >= MIN_BLOCK {
+                    // Big enough to split: the tail stays free.
+                    let tail = cur + want;
+                    let t = tail as *mut FreeBlock;
+                    (*t).magic = BLOCK_MAGIC;
+                    (*t).size = have - want;
+                    (*t).next = next;
+                    tail
+                } else {
+                    // The leftover could not hold its own sign, so hand out
+                    // the whole block. Those few bytes are lost until this
+                    // block is freed -- that is INTERNAL fragmentation.
+                    next
+                };
+
+                if prev == 0 {
+                    FREE_HEAD.store(replacement, Ordering::Relaxed);
+                } else {
+                    (*(prev as *mut FreeBlock)).next = replacement;
+                }
+
+                return cur as *mut u8;
+            }
+
+            prev = cur;
+            cur = (*blk).next;
+        }
+
+        core::ptr::null_mut() // no gap long enough
     }
 
-    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {
-        // Nothing. A bump allocator cannot reclaim: it has no idea what is
-        // still parked between `start` and `next`, only where the end is.
-        //
-        // Note what Rust hands us that C never does -- `layout`, so the size
-        // is known without a hidden header before the block. 7b uses that.
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        let size = align_up(layout.size().max(MIN_BLOCK), HEAP_ALIGN);
+        let addr = ptr as usize;
+
+        // Find where this block belongs in address order.
+        let mut prev = 0usize;
+        let mut cur = FREE_HEAD.load(Ordering::Relaxed);
+        while cur != 0 && cur < addr {
+            prev = cur;
+            cur = (*(cur as *mut FreeBlock)).next;
+        }
+
+        // Write its sign and link it in.
+        let blk = addr as *mut FreeBlock;
+        (*blk).magic = BLOCK_MAGIC;
+        (*blk).size = size;
+        (*blk).next = cur;
+
+        if prev == 0 {
+            FREE_HEAD.store(addr, Ordering::Relaxed);
+        } else {
+            (*(prev as *mut FreeBlock)).next = addr;
+        }
+
+        // Coalesce forward: if the next gap starts exactly where this one
+        // ends, they are one gap.
+        if cur != 0 && addr + size == cur {
+            let n = cur as *mut FreeBlock;
+            (*blk).size += (*n).size;
+            (*blk).next = (*n).next;
+        }
+
+        // Coalesce backward, same test from the other side. Without BOTH
+        // directions the curb still turns to dust, just more slowly.
+        if prev != 0 {
+            let p = prev as *mut FreeBlock;
+            if prev + (*p).size == addr {
+                (*p).size += (*blk).size;
+                (*p).next = (*blk).next;
+            }
+        }
     }
 }
 
 #[global_allocator]
-static ALLOCATOR: BumpAllocator = BumpAllocator;
-
-/// Bytes handed out so far, for the demo.
-fn heap_used(start: usize) -> usize {
-    HEAP_NEXT.load(Ordering::Relaxed) - start
-}
+static ALLOCATOR: Heap = Heap;
 
 // ===========================================================================
 // Device tree (FDT / "flattened device tree")
