@@ -659,17 +659,61 @@ fn store_demo() {
         b"ok".to_vec(),
         vec![("name".to_string(), Value::Text("shopping list".to_string()))],
     );
-    let store = STORE.lock();
+    // Scoped deliberately: SpinLock is NOT reentrant, and holding this guard
+    // into the next section deadlocked the kernel the first time this was
+    // written. Every lock here is released before the next thing that takes it.
+    {
+        let store = STORE.lock();
+        println!(
+            "split: same bytes, different names -> distinct: {}  ({:?} / {:?})",
+            tax != shop,
+            store[&tax].attr("name"),
+            store[&shop].attr("name")
+        );
+        let objects = store.len();
+        drop(store);
+        println!(
+            "       {} objects but only {} blobs -- content stored once",
+            objects,
+            BLOBS.lock().len()
+        );
+    }
+
+    // ---- the three verbs that replace rm ----
+    let py = || store_query(&[Cond::Eq("type", Value::Text("python".to_string()))]);
+    let victim = py()[0];
+
+    println!("verbs: {} python objects visible", py().len());
+
+    hide(victim, true);
     println!(
-        "split: same bytes, different names -> distinct: {}  ({:?} / {:?})",
-        tax != shop,
-        store[&tax].attr("name"),
-        store[&shop].attr("name")
+        "  hide    -> {} visible, still in the store: {}",
+        py().len(),
+        STORE.lock().contains_key(&victim)
+    );
+
+    hide(victim, false);
+    println!(
+        "  unhide  -> {} visible again (nothing was destroyed)",
+        py().len()
+    );
+
+    let content = STORE.lock()[&victim].content;
+    evict(victim);
+    println!(
+        "  evict   -> bytes gone ({} left), record survives: {} -- still a valid coordinate",
+        blob_len(content),
+        STORE.lock().contains_key(&victim)
+    );
+
+    forget(victim);
+    println!(
+        "  forget  -> record gone too: still present = {}",
+        STORE.lock().contains_key(&victim)
     );
     println!(
-        "       {} objects but only {} blobs -- content stored once",
-        store.len(),
-        BLOBS.lock().len()
+        "  history: {} claims recorded -- nothing overwritten, so WHEN is answerable",
+        CLAIMS.lock().len()
     );
 
     // The usage log: reading things is itself recorded.
@@ -2268,12 +2312,107 @@ fn matches_owned(obj: &Object, c: &OwnedCond) -> bool {
 }
 
 fn store_query_owned(conds: &[OwnedCond]) -> alloc::vec::Vec<ObjId> {
-    let store = STORE.lock();
-    store
+    let ids: alloc::vec::Vec<ObjId> = {
+        let store = STORE.lock();
+        store
+            .values()
+            .filter(|o| conds.iter().all(|c| matches_owned(o, c)))
+            .map(|o| o.id)
+            .collect()
+    };
+    ids.into_iter().filter(|id| !is_hidden(*id)).collect()
+}
+
+// ---------------------------------------------------------------------------
+// Claims -- how anything mutable exists in an immutable store
+//
+// Objects are content-addressed, so changing an attribute changes the id.
+// There is no way to modify one; that is the point. But some facts DO change:
+// whether something is hidden, whether its bytes still exist.
+//
+// So mutation is expressed as an append-only CLAIM: "as of time T, object X's
+// key K is V." The current state of a key is simply the latest claim about it.
+// Nothing is ever overwritten, so the history of what was hidden and when is
+// preserved for free.
+// ---------------------------------------------------------------------------
+
+struct Claim {
+    at: u64,
+    id: ObjId,
+    key: &'static str,
+    value: Value,
+}
+
+static CLAIMS: SpinLock<alloc::vec::Vec<Claim>> = SpinLock::new(alloc::vec::Vec::new());
+
+fn claim(id: ObjId, key: &'static str, value: Value) {
+    CLAIMS.lock().push(Claim {
+        at: now(),
+        id,
+        key,
+        value,
+    });
+}
+
+/// The most recent claim about `key` for `id`, if any.
+fn current_claim(id: ObjId, key: &str) -> Option<Value> {
+    let claims = CLAIMS.lock();
+    claims
+        .iter()
+        .filter(|c| c.id == id && c.key == key)
+        .max_by_key(|c| c.at)
+        .map(|c| c.value.clone())
+}
+
+fn is_hidden(id: ObjId) -> bool {
+    matches!(current_claim(id, "hidden"), Some(Value::Int(1)))
+}
+
+// ---------------------------------------------------------------------------
+// The three verbs that replace `rm`
+//
+// "Delete" is three unrelated problems wearing one word, and separating them
+// is what dissolves the "no root, so what is garbage" question entirely.
+// ---------------------------------------------------------------------------
+
+/// CLUTTER. Reversible, destroys nothing, and it is what most deletion
+/// actually is. The "Cluttered" view is just a saved query for hidden = 1.
+fn hide(id: ObjId, hidden: bool) {
+    claim(id, "hidden", Value::Int(if hidden { 1 } else { 0 }));
+}
+
+/// SPACE. Drop the bytes, keep the record.
+///
+/// Only possible because ids are content hashes: the object remains a valid,
+/// globally meaningful coordinate even with nothing behind it. So "the file I
+/// was working on while that video was open" still answers after the video is
+/// gone. A filesystem cannot do this -- when the file goes, every trace that it
+/// existed goes with it.
+fn evict(id: ObjId) {
+    let content = match STORE.lock().get(&id) {
+        Some(o) => o.content,
+        None => return,
+    };
+    // Only drop the bytes if no OTHER object still points at them.
+    let still_used = STORE
+        .lock()
         .values()
-        .filter(|o| conds.iter().all(|c| matches_owned(o, c)))
-        .map(|o| o.id)
-        .collect()
+        .any(|o| o.content == content && o.id != id);
+    if !still_used {
+        BLOBS.lock().remove(&content);
+    }
+    claim(id, "evicted", Value::Int(1));
+}
+
+/// PRIVACY. The bytes AND the record go. Irreversible, and rare.
+///
+/// The difference from evict is deliberate: eviction leaves a tombstone
+/// because you still want to reason about the thing. Forgetting leaves nothing
+/// because the whole point is that it should not be reasoned about.
+fn forget(id: ObjId) {
+    evict(id);
+    STORE.lock().remove(&id);
+    claim(id, "forgotten", Value::Int(1));
 }
 
 /// Every object satisfying ALL conditions.
@@ -2281,12 +2420,18 @@ fn store_query_owned(conds: &[OwnedCond]) -> alloc::vec::Vec<ObjId> {
 /// A linear scan, deliberately: indexes are an optimisation, and the semantics
 /// have to be right before the speed matters. Milestone 13 adds them.
 fn store_query(conds: &[Cond]) -> alloc::vec::Vec<ObjId> {
-    let store = STORE.lock();
-    store
-        .values()
-        .filter(|o| conds.iter().all(|c| matches(o, c)))
-        .map(|o| o.id)
-        .collect()
+    let ids: alloc::vec::Vec<ObjId> = {
+        let store = STORE.lock();
+        store
+            .values()
+            .filter(|o| conds.iter().all(|c| matches(o, c)))
+            .map(|o| o.id)
+            .collect()
+    };
+    // Hidden objects drop out by default. They still exist, still have their
+    // id, and a query for hidden = 1 finds them -- that view IS the
+    // "Cluttered" folder.
+    ids.into_iter().filter(|id| !is_hidden(*id)).collect()
 }
 
 // ===========================================================================

@@ -443,6 +443,27 @@ dissolves the "no root, so what is garbage" question entirely:
 | privacy | `forget` | explicit, destroys the bytes, irreversible, rare |
 | space | `evict` | only under pressure, by policy (LRU/size), never by reachability |
 
+**Mutation is expressed as an append-only CLAIM**, because objects are
+content-addressed and changing an attribute would change the id. A claim says
+"as of time T, object X's key K is V", and the current state of a key is simply
+the latest claim about it. Nothing is overwritten, so *when* something was
+hidden stays answerable. `hidden` is a claim; queries drop hidden objects by
+default, and a query for `hidden = 1` IS the Cluttered view.
+
+`evict` drops the bytes only if no other object still points at that blob, and
+leaves the record. `forget` removes the record too -- the difference is
+deliberate: eviction leaves a tombstone because you still want to reason about
+the thing, forgetting leaves nothing because the point is that you should not.
+
+**Shell syntax (decided, not yet built):** the argument to these verbs cannot be
+a filename, because there are none. It is either a query (`hide type=python
+created<last-month`) or an INDEX INTO THE LAST RESULT SET (`hide 2`). The
+numbered result list is what replaces a path: ephemeral, contextual, and
+meaningful only right after the query that produced it -- which is fine, because
+you are looking at it. This is what "narrow to ~20 so a human can scan" was for.
+Friction should match consequence: `hide` silent, `evict` confirms if large,
+`forget` always confirms.
+
 Eviction keeps the **record** while dropping the **bytes** -- only possible
 because ids are content hashes. An evicted object remains a valid, globally
 meaningful coordinate, so *"the file I was working on while that video was
@@ -588,12 +609,12 @@ innovation budget is spent at Phase V.
 10. ✅ user mode, syscalls, sscratch kernel stacks, SUM discipline, pointer
     validation
 11. ✅ process creation -- one address space per process
-12. ✅ 12a store in RAM; ✅ 12b store syscalls reachable from user programs
-    ⬅ **current** — 12c hidden/forget/evict, 12d indexes
+12. ✅ store: blobs + objects, typed attributes, query, syscalls,
+    hide/evict/forget via claims
+13. ⬅ **current** — virtio-blk and persistence (0x1EB05 gets spent here)
 
 Known, not yet fixed: `EVENTS` grows without bound (every access appends,
 nothing trims). `SpinLock` is NOT reentrant -- taking the same lock twice
 deadlocks, and no current path does, but it is a landmine.
 8. kernel threads + context switch
-13. virtio-blk + persist the store as an append-only log
 14. userspace shell whose commands are queries, not paths
