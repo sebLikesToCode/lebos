@@ -93,19 +93,60 @@ Written as `Vec<Thread>` it crashed: spawning the fifth thread grew the Vec past
 capacity 4, every suspended thread's context moved, and the pointers became
 freed memory. Boxing lets the Vec move while the threads never do.
 
-**OPEN BUG, found 2026-08-12, not yet diagnosed.** Shortening TICK_INTERVAL
-from 10 ms to 500 us or less crashes the kernel under the threading demo:
+**OPEN BUG, found 2026-08-12. Narrowed, not solved.**
 
-    store page fault, scause 0xf, stval 0x18
-    sp is inside a thread stack (heap region), so the stack itself is fine
+Shortening `TICK_INTERVAL` from 10 ms to 500 us reliably crashes the threading
+demo. At 10 ms it never reproduces, so `make run` is unaffected -- but user mode
+multiplies the trap rate, and this is exactly the class of bug that gets worse
+under pressure. Worth finishing before milestone 10.
 
-`stval 0x18` is a write through a null pointer at offset 0x18, which is `s[1]`
-in `Context` -- i.e. `switch` being called with `old == NULL`. At 10 ms it never
-reproduces. Worth chasing before milestone 10, because user mode will make
-traps far more frequent and this is exactly the class of bug that gets much
-more likely.
+Symptom:
+
+    store page fault, scause 0xf, stval 0x10
+    sepc inside thread_racer / a thread's println
+    a0 = a1 = a2 = 0, s1 = 0
+    sp is inside a thread stack, so the stack pointer itself is sane
+
+Disassembly at the faulting instruction:
+
+    addi   a3, a1, 0x40        <- a3 = &COUNTER.locked, computed ONCE
+    andi   a3, a3, -0x4           before the loop
+    ...loop...
+    csrrci a5, sstatus, 0x2     <- intr_off()
+    amoor.w.aq a2, a0, (a3)     <- faults; stval says a3 == 0x10
+
+So a **caller-saved** register holding a valid address is garbage after a
+preemption. Caller-saved registers are preserved by the *trap frame*, not by
+`switch`, which points at trap_entry's save/restore or at the frame being
+overwritten.
+
+What has been ruled out, each by direct test:
+
+- **Not the spinlock or the racers** -- reproduces with only main/alpha/beta/
+  greedy and no locks in play.
+- **Not stack size** -- still faults with 128 KiB stacks instead of 16 KiB.
+- **Not the handler's `println!`** -- still faults with the handler printing
+  nothing at all.
+
+What is consistent: it faults **while a thread is inside `println!`** (output
+cuts off mid-word, e.g. `[gr*** TRAP ***`), under a quantum short enough that
+the timer fires repeatedly during one formatting call.
+
+Leading hypotheses, untested:
+
+1. trap_entry's save or restore list is subtly wrong for some register, and
+   only deep frequent traps expose it.
+2. The timer becomes overdue while the handler runs, so it re-fires immediately
+   on `sret`, and something about back-to-back traps is not re-entrant.
+3. `main`'s `Context` starts fully zeroed (`ra = 0`, `sp = 0`), so anything
+   that switches TO main before main has ever switched away would load a null
+   ra and sp. Believed impossible on the current path, but unproven.
+
+Next diagnostic step: dump all 32 registers from the trap frame plus the
+current thread's stack bounds, and check whether sp is inside them.
 
 Next: milestone 10, user mode.
+
 
 Hard-won details that will bite again if forgotten:
 
