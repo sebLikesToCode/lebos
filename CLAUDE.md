@@ -224,8 +224,24 @@ The logo takes in the author's name and returns every way of seeing it. LeBOS
 is LeBlanc OS, so the mark contains the author, the system and the design
 thesis in one shape.
 
+The draft (day 3): black field, white prism, a white beam entering from the
+left, and the emerging spectrum rendered as **coloured binary digits**. That
+third layer is the best part and was not in the original brief -- undifferentiated
+input goes in, and structured, coloured, queryable DATA comes out. The mark
+describes the store, not just the optics.
+
 Do not redesign this into something with folders in it, and do not lose the
 white-light input -- that is the whole joke.
+
+Two open notes on the draft:
+
+- It reads as a Dark Side of the Moon homage. The codebase already panics with
+  `PANIC! AT THE KERNEL`, so a second band tribute is a tradition rather than a
+  coincidence -- but if LeBOS ever gets a public face, how close to that cover
+  it sits should be a decision rather than an accident. Steeper prism, a
+  different entry angle, or leaning harder on the binary so the bits read
+  before the rainbow does.
+- Not final.
 
 ## Easter eggs and tributes
 
