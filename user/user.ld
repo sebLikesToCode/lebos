@@ -22,32 +22,21 @@ SECTIONS
         *(.text .text.*)
     }
 
+    /* Each section gets its own page, so no page ever needs two different
+     * permissions at once. Without this a segment boundary can land mid-page
+     * and the loader has to choose which of two answers to be wrong about.
+     *
+     * The fixed 0x8000 data address that used to live here is gone. The kernel
+     * reads an ELF now, and an ELF states permissions per segment -- so the
+     * boundary is a fact carried in the file rather than a constant two
+     * unrelated files had to agree on.
+     */
+    . = ALIGN(4096);
     .rodata : { *(.rodata .rodata.*) }
 
-    /* WRITABLE DATA STARTS AT A FIXED ADDRESS.
-     *
-     * The kernel receives a flat binary with no section table, so it has no
-     * way to discover where read-only code ends and writable data begins --
-     * and it must know, because W^X applies to user pages: mapping the whole
-     * image r-x makes any global variable fault on first write, and mapping it
-     * all rw-x hands a program the ability to rewrite its own code.
-     *
-     * So the boundary is a constant both sides agree on. Ugly, and deliberately
-     * temporary: milestone 19 has to parse a real ELF anyway, which carries a
-     * permissions field per segment and deletes this whole arrangement.
-     *
-     * The gap is padded with zeros by objcopy, which costs image size and
-     * nothing else.
-     */
-    . = 0x8000;
+    . = ALIGN(4096);
     .data   : { *(.sdata .sdata.* .data .data.*) }
     .bss    : { *(.sbss .sbss.* .bss .bss.*) }
-    __bss_end = .;
-
-    ASSERT(ADDR(.data) == 0x8000,
-           "code and rodata overran 0x8000 -- raise USER_DATA_BASE in main.rs too")
-    ASSERT(__bss_end <= 0xC000,
-           "data + bss overran 16 KiB -- raise USER_DATA_SIZE in main.rs too")
 
     /DISCARD/ : { *(.eh_frame) *(.note .note.*) *(.comment) }
 }

@@ -34,7 +34,7 @@ static TICKS: AtomicU64 = AtomicU64::new(0);
 /// is no disk driver yet -- xv6 does exactly this with its `initcode`. The
 /// disk exists as of milestone 13, but loading a PROGRAM off it still needs an
 /// ELF parser and a way to name one without a path. That is milestone 19.
-static USER_PROG: &[u8] = include_bytes!("../user/hello.bin");
+static USER_PROG: &[u8] = include_bytes!("../user/hello.elf");
 
 /// Where user programs are mapped. Not 0, so that a null dereference faults
 /// rather than silently reading whatever sits at address zero. Must match
@@ -480,8 +480,22 @@ extern "C" fn kmain_high() -> ! {
     //
     // Same binary, same virtual address, different physical memory. Neither can
     // name the other's -- not "is denied", but has no address that reaches it.
-    let a_root = process_spawn("procA", b'A');
-    let b_root = process_spawn("procB", b'B');
+    // Milestone 19: the program is an OBJECT now, not a constant.
+    //
+    // Its bytes still come from the kernel image -- something has to seed the
+    // store on a blank disk, the same bootstrap xv6 does with initcode. But
+    // from here on it is reached the way everything else is: by query.
+    let prog_id = store_create(
+        USER_PROG.to_vec(),
+        alloc::vec![
+            ("name".into(), Value::Text("hello".into())),
+            ("type".into(), Value::Text("program".into())),
+        ],
+    );
+    println!("exec: seeded the store with `hello` -- #{:016x}", prog_id.0);
+
+    let a_root = process_spawn("procA", b'A', USER_PROG).unwrap_or(0);
+    let b_root = process_spawn("procB", b'B', USER_PROG).unwrap_or(0);
 
     println!("proc: two processes created, both running the same binary");
     println!(
@@ -527,12 +541,12 @@ extern "C" fn kmain_high() -> ! {
 /// thread's address space -- so `USER_BASE` here means *this* process's copy of
 /// the program, not anyone else's.
 extern "C" fn user_thread_entry() -> ! {
-    let (user_sp, arg) = {
+    let (user_sp, entry, arg) = {
         let t = THREADS.lock();
         let cur = CURRENT.load(Ordering::Relaxed);
-        (t[cur].user_sp, t[cur].user_arg)
+        (t[cur].user_sp, t[cur].user_entry, t[cur].user_arg)
     };
-    enter_user(user_sp, arg);
+    enter_user(user_sp, entry, arg);
 }
 
 /// Create a process: a private address space, the program loaded into it, and
@@ -542,9 +556,18 @@ extern "C" fn user_thread_entry() -> ! {
 /// entries; the program is a couple of frames; the thread already existed as a
 /// concept. Two processes then run the same binary, at the same virtual
 /// address, in completely different physical memory.
-fn process_spawn(name: &'static str, tag: u8) -> usize {
+fn process_spawn(name: &'static str, tag: u8, prog: &[u8]) -> Option<usize> {
     let root_pa = proc_pagetable();
-    let user_sp = map_user_tagged(root_pa, tag);
+    let (entry, user_sp, brk) = match load_user(root_pa, prog) {
+        Some(t) => t,
+        None => {
+            // The bytes were not a program this machine can run. Hand the
+            // address space straight back -- a refused exec must not leak the
+            // frames it already mapped.
+            free_user_space(root_pa);
+            return None;
+        }
+    };
     let satp = (8_usize << 60) | (root_pa >> 12);
 
     let mut stack = alloc::vec![0u8; STACK_SIZE];
@@ -555,17 +578,12 @@ fn process_spawn(name: &'static str, tag: u8) -> usize {
     ctx.sp = top;
     ctx.s[0] = user_thread_entry as *const () as usize;
 
-    // The heap starts on the first page past the writable data region --
-    // NOT past the image. The two stopped being the same thing when data got
-    // its own fixed address, and a break that overlapped .bss would hand the
-    // allocator pages the program's globals were already living in.
-    let brk = USER_DATA_BASE + USER_DATA_SIZE;
-
     thread_insert(Thread {
         ctx,
         satp,
         root_pa,
         user_sp,
+        user_entry: entry,
         user_arg: tag as usize,
         brk,
         name,
@@ -574,7 +592,7 @@ fn process_spawn(name: &'static str, tag: u8) -> usize {
         stack,
     });
 
-    root_pa
+    Some(root_pa)
 }
 
 /// Two threads that do nothing but announce themselves and hand the desk
@@ -1176,17 +1194,145 @@ const PTE_U: usize = 1 << 4; // user mode may access this page
 /// Bytes of user stack. One frame is plenty for a program this small.
 const USER_STACK_SIZE: usize = PAGE_SIZE;
 
-/// Where a user program's WRITABLE data begins. Must match `user/user.ld`.
+/// The top of every user stack. One page below this is the stack itself.
 ///
-/// A flat binary carries no section table, so the kernel cannot see where
-/// read-only code stops and writable globals start -- and it has to know,
-/// because W^X applies to user pages. Map the lot r-x and the first global
-/// variable faults; map the lot rw-x and a program can rewrite its own code.
+/// Deliberately far from the program. The stack used to sit at `USER_BASE -
+/// PAGE_SIZE`, which is 0 -- so page 0 was MAPPED, and a null dereference
+/// quietly read the bottom of the stack instead of faulting. `user.ld` links
+/// at 0x1000 specifically so that page 0 stays empty; the stack was undoing it.
+const USER_STACK_TOP: usize = 0x4000_0000;
+
+// ---------------------------------------------------------------------------
+// ELF loading -- milestone 19
+//
+// `objcopy -O binary` threw away everything except the bytes, which is why the
+// kernel needed a hardcoded USER_DATA_BASE: a flat image cannot say where
+// executable code stops and writable data starts.
+//
+// An ELF is the same bytes plus a packing list. Each PT_LOAD entry says: take
+// these bytes from this offset, put them at this address, with these
+// permissions -- and then add this many more zero bytes. That last clause IS
+// .bss, stated by the file rather than guessed at by convention.
+// ---------------------------------------------------------------------------
+
+const PT_LOAD: u32 = 1;
+const PF_X: u32 = 1;
+const PF_W: u32 = 2;
+const PF_R: u32 = 4;
+
+fn rd_u16(b: &[u8], off: usize) -> Option<u16> {
+    Some(u16::from_le_bytes(b.get(off..off + 2)?.try_into().ok()?))
+}
+fn rd_u32(b: &[u8], off: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(b.get(off..off + 4)?.try_into().ok()?))
+}
+fn rd_u64(b: &[u8], off: usize) -> Option<u64> {
+    Some(u64::from_le_bytes(b.get(off..off + 8)?.try_into().ok()?))
+}
+
+/// Load an ELF into a fresh address space. Returns (entry point, initial break).
 ///
-/// Deliberately temporary. Milestone 19 must parse an ELF to run programs out
-/// of the store, and an ELF states permissions per segment, which deletes this.
-const USER_DATA_BASE: usize = 0x8000;
-const USER_DATA_SIZE: usize = 0x4000;
+/// Every field is treated as hostile. This will eventually be handed bytes out
+/// of the store, and an object in the store is whatever somebody put there.
+fn load_elf(root_pa: usize, elf: &[u8]) -> Option<(usize, usize)> {
+    if elf.get(0..4)? != b"\x7fELF" {
+        return None;
+    }
+    if elf[4] != 2 || elf[5] != 1 {
+        return None; // must be 64-bit, little endian
+    }
+
+    let entry = rd_u64(elf, 0x18)? as usize;
+    let phoff = rd_u64(elf, 0x20)? as usize;
+    let phentsize = rd_u16(elf, 0x36)? as usize;
+    let phnum = rd_u16(elf, 0x38)? as usize;
+    if phentsize < 56 || phnum > 64 {
+        return None;
+    }
+
+    let root = va(root_pa) as *mut usize;
+    let mut brk = 0usize;
+
+    for i in 0..phnum {
+        let ph = phoff.checked_add(i.checked_mul(phentsize)?)?;
+        if rd_u32(elf, ph)? != PT_LOAD {
+            continue;
+        }
+
+        let flags = rd_u32(elf, ph + 4)?;
+        let off = rd_u64(elf, ph + 8)? as usize;
+        let vaddr = rd_u64(elf, ph + 0x10)? as usize;
+        let filesz = rd_u64(elf, ph + 0x20)? as usize;
+        let memsz = rd_u64(elf, ph + 0x28)? as usize;
+
+        // memsz < filesz would mean "copy more bytes than there is room for".
+        if memsz < filesz {
+            return None;
+        }
+        // Page 0 stays unmapped so a null dereference faults, and nothing may
+        // be placed where the stack lives or anywhere near the kernel.
+        if vaddr < PAGE_SIZE || vaddr.checked_add(memsz)? >= USER_STACK_TOP - PAGE_SIZE {
+            return None;
+        }
+        // W^X, enforced on input rather than trusted. A segment asking to be
+        // both writable and executable is refused outright.
+        if flags & PF_W != 0 && flags & PF_X != 0 {
+            println!("elf: REFUSED -- segment wants W and X together");
+            return None;
+        }
+
+        let mut pf = PTE_U;
+        if flags & PF_R != 0 {
+            pf |= PTE_R;
+        }
+        if flags & PF_W != 0 {
+            pf |= PTE_W;
+        }
+        if flags & PF_X != 0 {
+            pf |= PTE_X;
+        }
+        pf |= if flags & PF_X != 0 {
+            RSW_TEXT
+        } else {
+            RSW_DATA
+        };
+
+        let first = vaddr & !(PAGE_SIZE - 1);
+        let last = (vaddr.checked_add(memsz)?).div_ceil(PAGE_SIZE) * PAGE_SIZE;
+
+        let mut page = first;
+        while page < last {
+            let frame = frame_alloc()? as usize;
+            let dst = va(frame) as *mut u8;
+            // Zero FIRST. Everything past filesz is .bss, and a fresh frame
+            // holds whatever the last process left in it.
+            unsafe { core::ptr::write_bytes(dst, 0, PAGE_SIZE) };
+
+            // The slice of this page that actually comes from the file.
+            let lo = core::cmp::max(page, vaddr);
+            let hi = core::cmp::min(page + PAGE_SIZE, vaddr + filesz);
+            if lo < hi {
+                let src = off.checked_add(lo - vaddr)?;
+                let n = hi - lo;
+                if src.checked_add(n)? > elf.len() {
+                    return None; // the header promised bytes the file does not have
+                }
+                unsafe {
+                    core::ptr::copy_nonoverlapping(elf.as_ptr().add(src), dst.add(lo - page), n)
+                };
+            }
+
+            map(root, page, frame, pf);
+            page += PAGE_SIZE;
+        }
+        brk = core::cmp::max(brk, last);
+    }
+
+    if brk == 0 || entry < PAGE_SIZE {
+        return None; // nothing loaded, or an entry point in the null page
+    }
+    Some((entry, brk))
+}
 
 /// How far a process may push its break. A cap rather than "until memory runs
 /// out", because one greedy program should not be able to starve the machine
@@ -1228,87 +1374,20 @@ fn proc_pagetable() -> usize {
 /// The low half is free real estate: the kernel relocated to the high half and
 /// dropped the identity map, so user and kernel share one page table and can
 /// never collide. That is what milestone 6c bought.
-fn map_user_tagged(root_pa: usize, _tag: u8) -> usize {
-    // The tag used to be patched directly into a byte of the program's image.
-    // That worked only while every page was writable by the kernel and the
-    // message sat at a predictable offset -- and it stopped being true the
-    // moment the program grew and .rodata became genuinely read-only.
-    //
-    // It arrives in a0 now instead, which is both simpler and the first seed
-    // of argv: a program is told who it is rather than having its own text
-    // rewritten behind its back.
-    map_user(root_pa)
-}
+/// Build a user address space: load the program, map a stack.
+///
+/// Returns (entry point, initial stack pointer, initial break).
+fn load_user(root_pa: usize, prog: &[u8]) -> Option<(usize, usize, usize)> {
+    let (entry, brk) = load_elf(root_pa, prog)?;
 
-/// Copy the embedded user program into fresh frames and map it into the LOW
-/// half with U=1, plus a stack. Returns the initial user stack pointer.
-fn map_user(root_pa: usize) -> usize {
     let root = va(root_pa) as *mut usize;
-
-    // --- code and rodata: readable, executable, NOT writable ---
-    let mut addr = USER_BASE;
-    while addr < USER_DATA_BASE {
-        let frame = frame_alloc().expect("no frame for the user program");
-        let dst = va(frame as usize) as *mut u8;
-        unsafe { core::ptr::write_bytes(dst, 0, PAGE_SIZE) };
-
-        // Copy whatever the image has for this page. Past the end of the
-        // image there is nothing to copy and the page stays zero.
-        let off = addr - USER_BASE;
-        if off < USER_PROG.len() {
-            let n = core::cmp::min(PAGE_SIZE, USER_PROG.len() - off);
-            unsafe { core::ptr::copy_nonoverlapping(USER_PROG.as_ptr().add(off), dst, n) };
-        }
-
-        map(root, addr, frame as usize, PTE_R | PTE_X | PTE_U | RSW_TEXT);
-        addr += PAGE_SIZE;
-    }
-
-    // --- data and bss: readable, WRITABLE, not executable ---
-    //
-    // .bss occupies no space in a flat binary -- it is a promise that some
-    // zeroed bytes will exist, not a record of them -- so these pages are
-    // zeroed first and the image is copied over whatever part of them it
-    // reaches. Everything past the image end is the .bss, already correct.
-    while addr < USER_DATA_BASE + USER_DATA_SIZE {
-        let frame = frame_alloc().expect("no frame for user data");
-        let dst = va(frame as usize) as *mut u8;
-        unsafe { core::ptr::write_bytes(dst, 0, PAGE_SIZE) };
-
-        let off = addr - USER_BASE;
-        if off < USER_PROG.len() {
-            let n = core::cmp::min(PAGE_SIZE, USER_PROG.len() - off);
-            unsafe { core::ptr::copy_nonoverlapping(USER_PROG.as_ptr().add(off), dst, n) };
-        }
-
-        map(root, addr, frame as usize, PTE_R | PTE_W | PTE_U | RSW_DATA);
-        addr += PAGE_SIZE;
-    }
-
-    // --- the user stack, immediately below the program ---
-    let sframe = frame_alloc().expect("no frame for the user stack");
-    unsafe { core::ptr::write_bytes(va(sframe as usize) as *mut u8, 0, PAGE_SIZE) };
-    let stack_va = USER_BASE - USER_STACK_SIZE;
-    map(
-        root,
-        stack_va,
-        sframe as usize,
-        PTE_R | PTE_W | PTE_U | RSW_DATA,
-    );
+    let sframe = frame_alloc()? as usize;
+    unsafe { core::ptr::write_bytes(va(sframe) as *mut u8, 0, PAGE_SIZE) };
+    let stack_va = USER_STACK_TOP - USER_STACK_SIZE;
+    map(root, stack_va, sframe, PTE_R | PTE_W | PTE_U | RSW_DATA);
 
     unsafe { core::arch::asm!("sfence.vma") };
-
-    println!(
-        "user: {:#x}..{:#x} r-x, {:#x}..{:#x} rw-, stack {:#x}..{:#x} rw-",
-        USER_BASE,
-        USER_DATA_BASE,
-        USER_DATA_BASE,
-        USER_DATA_BASE + USER_DATA_SIZE,
-        stack_va,
-        USER_BASE
-    );
-
-    stack_va + USER_STACK_SIZE
+    Some((entry, USER_STACK_TOP, brk))
 }
 
 // ---------------------------------------------------------------------------
@@ -1490,7 +1569,7 @@ fn user_range_writable(root_pa: usize, ptr: usize, len: usize) -> bool {
 
 /// Drop to user mode and start the program. Never returns -- from here on this
 /// thread IS the user program, and only a trap brings the kernel back.
-fn enter_user(user_sp: usize, arg: usize) -> ! {
+fn enter_user(user_sp: usize, entry: usize, arg: usize) -> ! {
     unsafe {
         // SPP (bit 8) = 0  -> sret returns to USER mode, not supervisor
         core::arch::asm!("csrc sstatus, {}", in(reg) 1_usize << 8);
@@ -1508,7 +1587,7 @@ fn enter_user(user_sp: usize, arg: usize) -> ! {
             "csrw sepc, {entry}",
             "mv sp, {usp}",
             "sret",
-            entry = in(reg) USER_BASE,
+            entry = in(reg) entry,
             usp = in(reg) user_sp,
             // a0 is the first argument in the RISC-V calling convention, and
             // _start does not touch it before `call umain` -- so this arrives
@@ -2268,6 +2347,9 @@ struct Thread {
     root_pa: usize,
     /// Initial user stack pointer, for a thread that will drop to user mode.
     user_sp: usize,
+    /// Where this program starts. Read from the ELF's e_entry rather than
+    /// assumed to be USER_BASE -- the file says where it begins.
+    user_entry: usize,
     /// What lands in a0 when this thread enters user mode. Today it is an
     /// identity tag so two processes running one binary can tell themselves
     /// apart; tomorrow it is argv.
@@ -2324,6 +2406,7 @@ fn threads_init() {
         satp: KERNEL_SATP.load(Ordering::Relaxed),
         root_pa: 0,
         user_sp: 0,
+        user_entry: 0,
         user_arg: 0,
         brk: 0,
         name: "main",
@@ -2358,6 +2441,7 @@ fn thread_spawn(name: &'static str, entry: extern "C" fn() -> !) {
         satp: KERNEL_SATP.load(Ordering::Relaxed),
         root_pa: 0,
         user_sp: 0,
+        user_entry: 0,
         user_arg: 0,
         brk: 0,
         name,
@@ -3801,13 +3885,62 @@ extern "C" fn shell() -> ! {
                 }
             }
 
-            // Spawn the embedded program and collect it. Not exec-by-query
-            // yet -- that is 19, and it needs the program to be an OBJECT.
+            // EXEC BY QUERY.
+            //
+            // Every operating system that has shipped resolves a NAME to a
+            // LOCATION here -- execve("/bin/sh") walks a tree to a leaf. There
+            // is no tree. So a program is an object with type=program, and
+            // running one means running a query.
+            //
+            // Ambiguity therefore stops being an error. Two matches is not
+            // "not found", it is a numbered list, which is the same interface
+            // as everything else in this shell because it is the same
+            // operation.
             "run" => {
-                process_spawn("child", b'C');
-                match thread_wait() {
-                    Some((name, code)) => println!("  {} exited with {}", name, code),
-                    None => println!("  nothing to wait for"),
+                let mut conds = alloc::vec![OwnedCond::Eq("type".into(), "program".into())];
+                let mut bad = false;
+                for w in &rest {
+                    match parse_pred(w) {
+                        Some(c) => conds.push(c),
+                        None => {
+                            println!("  `{}` is not a predicate", w);
+                            bad = true;
+                        }
+                    }
+                }
+                if bad {
+                    continue;
+                }
+
+                let ids = store_query_owned(&conds);
+                match ids.len() {
+                    0 => println!("  no program matches. `find type=program` to see them"),
+                    1 => {
+                        let bytes = {
+                            let store = STORE.lock();
+                            let content = store.get(&ids[0]).map(|o| o.content);
+                            drop(store);
+                            content.and_then(|c| BLOBS.lock().get(&c).cloned())
+                        };
+                        match bytes {
+                            // The bytes are evicted: the record still names a
+                            // real program, and there is nothing left to run.
+                            // Only a store that separates those two ideas can
+                            // even express this.
+                            None => println!("  that program's bytes were evicted"),
+                            Some(b) => match process_spawn("child", b'C', &b) {
+                                None => println!("  not a program this machine can run"),
+                                Some(_) => match thread_wait() {
+                                    Some((n, code)) => println!("  {} exited with {}", n, code),
+                                    None => println!("  nothing to wait for"),
+                                },
+                            },
+                        }
+                    }
+                    _ => {
+                        println!("  {} programs match. narrow it:", ids.len());
+                        shell_find(&conds, false);
+                    }
                 }
             }
 

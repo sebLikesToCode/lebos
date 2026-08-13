@@ -578,6 +578,56 @@ three times instead of forever, and the timer no longer announces each second.
 Both were proof the scheduler worked and became a machine talking over its
 user the moment there was a user.
 
+## exec-by-query and the ELF loader (milestone 19)
+
+**A program is an object with `type=program`.** Running one means running a
+QUERY:
+
+    run                  the only program
+    run name~shell       by name
+    run type=program created>100
+
+`execve("/bin/sh")` is a path lookup in every OS that has shipped. There is no
+tree here, so **ambiguity stops being an error** -- two matches is a numbered
+list, the same interface as everything else in the shell, because it is the
+same operation. Zero matches says so and suggests `find type=program`.
+
+The kernel image still carries one program to seed a blank disk -- something
+has to, and xv6 does the same with `initcode` -- but from that point it is
+reached only by query.
+
+**Eviction composes with this for free:** `run` on a program whose bytes were
+evicted reports exactly that. The record still names a real program and there
+is nothing left to run. Only a store that separates the record from the bytes
+can express the difference.
+
+### The ELF loader
+
+`objcopy -O binary` is gone; the Makefile strips the ELF and the kernel parses
+it. Each `PT_LOAD` says: take these bytes from this offset, put them at this
+address, with these permissions, and add this many more zero bytes. **That last
+clause IS `.bss`** -- stated by the file instead of guessed at, which is what
+the `USER_DATA_BASE = 0x8000` convention was standing in for. That hack is
+gone, along with the assumption that programs start at `USER_BASE`: the entry
+point comes from `e_entry`.
+
+Every field is treated as hostile, because these bytes come out of the store
+and the store is whatever somebody put in it. Refused: `memsz < filesz`, a
+segment at or below the null page, anything reaching the stack, a header
+promising bytes the file does not contain, and **any segment asking for W and X
+together**. A refused load frees the address space it had already built rather
+than leaking those frames. Verified by making an object with `type=program`
+out of 21 bytes of typed text and running it -- refused, kernel survived.
+
+`user.ld` now `ALIGN(4096)`s each section so no page ever needs two different
+permissions at once.
+
+**The null page was mapped this whole time.** The user stack sat at
+`USER_BASE - PAGE_SIZE`, which is 0 -- so a null dereference quietly read the
+bottom of the stack instead of faulting, defeating the entire reason `user.ld`
+links at `0x1000`. The stack now lives just under `USER_STACK_TOP`
+(`0x4000_0000`), far from the program, and page 0 is empty.
+
 ## The userspace heap (milestone 17)
 
 A **bump allocator**: one pointer walks forward, `dealloc` does nothing. That
@@ -963,11 +1013,10 @@ that existed. Phase VI ends with `lebos` being a kernel and nothing else.
 17. ✅ userspace memory: `sbrk` + a bump allocator. `Vec`, `String` and
     `format!` work in user programs
 18. ✅ the syscalls a shell needs: read_char, get, verb, save
-19. ⬅ **current** — **exec-by-query**. A program is an object with
-    `type=program`, so running one means running a QUERY. Needs an ELF parser,
-    which also deletes the `USER_DATA_BASE` hack from 17.
-20. the shell as a user program, loaded from the store. Swap FNV-1a for
-    SHA-256 here -- untrusted code can write to the store from this point.
+19. ✅ **exec-by-query** + an ELF loader
+20. ⬅ **current** — the shell as a user program, loaded from the store. Swap
+    FNV-1a for SHA-256 here: untrusted code can write to the store from this
+    point.
 
 Then Phase VII is pixels, cleanly: the framebuffer driver is mechanism
 (kernel), the window manager is policy (userspace).

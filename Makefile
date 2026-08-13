@@ -23,7 +23,7 @@ $(DISK):
         play resync playdiff user logo
 
 USERELF := user/target/$(TARGET)/debug/hello
-USERBIN := user/hello.bin
+USERBIN := user/hello.elf
 
 ## user    -- build the user program and flatten it to a raw binary.
 ##            The kernel bakes this in with include_bytes!, so it must exist
@@ -32,10 +32,14 @@ USERBIN := user/hello.bin
 #            user/.cargo/config.toml because cargo MERGES config files up the
 #            directory tree -- the kernel's -Tlinker.ld would otherwise leak in
 #            and link this into the higher half. The env var replaces them.
+# No objcopy any more. The kernel parses the ELF itself as of milestone 19,
+# because an ELF states where each segment goes and what may be done to it --
+# which a flat binary throws away, and which the kernel then had to guess at
+# with a hardcoded constant.
 $(USERBIN): user/src/main.rs user/user.ld
 	cd user && RUSTFLAGS="-C code-model=medium -C link-arg=-Tuser.ld" cargo build
-	rust-objcopy -O binary $(USERELF) $(USERBIN)
-	@echo "user program: $$(stat -c%s $(USERBIN)) bytes"
+	rust-objcopy --strip-all $(USERELF) $(USERBIN)
+	@echo "user program: $$(stat -c%s $(USERBIN)) bytes (ELF)"
 
 user: $(USERBIN)
 
