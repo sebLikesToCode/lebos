@@ -17,6 +17,20 @@
 #![no_main]
 
 use core::panic::PanicInfo;
+use core::fmt::{self, Write};
+
+fn _print(args: fmt::Arguments) {
+    let _ = Uart.write_fmt(args);
+}
+
+macro_rules! print {
+    ($($arg:tt)*) => { _print(format_args!($($arg)*)) };
+}
+
+macro_rules! println {
+    ()            => { print!("\n") };
+    ($($arg:tt)*) => { print!("{}\n", format_args!($($arg)*)) };
+}
 
 // entry.S, pasted in at compile time. It has to be assembly: there is no valid
 // stack when it runs, and Rust cannot function without one.
@@ -38,8 +52,8 @@ pub extern "C" fn kmain(_hartid: usize, _dtb: *const u8) -> ! {
     //  say something. The UART lives at 0x1000_0000 and writing a byte
     //  to that address sends it out the serial port.
     // ---------------------------------------------------------------
-    puts("hi");
-    puts("im doin this myself");
+    println!("LeBOS. {} + {} = {}", 2, 2, 4);
+    println!("UART at {:#x}", 0x1000_0000);
     loop {
         // Wait For Interrupt: parks the core instead of spinning it at 100%.
         unsafe { core::arch::asm!("wfi") };
@@ -64,6 +78,13 @@ fn puts(s: &str) {
     }
 }
 
+struct Uart;
+impl Write for Uart {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        puts(s);
+        Ok(())
+    }
+}
 
 /// Where a panic ends up.
 ///
