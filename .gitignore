@@ -24,3 +24,4 @@ lebos.img
 # Not part of the build; deliberately untracked.
 pykernel.py
 decoder.md
+TOUR.md
