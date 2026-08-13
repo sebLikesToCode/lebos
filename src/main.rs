@@ -19,6 +19,10 @@
 use core::panic::PanicInfo;
 use core::fmt::{self, Write};
 
+extern "C" {
+    fn trap_entry();
+}
+
 fn _print(args: fmt::Arguments) {
     let _ = Uart.write_fmt(args);
 }
@@ -49,10 +53,10 @@ core::arch::global_asm!(include_str!("entry.S"));
 pub extern "C" fn kmain(_hartid: usize, _dtb: *const u8) -> ! {
 
     unsafe {
-        core::arch::asm!("csrw stvec, {}", in(reg) trap_handler as *const () as usize);
+        core::arch::asm!("csrw stvec, {}", in(reg) trap_entry as *const () as usize);
     }
 
-    //unsafe { core::arch::asm!("unimp") };
+    unsafe { core::arch::asm!("unimp") };
 
     println!("{}", BANNER);
 
@@ -88,7 +92,8 @@ impl Write for Uart {
     }
 }
 
-fn trap_handler() {
+#[no_mangle]
+extern "C" fn trap_handler() {
     let cause: usize;
     let val: usize;
     let sep: usize;
@@ -98,12 +103,50 @@ fn trap_handler() {
         core::arch::asm!("csrr {}, stval", out(reg) val);
         core::arch::asm!("csrr {}, sepc", out(reg) sep);
     }
+
+    let is_interrupt = (cause as isize) < 0;
+    let code = cause & 0xff;
+
     println!("TRAP");
-    println!("sepc = {}", sep);
+    println!("sepc = {:#x}", sep);
     println!("scause = {}", cause);
-    println!("stval = {}", val);
-    loop {
-        unsafe { core::arch::asm!("wfi") };
+    println!("stval = {:#x}", val);
+
+    if !is_interrupt {
+        let name = match code {
+            0  => "instruction address misaligned",
+            1  => "instruction access fault",
+            2  => "illegal instruction",
+            3  => "breakpoint",
+            4  => "load address misaligned",
+            5  => "load access fault",
+            6  => "store/AMO address misaligned",
+            7  => "store/AMO access fault",
+            8  => "ecall from user mode",
+            9  => "ecall from supervisor mode",
+            11 => "ecall from machine mode",
+            12 => "instruction page fault",
+            13 => "load page fault",
+            15 => "store/AMO page fault",
+            _  => "unknown exception",
+        };
+        println!("ERROR: {}", name);
+    }
+    else {
+        let name = match code {
+            1 => "supervisor software interrupt",
+            5 => "supervisor timer interrupt",
+            9 => "supervisor external interrupt",
+            _ => "unknown interrupt",
+        };
+        println!("ERROR: {}", name);
+    }
+
+    let insn = unsafe { core::ptr::read_volatile(sep as *const u16) };
+
+    if !is_interrupt {
+        let width = if insn & 0b11 == 0b11 { 4 } else { 2 };
+        unsafe {core::arch::asm!("csrw sepc, {}", in(reg) sep + width)}
     }
 }
 
@@ -114,6 +157,8 @@ fn trap_handler() {
 /// no unwinder -- hence `panic = "abort"` in Cargo.toml.
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
+    println!("PANIC! AT THE KERNEL");
+    println!("{}", _info);
     loop {
         unsafe { core::arch::asm!("wfi") };
     }

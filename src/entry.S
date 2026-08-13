@@ -41,3 +41,79 @@ _start:
         # runaway program.
 3:      wfi
         j       3b
+
+
+# ---------------------------------------------------------------------------
+# Trap entry.
+#
+# Every exception and interrupt lands here, because kmain writes this address
+# into stvec.
+#
+# It is assembly for two reasons.
+#
+# ONE: stvec's low two bits are a MODE field, not address bits. The entry point
+# must therefore be at least 4-byte aligned, and Rust cannot align a function
+# -- #[repr(align)] applies to structs, enums and unions, not to fn. So the
+# alignment has to be asserted here. (Watch out: RISC-V `.align` takes a POWER
+# OF TWO. `.align 2` means 2^2 = 4 bytes, not 2 bytes.)
+#
+# TWO: the hardware saves NO general-purpose registers on a trap. It sets sepc,
+# scause and stval, and that is all. Every one of the 32 registers still holds
+# whatever the interrupted code had in it -- and Rust will start clobbering
+# them the instant it runs. So all of them are saved here, before any Rust, and
+# put back afterwards.
+#
+# That block of saved registers is the "trap frame". Its layout is exactly
+# x0..x31 in register-number order, 8 bytes each, 256 bytes total, so that Rust
+# can eventually view it as [usize; 32] and index it by register number.
+#
+# Not saved yet: sepc and sstatus. They are single global CSRs, and the moment
+# a scheduler exists that becomes the worst bug in this kernel -- another
+# thread traps, overwrites sepc, and this sret jumps to ITS program counter.
+# Right now nothing can trap between entry and exit, so reading them live is
+# correct. Milestone 8 is when it stops being.
+#
+# A note on stacks: this runs on whatever stack was already active, which is
+# fine while everything is kernel code. Once user mode exists, sp will hold an
+# untrusted value and this has to swap to a known-good kernel stack first.
+# ---------------------------------------------------------------------------
+
+.equ FRAME, 256
+
+.macro SAVE_GP i
+        sd      x\i, \i*8(sp)
+.endm
+
+.macro LOAD_GP i
+        ld      x\i, \i*8(sp)
+.endm
+
+.section .text
+.align 2
+.globl trap_entry
+trap_entry:
+        addi    sp, sp, -FRAME
+
+        # x0 is hardwired zero -- nothing to save. x2 is sp, which we have just
+        # moved, so it is recorded separately below.
+        .irp n, 1,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+        SAVE_GP \n
+        .endr
+
+        # The interrupted sp is exactly one frame above where we are now. t0 is
+        # already saved, so clobbering it is free.
+        addi    t0, sp, FRAME
+        sd      t0, 2*8(sp)
+
+        call    trap_handler
+
+        .irp n, 1,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+        LOAD_GP \n
+        .endr
+
+        addi    sp, sp, FRAME
+
+        # NOT `ret`. `ret` jumps to ra, which belongs to the interrupted code
+        # and has nothing to do with where the trap happened. `sret` jumps to
+        # sepc and restores the pre-trap interrupt-enable state.
+        sret
