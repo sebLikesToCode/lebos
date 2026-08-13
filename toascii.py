@@ -58,7 +58,16 @@ for y in range(height):
         elif sat > 0.30:
             # Coloured light becomes data -- the third layer of the logo, and
             # the only one that survives being reduced to monospace.
-            ch, col = "01"[(x * 7 + y * 3) % 2], quant((r, g, b))
+            #
+            # The hue is kept and the brightness is thrown away. Sampling the
+            # image directly gave muddy digits, because the beam fades toward
+            # its edges and a dim red on black reads as dirt rather than as
+            # light. A character is either there or it is not, so anything
+            # drawn at all should be drawn at full strength.
+            hh, ss, _ = colorsys.rgb_to_hsv(r / 255, g / 255, b / 255)
+            br, bg_, bb = colorsys.hsv_to_rgb(hh, min(1.0, ss * 1.35), 1.0)
+            ch = "01"[(x * 7 + y * 3) % 2]
+            col = quant((int(br * 255), int(bg_ * 255), int(bb * 255)))
         else:
             ch, col = RAMP[min(len(RAMP) - 1, int(val * len(RAMP)))], quant((r, g, b))
 
