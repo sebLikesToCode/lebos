@@ -1,0 +1,1 @@
+/home/sebastian/code/OS/reference/target/riscv64gc-unknown-none-elf/debug/lebos-ref: /home/sebastian/code/OS/reference/src/banner.txt /home/sebastian/code/OS/reference/src/entry.S /home/sebastian/code/OS/reference/src/main.rs /home/sebastian/code/OS/reference/user/hello.elf /home/sebastian/code/OS/reference/user/shell.elf

@@ -1,31 +1,31 @@
+# ---- build output ----
 /target
+kernel/target/
+user/target/
 Cargo.lock
-.idea/
+kernel/Cargo.lock
+user/Cargo.lock
 
-# Scratch copy of main.rs for experiments -- deliberately untracked so it can
-# be broken freely. `make resync` recreates it from main.rs.
-src/main2.rs
-
-# Scratch pad for working out kernel logic in Python before translating.
-questions.py
+# ---- generated, reproducible ----
+# lebos.img   -> make disk
+# qemu.log    -> make trace
+# virt.dtb/s  -> make dumpdtb
+lebos.img
 qemu.log
 virt.dtb
 virt.dts
-src/entry2.S
 
-# user program build artifacts
-user/target
-user/hello.bin
+# ---- scratch copies of the reference kernel ----
+# Deliberately untracked so they can be broken freely; `make resync` recreates
+# them. Note the paths: these moved from src/ to reference/ and the old
+# patterns silently stopped matching, which committed 3500 lines of duplicate.
+reference/main2.rs
+reference/entry2.S
+reference/banner_art.txt
 
-# disk image
-lebos.img
+# ---- reading aids ----
+# Not part of the build. Notes rather than source, so they live outside git.
+learn/
 
-# A Python mirror of the kernel algorithms, for reading alongside main.rs.
-# Not part of the build; deliberately untracked.
-pykernel.py
-decoder.md
-TOUR.md
-RUST.md
-
-# Sebastian's kernel build output
-kernel/target/
+# ---- editors ----
+.idea/

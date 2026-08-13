@@ -1,32 +1,24 @@
+# LeBOS -- the kernel, written by Sebastian LeBlanc.
+#
+# The previous kernel lives in reference/ as its own standalone crate. It still
+# boots (`make ref`) and exists to be read while this one is written.
 [package]
-name = "lebos-ref"
+name = "lebos"
 version = "0.1.0"
 edition = "2021"
 
-# The reference kernel -- the one written alongside Claude across milestones
-# 1-20. It still boots, and it exists to be READ while the real one is written.
-# Same role xv6 plays for everyone else, except every decision in it is already
-# Sebastian's and the comments explain the reasoning.
 [[bin]]
-name = "lebos-ref"
-path = "reference/main.rs"
+name = "lebos"
+path = "src/main.rs"
 test = false
 bench = false
 
-# Scratch copy for experiments. Gitignored, and built only by `make play` so
-# that breaking it can never block `make run`. Create/refresh it from main.rs
-# with `make resync`.
-[[bin]]
-name = "main2"
-path = "reference/main2.rs"
-test = false
-bench = false
-
-# Kernels must abort, never unwind: there is no runtime to unwind into.
+# There is no unwinder, so a panic must abort.
 [profile.dev]
 panic = "abort"
-opt-level = 1     # opt-level = 0 generates enormous stack frames that can
-                  # overflow our small boot stack before paging is set up.
+# opt-level 0 generates stack frames large enough to overflow a small boot
+# stack. 1 is the floor for a kernel.
+opt-level = 1
 
 [profile.release]
 panic = "abort"
