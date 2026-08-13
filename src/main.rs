@@ -487,6 +487,8 @@ extern "C" fn kmain_high() -> ! {
     //
     // Same binary, same virtual address, different physical memory. Neither can
     // name the other's -- not "is denied", but has no address that reaches it.
+    sha256_selftest();
+
     // Milestone 19: the program is an OBJECT now, not a constant.
     //
     // Its bytes still come from the kernel image -- something has to seed the
@@ -2880,21 +2882,148 @@ extern "C" fn thread_racer() -> ! {
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 struct ObjId(u64);
 
-/// Streaming FNV-1a, so an id can be computed over several pieces.
-struct Hasher(u64);
+// ---------------------------------------------------------------------------
+// SHA-256
+//
+// FNV-1a was here until milestone 20, and it was fine while the only thing
+// writing to the store was the kernel. It stopped being fine the moment the
+// shell became an untrusted program.
+//
+// The difference that matters is not "how random do the bits look". It is that
+// FNV-1a is TRIVIALLY INVERTIBLE: the mixing step is an xor and a multiply by
+// an odd constant, both reversible, so given any target id you can compute
+// bytes that produce it in about as long as it takes to type. Content
+// addressing turns that into "I can make my object be your object", which
+// destroys every property the store was built on -- dedup, immutability,
+// tamper detection, and the idea that an id means the same thing everywhere.
+//
+// The classic FIPS 180-4 construction: pad the message, absorb 512-bit blocks
+// into eight 32-bit words, sixty-four rounds each.
+// ---------------------------------------------------------------------------
+
+const K: [u32; 64] = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+];
+
+/// Streaming SHA-256, so an id can be computed over several pieces without
+/// joining them first.
+struct Hasher {
+    h: [u32; 8],
+    buf: [u8; 64],
+    n: usize,
+    total: u64,
+}
 
 impl Hasher {
     fn new() -> Self {
-        Hasher(0xcbf2_9ce4_8422_2325) // FNV offset basis
-    }
-    fn write(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.0 ^= b as u64;
-            self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3); // FNV prime
+        Hasher {
+            h: [
+                0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+                0x5be0cd19,
+            ],
+            buf: [0; 64],
+            n: 0,
+            total: 0,
         }
     }
-    fn finish(self) -> ObjId {
-        ObjId(self.0)
+
+    fn block(&mut self, b: &[u8]) {
+        // Expand sixteen big-endian words into sixty-four.
+        let mut w = [0u32; 64];
+        for (i, word) in w.iter_mut().take(16).enumerate() {
+            *word = u32::from_be_bytes([b[i * 4], b[i * 4 + 1], b[i * 4 + 2], b[i * 4 + 3]]);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+
+        let mut v = self.h;
+        for i in 0..64 {
+            let s1 = v[4].rotate_right(6) ^ v[4].rotate_right(11) ^ v[4].rotate_right(25);
+            let ch = (v[4] & v[5]) ^ (!v[4] & v[6]);
+            let t1 = v[7]
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K[i])
+                .wrapping_add(w[i]);
+            let s0 = v[0].rotate_right(2) ^ v[0].rotate_right(13) ^ v[0].rotate_right(22);
+            let maj = (v[0] & v[1]) ^ (v[0] & v[2]) ^ (v[1] & v[2]);
+            let t2 = s0.wrapping_add(maj);
+
+            v[7] = v[6];
+            v[6] = v[5];
+            v[5] = v[4];
+            v[4] = v[3].wrapping_add(t1);
+            v[3] = v[2];
+            v[2] = v[1];
+            v[1] = v[0];
+            v[0] = t1.wrapping_add(t2);
+        }
+        for (h, x) in self.h.iter_mut().zip(v.iter()) {
+            *h = h.wrapping_add(*x);
+        }
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        self.total += bytes.len() as u64;
+        for &byte in bytes {
+            self.buf[self.n] = byte;
+            self.n += 1;
+            if self.n == 64 {
+                let b = self.buf;
+                self.block(&b);
+                self.n = 0;
+            }
+        }
+    }
+
+    /// Pad, absorb the length, and fold the digest down to 64 bits.
+    ///
+    /// **Truncated, and that is a known limit.** An `ObjId` is a `usize` so it
+    /// fits in a register, which is what lets a syscall take one. Sixty-four
+    /// bits puts a birthday collision at roughly 2^32 work -- far beyond
+    /// FNV-1a, where a collision is *computed* rather than searched for, but
+    /// not the 2^128 a full digest would give. Widening it means ids no longer
+    /// fit in a register and every store syscall has to pass them by buffer.
+    /// That is a real change to the ABI, and it is milestone 21's problem.
+    fn finish(mut self) -> ObjId {
+        let bits = self.total * 8;
+        self.write(&[0x80]);
+        while self.n != 56 {
+            self.write(&[0]);
+        }
+        // write() has already counted these bytes into `total`, which is why
+        // `bits` was captured before any of the padding went in.
+        let b = bits.to_be_bytes();
+        self.write(&b);
+
+        ObjId(((self.h[0] as u64) << 32) | self.h[1] as u64)
+    }
+}
+
+/// The published FIPS 180-4 test vector: sha256("abc") begins ba7816bf8f01cfea.
+///
+/// Checked at every boot, and silent unless it fails. A hash that is subtly
+/// wrong still produces stable, random-looking ids -- every test passes, dedup
+/// works, the disk round-trips -- and the store is quietly no longer content
+/// addressed in any sense anyone else would recognise. Nothing else in this
+/// kernel can be wrong so invisibly, so nothing else gets a known-answer test.
+fn sha256_selftest() {
+    let got = hash_bytes(b"abc").0;
+    if got != 0xba78_16bf_8f01_cfea {
+        println!("SHA-256 SELF TEST FAILED: got {:#018x}", got);
     }
 }
 
@@ -3601,7 +3730,11 @@ fn blk_rw(sector: u64, buf_phys: usize, write: bool) -> bool {
 ///
 /// It is also not quite a lie: the files app's folders exist as saved queries.
 const LEBOS_MAGIC: u32 = 0xF01D_AB1E;
-const LEBOS_VERSION: u32 = 1;
+/// Bumped to 2 at milestone 20. Every id on a version-1 disk was an FNV-1a
+/// hash, so those ids no longer describe their own contents -- and an id that
+/// lies is worse than a disk that will not load. The header check rejects them
+/// and the store starts empty.
+const LEBOS_VERSION: u32 = 2;
 
 const REC_BLOB: u8 = 1;
 const REC_OBJECT: u8 = 2;

@@ -578,6 +578,59 @@ three times instead of forever, and the timer no longer announces each second.
 Both were proof the scheduler worked and became a machine talking over its
 user the moment there was a user.
 
+## The shell in userspace, and SHA-256 (milestone 20)
+
+**The shell is a program.** `user/src/bin/shell.rs`, ~350 lines, running in
+user mode. 280 lines left `main.rs`. Everything it does was policy -- what a
+predicate means, how a table is formatted, which verb `hide` is short for, what
+counts as a line of input -- and it lived in ring 0 only because the kernel was
+the only place with a heap.
+
+The user crate is now a shared module (`src/sys.rs`) plus two binaries, both
+seeded into the store at boot from the kernel image. Something has to fill a
+blank disk; xv6 does the same with `initcode`.
+
+Three additions made it possible:
+
+- **`spawn(id)`** runs the program in an object. Choosing WHICH id is a query,
+  and a query is something userspace does for itself.
+- **`wait()`** blocks for a child and returns its exit code.
+- **`get(..., meta_only)`** -- listing twenty results must not drag twenty
+  programs across the privilege boundary.
+
+The query wire format gained `Contains` and `Hidden`. **`Hidden` is answered
+from the claim log, not the object**, because hidden is a claim -- so the
+Cluttered view really is the same query with one boolean flipped rather than a
+second code path that happens to agree.
+
+### SHA-256
+
+FNV-1a was fine while only the kernel wrote to the store. It stopped being fine
+the moment the shell became untrusted, and the reason is not "the bits look
+less random": **FNV-1a is trivially invertible.** Its mixing step is an xor and
+a multiply by an odd constant, both reversible, so given any target id you can
+compute bytes that produce it. Under content addressing that means *"I can make
+my object be your object"*, which destroys dedup, immutability, tamper
+detection, and the idea that an id means the same thing on every machine.
+
+**Known limit, written down rather than glossed:** `ObjId` is still a `usize`
+so it fits in a register, so the digest is truncated to 64 bits. That puts a
+birthday collision at ~2^32 work -- vastly better than a hash where collisions
+are *computed* rather than searched for, but not the 2^128 a full digest gives.
+Widening it means ids no longer fit in a register and every store syscall must
+pass them by buffer. That is a real ABI change and it is milestone 21's.
+
+`sha256_selftest()` runs at every boot against the published `sha256("abc")`
+vector and is silent unless it fails. A subtly wrong hash still produces
+stable, random-looking ids -- every test passes, dedup works, the disk
+round-trips -- and the store is quietly no longer content addressed. Nothing
+else in this kernel can be wrong so invisibly, which is why nothing else has a
+known-answer test.
+
+`LEBOS_VERSION` is 2. Version-1 disks carry FNV ids that no longer describe
+their own contents, and an id that lies is worse than a disk that will not
+load, so the header check rejects them.
+
 ## exec-by-query and the ELF loader (milestone 19)
 
 **A program is an object with `type=program`.** Running one means running a
@@ -1014,14 +1067,28 @@ that existed. Phase VI ends with `lebos` being a kernel and nothing else.
     `format!` work in user programs
 18. ✅ the syscalls a shell needs: read_char, get, verb, save
 19. ✅ **exec-by-query** + an ELF loader
-20. ⬅ **current** — the shell as a user program, loaded from the store. Swap
-    FNV-1a for SHA-256 here: untrusted code can write to the store from this
-    point.
+20. ✅ the shell as a user program + SHA-256
+
+**Phase VI complete. `lebos` is a kernel and nothing else.**
+
+Next, undecided and deliberately so — Phase VII is pixels (framebuffer driver
+in the kernel as mechanism, window manager in userspace as policy), and the
+outstanding debts are listed below.
 
 Then Phase VII is pixels, cleanly: the framebuffer driver is mechanism
 (kernel), the window manager is policy (userspace).
 
-Known, not yet fixed: `EVENTS` grows without bound (every access appends,
-nothing trims). `SpinLock` is NOT reentrant -- taking the same lock twice
-deadlocks, and no current path does, but it is a landmine.
+Known, not yet fixed:
+
+- `EVENTS` grows without bound -- every access appends, nothing trims.
+- Claims accumulate across boots; compaction is a real milestone.
+- `SpinLock` is NOT reentrant. No current path takes one twice, but it is a
+  landmine.
+- `ObjId` is a truncated 64-bit digest. See milestone 20 above.
+- Saves are whole-store rather than incremental, though the format is already
+  shaped for appending.
+- `store_query` is a linear scan. Nothing is slow yet.
+- The unresolved capability tension is now urgent: an untrusted shell can
+  compute any id it can guess the contents of, so "an id is a capability" is
+  false as written. Decide before anything multi-user exists.
 
