@@ -20,7 +20,7 @@ $(DISK):
 	@echo "created $(DISK) (64 MiB)"
 
 .PHONY: build run debug gdb clean objdump nm size dumpdtb check fmt \
-        play resync playdiff user
+        play resync playdiff user logo
 
 USERELF := user/target/$(TARGET)/debug/hello
 USERBIN := user/hello.bin
@@ -38,6 +38,12 @@ $(USERBIN): user/src/main.rs user/user.ld
 	@echo "user program: $$(stat -c%s $(USERBIN)) bytes"
 
 user: $(USERBIN)
+
+## logo    -- print the boot banner in colour, without booting anything.
+##            Regenerate it from the artwork with:
+##              python3 toascii.py assets/logo.png 72 > src/banner_art.txt
+logo:
+	@cat src/banner.txt
 
 ## build   -- compile the kernel ELF.
 ##            Only --bin lebos, so a broken main2.rs can never block this.
