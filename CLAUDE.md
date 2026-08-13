@@ -212,12 +212,20 @@ changes the job:
 
 ## The logo -- DECIDED, day 2
 
-**A prism.** His call, and it earns its place: white light goes in unchanged
-and a spectrum comes out. The prism does not alter the light, it reveals what
-was already in it -- which is what a query does to an object. One thing, many
-views, no single correct one, and no hierarchy among the colours.
+**A prism.** His call, and it works on two levels at once.
 
-Do not redesign this into something with folders in it.
+The mechanism: white light goes in unchanged and a spectrum comes out. The
+prism does not alter the light, it reveals what was already in it -- which is
+exactly what a query does to an object. One thing, many views, no single
+correct one, and no hierarchy among the colours.
+
+The pun: **the input is WHITE LIGHT, and LeBlanc is French for "the white."**
+The logo takes in the author's name and returns every way of seeing it. LeBOS
+is LeBlanc OS, so the mark contains the author, the system and the design
+thesis in one shape.
+
+Do not redesign this into something with folders in it, and do not lose the
+white-light input -- that is the whole joke.
 
 ## Easter eggs and tributes
 
