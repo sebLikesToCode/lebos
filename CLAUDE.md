@@ -243,6 +243,15 @@ Two open notes on the draft:
   before the rainbow does.
 - Not final.
 
+**It boots in colour.** `toascii.py` renders `assets/logo.png` into
+`src/banner.txt`, which the kernel embeds with `include_str!` and prints as its
+first output. Colour costs nothing: ANSI escapes are the interface every
+terminal has understood since the 1970s, and `-nographic` hands the serial line
+straight to the real one -- so LeBOS renders its own logo in 24-bit colour
+three milestones before it owns a pixel. Escapes are emitted only where the
+colour CHANGES, since otherwise every character carries 19 bytes of preamble.
+Regenerate the banner whenever the logo changes; do not hand-edit it.
+
 ## Easter eggs and tributes
 
 The author wants this codebase full of them. **Flag the opportunity whenever

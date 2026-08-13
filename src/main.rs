@@ -49,14 +49,18 @@ const USER_BASE: usize = 0x1000;
 ///
 /// Legal note for the confused: LeBOS is also a French womenswear label. This
 /// is the other one.
-const BANNER: &str = r"
- _          ____   ___  ____
-| |    ___ | __ ) / _ \/ ___|
-| |   / _ \|  _ \| | | \___ \
-| |__|  __/| |_) | |_| |___) |
-|_____\___||____/ \___/|____/
-        no files. no paths. no regrets.
-";
+/// The boot banner, generated from the logo by `toascii.py` and embedded
+/// verbatim.
+///
+/// It is in colour, which costs nothing: ANSI escape codes are the interface
+/// every terminal has understood since the 1970s, and QEMU's `-nographic`
+/// hands the serial line straight to the real one. So the kernel renders its
+/// own logo, in 24-bit colour, three milestones before it owns a single pixel.
+///
+/// An escape is only emitted where the colour CHANGES -- otherwise each
+/// character carries 19 bytes of preamble and the banner outweighs the frame
+/// allocator.
+const BANNER: &str = include_str!("banner.txt");
 
 macro_rules! print {
     ($($arg:tt)*) => {
