@@ -38,12 +38,32 @@ pub extern "C" fn kmain(_hartid: usize, _dtb: *const u8) -> ! {
     //  say something. The UART lives at 0x1000_0000 and writing a byte
     //  to that address sends it out the serial port.
     // ---------------------------------------------------------------
-
+    puts("hi");
+    puts("im doin this myself");
     loop {
         // Wait For Interrupt: parks the core instead of spinning it at 100%.
         unsafe { core::arch::asm!("wfi") };
     }
 }
+
+// prints a byte literal character. if it is a newline, isers \r (cairrage return) to return to the start of the next line.
+// uses write volatile because rust would delete it in the end
+fn putchar(c: u8) {
+    unsafe {
+        core::ptr::write_volatile(0x1000_0000 as *mut u8, c);
+    }
+    if c == b'\n' {
+            putchar(b'\r');
+    }
+}
+
+// puts a string of byte literals down with putchar
+fn puts(s: &str) {
+    for c in s.bytes() {
+        putchar(c);
+    }
+}
+
 
 /// Where a panic ends up.
 ///
