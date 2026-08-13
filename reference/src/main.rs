@@ -153,7 +153,7 @@ pub extern "C" fn kmain(hartid: usize, dtb: *const u8) -> ! {
         core::arch::asm!("csrw stvec, {}", in(reg) trap_entry as *const () as usize);
     }
 
-    println!("{}", BANNER);
+    
     println!("hart {} | dtb at {:#x}", hartid, dtb as usize);
 
     // Ask the machine how much RAM it has instead of assuming.

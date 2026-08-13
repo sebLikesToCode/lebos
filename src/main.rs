@@ -23,6 +23,8 @@ fn _print(args: fmt::Arguments) {
     let _ = Uart.write_fmt(args);
 }
 
+const BANNER: &str = include_str!("banner.txt");
+
 macro_rules! print {
     ($($arg:tt)*) => { _print(format_args!($($arg)*)) };
 }
@@ -45,15 +47,15 @@ core::arch::global_asm!(include_str!("entry.S"));
 /// `-> !` means this never returns. There is nothing to return TO.
 #[no_mangle]
 pub extern "C" fn kmain(_hartid: usize, _dtb: *const u8) -> ! {
-    // ---------------------------------------------------------------
-    //  Nothing here yet, so booting this prints nothing at all.
-    //
-    //  Milestone 2 is the first thing that is yours: make the machine
-    //  say something. The UART lives at 0x1000_0000 and writing a byte
-    //  to that address sends it out the serial port.
-    // ---------------------------------------------------------------
-    println!("LeBOS. {} + {} = {}", 2, 2, 4);
-    println!("UART at {:#x}", 0x1000_0000);
+
+    unsafe {
+        core::arch::asm!("csrw stvec, {}", in(reg) trap_handler as *const () as usize);
+    }
+
+    //unsafe { core::arch::asm!("unimp") };
+
+    println!("{}", BANNER);
+
     loop {
         // Wait For Interrupt: parks the core instead of spinning it at 100%.
         unsafe { core::arch::asm!("wfi") };
@@ -83,6 +85,25 @@ impl Write for Uart {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         puts(s);
         Ok(())
+    }
+}
+
+fn trap_handler() {
+    let cause: usize;
+    let val: usize;
+    let sep: usize;
+
+    unsafe {
+        core::arch::asm!("csrr {}, scause", out(reg) cause);
+        core::arch::asm!("csrr {}, stval", out(reg) val);
+        core::arch::asm!("csrr {}, sepc", out(reg) sep);
+    }
+    println!("TRAP");
+    println!("sepc = {}", sep);
+    println!("scause = {}", cause);
+    println!("stval = {}", val);
+    loop {
+        unsafe { core::arch::asm!("wfi") };
     }
 }
 

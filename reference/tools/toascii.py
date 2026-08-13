@@ -2,7 +2,7 @@
 """
 Turn the LeBOS logo into a coloured ASCII boot banner.
 
-    python3 toascii.py assets/logo.png 72 > src/banner_art.txt
+    python3 reference/tools/toascii.py reference/assets/logo.png 72
 
 The committed banner is src/banner.txt: this art with the wordmark appended.
 
