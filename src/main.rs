@@ -36,6 +36,13 @@ static TICKS: AtomicU64 = AtomicU64::new(0);
 /// ELF parser and a way to name one without a path. That is milestone 19.
 static USER_PROG: &[u8] = include_bytes!("../user/hello.elf");
 
+/// The shell, which is now an ordinary program like any other.
+///
+/// Baked into the kernel image only to seed a blank disk -- something has to
+/// put the first program in the store, and xv6 does exactly this with
+/// `initcode`. Once saved, it is reached the way everything else is: by query.
+static SHELL_PROG: &[u8] = include_bytes!("../user/shell.elf");
+
 /// Where user programs are mapped. Not 0, so that a null dereference faults
 /// rather than silently reading whatever sits at address zero. Must match
 /// `. = 0x1000` in user/user.ld.
@@ -485,14 +492,25 @@ extern "C" fn kmain_high() -> ! {
     // Its bytes still come from the kernel image -- something has to seed the
     // store on a blank disk, the same bootstrap xv6 does with initcode. But
     // from here on it is reached the way everything else is: by query.
-    let prog_id = store_create(
+    let hello_id = store_create(
         USER_PROG.to_vec(),
         alloc::vec![
             ("name".into(), Value::Text("hello".into())),
             ("type".into(), Value::Text("program".into())),
         ],
     );
-    println!("exec: seeded the store with `hello` -- #{:016x}", prog_id.0);
+    let shell_id = store_create(
+        SHELL_PROG.to_vec(),
+        alloc::vec![
+            ("name".into(), Value::Text("shell".into())),
+            ("type".into(), Value::Text("program".into())),
+        ],
+    );
+    println!(
+        "exec: seeded `hello` #{:012x} and `shell` #{:012x}",
+        hello_id.0 & 0xffff_ffff_ffff,
+        shell_id.0 & 0xffff_ffff_ffff
+    );
 
     let a_root = process_spawn("procA", b'A', USER_PROG).unwrap_or(0);
     let b_root = process_spawn("procB", b'B', USER_PROG).unwrap_or(0);
@@ -517,8 +535,16 @@ extern "C" fn kmain_high() -> ! {
     // Milestone 15: the console stops being polled.
     plic_init();
 
-    // Milestone 14: hand the machine over to whoever is typing.
-    thread_spawn("shell", shell);
+    // Milestone 20: hand the machine over -- to a PROGRAM, not a thread.
+    //
+    // The shell used to be a kernel thread, which meant every command you
+    // typed ran in supervisor mode with unrestricted access to physical
+    // memory. It is a user process now: it reaches the store only through
+    // validated syscalls, and if it crashes the machine survives it.
+    match process_spawn("shell", b'S', SHELL_PROG) {
+        Some(_) => {}
+        None => println!("BOOT FAILED: the shell is not a program this machine can run"),
+    }
 
     // Thread 0 is now init. Everything spawned at boot is its child, and a
     // zombie nobody collects is a table slot and 16 KiB held forever -- which
@@ -1618,7 +1644,7 @@ unsafe fn copy_to_user(addr: usize, byte: u8) {
 ///
 /// Same shape as the on-disk record and the create request, deliberately: one
 /// wire format, learned once.
-fn serialize_object(id: ObjId) -> Option<alloc::vec::Vec<u8>> {
+fn serialize_object(id: ObjId, meta_only: bool) -> Option<alloc::vec::Vec<u8>> {
     let (content, attrs) = {
         let store = STORE.lock();
         let o = store.get(&id)?;
@@ -1638,11 +1664,14 @@ fn serialize_object(id: ObjId) -> Option<alloc::vec::Vec<u8>> {
         w.blob(k.as_bytes());
         w.value(v);
     }
-    // The bytes last, so a caller that only wants metadata can stop early.
-    // An evicted object has none, and that is a fact rather than a failure.
-    match BLOBS.lock().get(&content) {
-        Some(b) => w.blob(b),
-        None => w.u32(0),
+    // Length always, bytes only if asked for. An evicted object reports 0,
+    // which is a fact rather than a failure.
+    let len = BLOBS.lock().get(&content).map(|b| b.len()).unwrap_or(0);
+    w.u32(len as u32);
+    if !meta_only {
+        if let Some(b) = BLOBS.lock().get(&content) {
+            w.0.extend_from_slice(b);
+        }
     }
     Some(w.0)
 }
@@ -3079,6 +3108,11 @@ fn parse_query(buf: &[u8]) -> Option<alloc::vec::Vec<OwnedCond>> {
         conds.push(match op {
             0 => OwnedCond::Eq(key, r.text()?),
             1 => OwnedCond::Between(key, r.i64()?, r.i64()?),
+            2 => OwnedCond::Contains(key, r.text()?),
+            // The key is read and discarded for Hidden -- it keeps the wire
+            // format uniform (op, key, payload) so a parser never has to know
+            // which ops carry one.
+            3 => OwnedCond::Hidden(r.u8()? != 0),
             _ => return None,
         });
     }
@@ -3092,6 +3126,11 @@ enum OwnedCond {
     /// Substring match. Legal ONLY because a name is a label and not an
     /// address -- `open("todo.txt")` must be exact, `name ~ todo` need not be.
     Contains(alloc::string::String, alloc::string::String),
+    /// Which side of the hidden line to look at. Not an attribute -- hidden is
+    /// a CLAIM, so it is answered from the claim log rather than the object.
+    /// `Hidden(true)` IS the Cluttered view, and it is the same query with one
+    /// boolean flipped rather than a separate code path.
+    Hidden(bool),
 }
 
 fn matches_owned(obj: &Object, c: &OwnedCond) -> bool {
@@ -3103,10 +3142,24 @@ fn matches_owned(obj: &Object, c: &OwnedCond) -> bool {
         OwnedCond::Contains(k, needle) => {
             matches!(obj.attr(k), Some(Value::Text(t)) if t.contains(needle.as_str()))
         }
+        // Handled by store_query_owned, which needs the claim log rather than
+        // the object. Always true here so it never filters anything twice.
+        OwnedCond::Hidden(_) => true,
     }
 }
 
 fn store_query_owned(conds: &[OwnedCond]) -> alloc::vec::Vec<ObjId> {
+    // Hidden is not an attribute, so it is pulled out and answered separately
+    // from the claim log. Absent, it defaults to false -- hidden objects drop
+    // out unless you ask for them, which is what makes hiding useful.
+    let want_hidden = conds
+        .iter()
+        .find_map(|c| match c {
+            OwnedCond::Hidden(v) => Some(*v),
+            _ => None,
+        })
+        .unwrap_or(false);
+
     let ids: alloc::vec::Vec<ObjId> = {
         let store = STORE.lock();
         store
@@ -3115,7 +3168,9 @@ fn store_query_owned(conds: &[OwnedCond]) -> alloc::vec::Vec<ObjId> {
             .map(|o| o.id)
             .collect()
     };
-    ids.into_iter().filter(|id| !is_hidden(*id)).collect()
+    ids.into_iter()
+        .filter(|id| is_hidden(*id) == want_hidden)
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -3507,471 +3562,18 @@ fn blk_rw(sector: u64, buf_phys: usize, write: bool) -> bool {
 }
 
 // ===========================================================================
-// The shell -- milestone 14
+// The shell used to live here -- milestones 14 through 19.
 //
-// Every shell ever written resolves a NAME to a LOCATION. `cat notes.txt`
-// means "walk the tree to this leaf." This one cannot: there is no tree, no
-// leaf, and nothing has a location.
+// It is a user program now (`user/src/bin/shell.rs`), and about 280 lines came
+// out of this file when it moved. Everything it did was policy: what a
+// predicate means, how to format a table, which verb `hide` is short for, what
+// counts as a line of input. None of that needed supervisor mode; it lived
+// here only because the kernel was the only place with a heap.
 //
-// So an argument is one of exactly two things:
-//
-//     a QUERY            find type=python created>100
-//     an INDEX into the last result set   hide 2
-//
-// The numbered list is what replaces a path. It is ephemeral, contextual and
-// meaningless a minute later -- which is fine, because you are looking at it
-// while you use it. That is what "narrow to ~20 so a human can scan" was for.
-//
-// Friction is matched to consequence, deliberately: `hide` is silent because
-// it destroys nothing, `evict` and `forget` announce exactly what they did.
+// What stayed behind is mechanism -- read a byte, fetch an object, run a verb,
+// spawn a program, flush to disk. The kernel no longer has an opinion about
+// how any of it should look.
 // ===========================================================================
-
-/// The last result set. THIS IS THE PATH REPLACEMENT.
-static LAST: SpinLock<alloc::vec::Vec<ObjId>> = SpinLock::new(alloc::vec::Vec::new());
-
-const MAX_LINE: usize = 256;
-
-/// Read one line, echoing as it goes.
-///
-/// The terminal is raw: no line buffering, no echo, no editing. A keystroke
-/// arrives as a single byte and NOTHING appears on screen unless this function
-/// puts it there. Backspace is not an action, it is the byte 0x7f -- erasing
-/// means printing "\x08 \x08": step left, paint a space over the character,
-/// step left again. Everything a terminal seems to do for free is done here.
-fn readline() -> alloc::string::String {
-    let mut line = alloc::string::String::new();
-    loop {
-        let c = getchar_blocking();
-        match c {
-            b'\r' | b'\n' => {
-                println!();
-                return line;
-            }
-            0x7f | 0x08 => {
-                if line.pop().is_some() {
-                    puts("\x08 \x08");
-                }
-            }
-            0x15 => {
-                // Ctrl-U: kill the line.
-                while line.pop().is_some() {
-                    puts("\x08 \x08");
-                }
-            }
-            // Printable, and there is room. A full line stops echoing rather
-            // than growing without bound -- the guard is the only thing
-            // between a held-down key and the heap.
-            0x20..=0x7e if line.len() < MAX_LINE => {
-                line.push(c as char);
-                putchar(c);
-            }
-            _ => {} // control characters, and overflow, are dropped
-        }
-    }
-}
-
-/// Parse one predicate: `key=value`, `key~substring`, `key>n`, `key<n`.
-///
-/// Four operators is not a limitation, it is the whole retrieval model. Eq
-/// narrows by kind, `~` by name, and `<`/`>` by time -- and time is the axis
-/// that narrows hardest, which is exactly why attribute values are typed.
-fn parse_pred(s: &str) -> Option<OwnedCond> {
-    for (i, ch) in s.char_indices() {
-        // Short names for the attributes worth typing constantly. Aliases are
-        // safe here in a way a path alias never is: this expands a LABEL, and
-        // if it expands to something nothing has, the query simply returns
-        // nothing. There is no wrong directory to end up in.
-        let key = match &s[..i] {
-            "t" => "created_at",
-            "n" => "name",
-            k => k,
-        };
-        let rest = &s[i + ch.len_utf8()..];
-        if key.is_empty() {
-            continue;
-        }
-        return Some(match ch {
-            '=' => OwnedCond::Eq(key.into(), rest.into()),
-            '~' => OwnedCond::Contains(key.into(), rest.into()),
-            '>' => OwnedCond::Between(key.into(), rest.parse::<i64>().ok()? + 1, i64::MAX),
-            '<' => OwnedCond::Between(key.into(), i64::MIN, rest.parse::<i64>().ok()? - 1),
-            _ => continue,
-        });
-    }
-    None
-}
-
-/// Run a query and remember the answer as the new result set.
-///
-/// `hidden` selects which of the two views you get: the default drops hidden
-/// objects, and asking for them IS the Cluttered folder. No special case in
-/// the store -- it is one boolean over the same query.
-fn shell_find(conds: &[OwnedCond], hidden: bool) {
-    let ids: alloc::vec::Vec<ObjId> = {
-        let store = STORE.lock();
-        store
-            .values()
-            .filter(|o| conds.iter().all(|c| matches_owned(o, c)))
-            .map(|o| o.id)
-            .collect()
-    };
-    let ids: alloc::vec::Vec<ObjId> = ids
-        .into_iter()
-        .filter(|id| is_hidden(*id) == hidden)
-        .collect();
-
-    if ids.is_empty() {
-        println!("  nothing matches");
-    }
-    for (i, id) in ids.iter().enumerate() {
-        // Copy out what we need, THEN drop the lock. Holding STORE while
-        // calling blob_len would be fine (different lock), but holding it
-        // while printing is a long time to stop the world.
-        let row = {
-            let store = STORE.lock();
-            store.get(id).map(|o| {
-                let name = match o.attr("name") {
-                    Some(Value::Text(t)) => t.clone(),
-                    _ => alloc::string::String::from("(unnamed)"),
-                };
-                let kind = match o.attr("type") {
-                    Some(Value::Text(t)) => t.clone(),
-                    _ => alloc::string::String::from("-"),
-                };
-                let when = match o.attr("created_at") {
-                    Some(Value::Int(n)) => *n,
-                    _ => -1,
-                };
-                (name, kind, when, o.content)
-            })
-        };
-        if let Some((name, kind, when, content)) = row {
-            let bytes = blob_len(content);
-            println!(
-                "  {:>2}  {:<18} {:<9} t={:<6} {:>5}b  #{:012x}{}",
-                i,
-                name,
-                kind,
-                when,
-                bytes,
-                id.0 & 0xffff_ffff_ffff,
-                if bytes == 0 { "  [evicted]" } else { "" }
-            );
-        }
-    }
-    *LAST.lock() = ids;
-}
-
-/// Turn "2" into the object it named in the last result set.
-///
-/// The error message matters: an index is only meaningful relative to a query
-/// you just ran, so saying so is more useful than "not found".
-fn shell_pick(arg: Option<&str>) -> Option<ObjId> {
-    let n: usize = match arg.and_then(|a| a.parse().ok()) {
-        Some(n) => n,
-        None => {
-            println!("  that wants a number from the last result list");
-            return None;
-        }
-    };
-    let last = LAST.lock();
-    match last.get(n) {
-        Some(id) => Some(*id),
-        None => {
-            println!("  no {} in the last result list ({} shown)", n, last.len());
-            None
-        }
-    }
-}
-
-fn shell_show(id: ObjId) {
-    let (attrs, content) = {
-        let store = STORE.lock();
-        match store.get(&id) {
-            Some(o) => (
-                o.attrs
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect::<alloc::vec::Vec<_>>(),
-                o.content,
-            ),
-            None => {
-                println!("  gone -- forgotten, not merely hidden");
-                return;
-            }
-        }
-    };
-    println!("  id         #{:016x}", id.0);
-    println!("  content    #{:016x}", content.0);
-    for (k, v) in &attrs {
-        match v {
-            Value::Int(n) => println!("  {:<10} {}", k, n),
-            Value::Text(t) => println!("  {:<10} {}", k, t),
-            Value::Id(i) => println!("  {:<10} #{:016x}", k, i.0),
-            Value::Bytes(b) => println!("  {:<10} {} bytes", k, b.len()),
-        }
-    }
-    match BLOBS.lock().get(&content) {
-        Some(b) => {
-            print!("  ----\n  ");
-            for &c in b.iter() {
-                putchar(if (0x20..0x7f).contains(&c) || c == b'\n' {
-                    c
-                } else {
-                    b'.'
-                });
-            }
-            println!();
-        }
-        None => println!("  ---- bytes evicted; the record still means something"),
-    }
-}
-
-fn shell_help() {
-    println!("  find <preds>     narrow the store. no preds = everything");
-    println!("  cluttered        the hidden ones. a saved query, not a folder");
-    println!("  show N           N indexes the LAST result list");
-    println!("  new <type> <name> <text...>");
-    println!("  hide N | unhide N        clutter    -- reversible");
-    println!("  evict N                  space      -- bytes go, record stays");
-    println!("  forget N                 privacy    -- both go");
-    println!("  save | load | stats | help");
-    println!();
-    println!("  preds:  type=python   name~brick   created_at>100   t<200");
-    println!("          t = created_at, n = name");
-    println!("  there are no filenames to type, because there are no files.");
-}
-
-fn shell_stats() {
-    let (blocks, free) = heap_stats();
-    println!(
-        "  {} objects, {} blobs, {} claims, {} events",
-        STORE.lock().len(),
-        BLOBS.lock().len(),
-        CLAIMS.lock().len(),
-        EVENTS.lock().len()
-    );
-    // Free BLOCKS, not used bytes. A rising block count against a flat byte
-    // count is fragmentation, and is the number worth watching.
-    println!("  heap {} bytes free in {} block(s)", free, blocks);
-    println!(
-        "  up {} ticks ({}s)",
-        TICKS.load(Ordering::Relaxed),
-        TICKS.load(Ordering::Relaxed) / 100
-    );
-    // The proof that milestone 15 is real. If this climbs while you type,
-    // nothing anywhere is polling the UART -- the chip is raising IRQ 10 and
-    // the PLIC is routing it here.
-    println!(
-        "  {} bytes arrived by interrupt",
-        CONSOLE_IRQS.load(Ordering::Relaxed)
-    );
-}
-
-/// The shell thread. Never returns; it is the machine's front door.
-extern "C" fn shell() -> ! {
-    println!();
-    println!("LeBOS shell. There are no paths. Type `help`.");
-
-    loop {
-        print!("> ");
-        let line = readline();
-        let mut words = line.split_whitespace();
-        let cmd = match words.next() {
-            Some(c) => c,
-            None => continue,
-        };
-        let rest: alloc::vec::Vec<&str> = words.collect();
-
-        match cmd {
-            "help" | "?" => shell_help(),
-
-            "find" | "ls" => {
-                let mut conds = alloc::vec::Vec::new();
-                let mut bad = false;
-                for w in &rest {
-                    match parse_pred(w) {
-                        Some(c) => conds.push(c),
-                        None => {
-                            println!("  `{}` is not a predicate -- try type=python", w);
-                            bad = true;
-                        }
-                    }
-                }
-                if !bad {
-                    shell_find(&conds, false);
-                }
-            }
-
-            "cluttered" => shell_find(&[], true),
-
-            "new" => {
-                if rest.len() < 3 {
-                    println!("  new <type> <name> <text...>");
-                    continue;
-                }
-                let text = rest[2..].join(" ");
-                let id = store_create(
-                    text.clone().into_bytes(),
-                    alloc::vec![
-                        ("name".into(), Value::Text(rest[1].into())),
-                        ("type".into(), Value::Text(rest[0].into())),
-                        (
-                            "created_at".into(),
-                            Value::Int(TICKS.load(Ordering::Relaxed) as i64)
-                        ),
-                    ],
-                );
-                log_event(id);
-                println!("  #{:016x}", id.0);
-            }
-
-            "show" | "cat" => {
-                if let Some(id) = shell_pick(rest.first().copied()) {
-                    log_event(id);
-                    shell_show(id);
-                }
-            }
-
-            // Silent on success: hiding destroys nothing, so it should not
-            // demand attention. The three verbs get three different volumes.
-            "hide" => {
-                if let Some(id) = shell_pick(rest.first().copied()) {
-                    hide(id, true);
-                }
-            }
-            "unhide" => {
-                if let Some(id) = shell_pick(rest.first().copied()) {
-                    hide(id, false);
-                }
-            }
-            "evict" => {
-                if let Some(id) = shell_pick(rest.first().copied()) {
-                    evict(id);
-                    println!("  bytes gone. the record still answers questions.");
-                }
-            }
-            "forget" => {
-                if let Some(id) = shell_pick(rest.first().copied()) {
-                    forget(id);
-                    println!("  gone. that was the point.");
-                }
-            }
-
-            "save" => {
-                if store_save() {
-                    println!("  written to disk");
-                } else {
-                    println!("  SAVE FAILED");
-                }
-            }
-            "load" => match store_load() {
-                Some((b, o, c)) => println!("  replayed {} blobs, {} objects, {} claims", b, o, c),
-                None => println!("  no LeBOS store on that disk"),
-            },
-
-            "stats" => shell_stats(),
-
-            "ps" => {
-                let threads = THREADS.lock();
-                for (i, t) in threads.iter().enumerate() {
-                    let state = match t.state {
-                        ThreadState::Runnable => alloc::string::String::from("runnable"),
-                        ThreadState::Sleeping(c) => alloc::format!("sleeping on {:#x}", c),
-                        ThreadState::Zombie(c) => alloc::format!("zombie (exit {})", c),
-                        ThreadState::Free => alloc::string::String::from("-- free slot --"),
-                    };
-                    println!("  {:>2}  {:<8} {}", i, t.name, state);
-                }
-            }
-
-            // EXEC BY QUERY.
-            //
-            // Every operating system that has shipped resolves a NAME to a
-            // LOCATION here -- execve("/bin/sh") walks a tree to a leaf. There
-            // is no tree. So a program is an object with type=program, and
-            // running one means running a query.
-            //
-            // Ambiguity therefore stops being an error. Two matches is not
-            // "not found", it is a numbered list, which is the same interface
-            // as everything else in this shell because it is the same
-            // operation.
-            "run" => {
-                let mut conds = alloc::vec![OwnedCond::Eq("type".into(), "program".into())];
-                let mut bad = false;
-                for w in &rest {
-                    match parse_pred(w) {
-                        Some(c) => conds.push(c),
-                        None => {
-                            println!("  `{}` is not a predicate", w);
-                            bad = true;
-                        }
-                    }
-                }
-                if bad {
-                    continue;
-                }
-
-                let ids = store_query_owned(&conds);
-                match ids.len() {
-                    0 => println!("  no program matches. `find type=program` to see them"),
-                    1 => {
-                        let bytes = {
-                            let store = STORE.lock();
-                            let content = store.get(&ids[0]).map(|o| o.content);
-                            drop(store);
-                            content.and_then(|c| BLOBS.lock().get(&c).cloned())
-                        };
-                        match bytes {
-                            // The bytes are evicted: the record still names a
-                            // real program, and there is nothing left to run.
-                            // Only a store that separates those two ideas can
-                            // even express this.
-                            None => println!("  that program's bytes were evicted"),
-                            Some(b) => match process_spawn("child", b'C', &b) {
-                                None => println!("  not a program this machine can run"),
-                                Some(_) => match thread_wait() {
-                                    Some((n, code)) => println!("  {} exited with {}", n, code),
-                                    None => println!("  nothing to wait for"),
-                                },
-                            },
-                        }
-                    }
-                    _ => {
-                        println!("  {} programs match. narrow it:", ids.len());
-                        shell_find(&conds, false);
-                    }
-                }
-            }
-
-            // The commands people will reach for out of muscle memory. Every
-            // one of them is a path operation, and none of them can mean
-            // anything here -- so say why rather than "command not found".
-            "cd" | "pwd" | "mkdir" | "rmdir" | "touch" | "mv" | "cp" | "rm" => {
-                println!(
-                    "  `{}` needs somewhere to put things. there is nowhere.",
-                    cmd
-                );
-                println!(
-                    "  nothing is anywhere. describe it instead: find name~{}",
-                    "todo"
-                );
-            }
-
-            // "if you see me use ubuntu, i might say hi,
-            //   but if you see me using arch, i'm a talkative guy"
-            //        -- "Too Late I Already Deleted Windows", parody, via Seb
-            //
-            // Which is the correct song to quote in the one shell on earth
-            // where deleting Windows would not be enough -- the paths would
-            // still be there.
-            "ubuntu" => println!("  hi"),
-            "arch" => println!("  blah blah blah"),
-
-            _ => println!("  no such command: {}. try `help`.", cmd),
-        }
-    }
-}
 
 // ===========================================================================
 // Persistence -- milestone 13b
@@ -4782,7 +4384,11 @@ extern "C" fn trap_handler(frame: &mut TrapFrame) {
                     usize::MAX
                 } else {
                     let id = ObjId(arg0 as u64);
-                    match serialize_object(id) {
+                    // a3 != 0 asks for metadata only. Listing twenty results
+                    // should not copy twenty programs across the privilege
+                    // boundary -- the shell wants a name, a type and a size.
+                    let meta_only = frame.x[13] != 0;
+                    match serialize_object(id, meta_only) {
                         Some(buf) if buf.len() <= cap => {
                             log_event(id);
                             for (i, b) in buf.iter().enumerate() {
@@ -4849,6 +4455,33 @@ extern "C" fn trap_handler(frame: &mut TrapFrame) {
                     usize::MAX
                 }
             }
+
+            // spawn(id) -> 0, or usize::MAX. Run the program in object `id`.
+            //
+            // The caller passes an ID, not a path, because there are no paths.
+            // Choosing WHICH id is a query, and a query is something userspace
+            // does for itself -- the kernel is only asked to run this one.
+            9 => {
+                let id = ObjId(arg0 as u64);
+                let bytes = {
+                    let content = STORE.lock().get(&id).map(|o| o.content);
+                    content.and_then(|c| BLOBS.lock().get(&c).cloned())
+                };
+                match bytes {
+                    None => usize::MAX,
+                    Some(b) => match process_spawn("child", b'C', &b) {
+                        Some(_) => 0,
+                        None => usize::MAX,
+                    },
+                }
+            }
+
+            // wait() -> the exit code of one dead child, or usize::MAX if
+            // there are none. Blocks until a child exits.
+            10 => match thread_wait() {
+                Some((_, code)) => code as usize,
+                None => usize::MAX,
+            },
 
             _ => {
                 println!("user: unknown syscall {}", num);

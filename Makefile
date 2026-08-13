@@ -23,6 +23,8 @@ $(DISK):
         play resync playdiff user logo
 
 USERELF := user/target/$(TARGET)/debug/hello
+SHELLELF := user/target/$(TARGET)/debug/shell
+SHELLBIN := user/shell.elf
 USERBIN := user/hello.elf
 
 ## user    -- build the user program and flatten it to a raw binary.
@@ -36,12 +38,13 @@ USERBIN := user/hello.elf
 # because an ELF states where each segment goes and what may be done to it --
 # which a flat binary throws away, and which the kernel then had to guess at
 # with a hardcoded constant.
-$(USERBIN): user/src/main.rs user/user.ld
+$(USERBIN) $(SHELLBIN): user/src/main.rs user/src/sys.rs user/src/bin/shell.rs user/user.ld
 	cd user && RUSTFLAGS="-C code-model=medium -C link-arg=-Tuser.ld" cargo build
 	rust-objcopy --strip-all $(USERELF) $(USERBIN)
-	@echo "user program: $$(stat -c%s $(USERBIN)) bytes (ELF)"
+	rust-objcopy --strip-all $(SHELLELF) $(SHELLBIN)
+	@echo "hello: $$(stat -c%s $(USERBIN)) bytes | shell: $$(stat -c%s $(SHELLBIN)) bytes"
 
-user: $(USERBIN)
+user: $(USERBIN) $(SHELLBIN)
 
 ## logo    -- print the boot banner in colour, without booting anything.
 ##            Regenerate it from the artwork with:
@@ -51,7 +54,7 @@ logo:
 
 ## build   -- compile the kernel ELF.
 ##            Only --bin lebos, so a broken main2.rs can never block this.
-build: $(USERBIN) $(PLAY) $(DISK)
+build: $(USERBIN) $(SHELLBIN) $(PLAY) $(DISK)
 	cargo build --bin lebos
 
 ## run     -- boot the kernel in QEMU. Quit with: Ctrl-A then X
@@ -140,5 +143,5 @@ fmt:
 clean:
 	cargo clean
 	cd user && cargo clean
-	rm -f $(USERBIN)
+	rm -f $(USERBIN) $(SHELLBIN)
 	rm -f qemu.log virt.dtb virt.dts $(DISK)
