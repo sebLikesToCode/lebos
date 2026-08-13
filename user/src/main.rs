@@ -41,6 +41,97 @@ const SYS_WRITE: usize = 1;
 const SYS_CREATE: usize = 2;
 const SYS_QUERY: usize = 3;
 const SYS_SBRK: usize = 4;
+const SYS_READ: usize = 5;
+const SYS_GET: usize = 6;
+const SYS_VERB: usize = 7;
+const SYS_SAVE: usize = 8;
+
+/// One byte from the console. Blocks until someone types.
+///
+/// The kernel hands over bytes and nothing else -- echo, backspace and the
+/// whole notion of a "line" are built below, in this program, because every
+/// one of them is policy.
+fn read_char() -> u8 {
+    unsafe { syscall4(SYS_READ, 0, 0, 0, 0) as u8 }
+}
+
+fn verb(id: u64, which: usize) -> bool {
+    unsafe { syscall4(SYS_VERB, id as usize, which, 0, 0) != usize::MAX }
+}
+
+fn save() -> bool {
+    unsafe { syscall4(SYS_SAVE, 0, 0, 0, 0) != usize::MAX }
+}
+
+/// Fetch one object into a buffer we own. `alloc` exists now, so this can grow
+/// to fit instead of guessing -- which is exactly what milestone 17 bought.
+fn get(id: u64) -> Option<alloc::vec::Vec<u8>> {
+    let mut cap = 256;
+    loop {
+        let mut buf = alloc::vec![0u8; cap];
+        let n = unsafe { syscall4(SYS_GET, id as usize, buf.as_mut_ptr() as usize, cap, 0) };
+        if n == usize::MAX {
+            return None;
+        }
+        // Top bit set means "too small, and here is the size you need".
+        // Truncating would have handed back a half-object that still parses.
+        if n & (1 << 63) != 0 {
+            cap = n & !(1 << 63);
+            continue;
+        }
+        buf.truncate(n);
+        return Some(buf);
+    }
+}
+
+/// Read a line, echoing as it goes. THIS IS THE SHELL'S LINE EDITOR, and it
+/// runs in user mode -- the kernel never sees a line, only bytes.
+fn read_line() -> alloc::string::String {
+    let mut line = alloc::string::String::new();
+    loop {
+        let c = read_char();
+        match c {
+            b'\r' | b'\n' => {
+                write(b"\n");
+                return line;
+            }
+            0x7f | 0x08 => {
+                if line.pop().is_some() {
+                    write(b"\x08 \x08");
+                }
+            }
+            0x20..=0x7e => {
+                line.push(c as char);
+                write(&[c]);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Walks a packed buffer without ever running off the end.
+struct Rd<'a> {
+    b: &'a [u8],
+    i: usize,
+}
+
+impl<'a> Rd<'a> {
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        let out = self.b.get(self.i..self.i + n)?;
+        self.i += n;
+        Some(out)
+    }
+    fn u32(&mut self) -> Option<u32> {
+        Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
+    }
+    fn u64(&mut self) -> Option<u64> {
+        Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
+    }
+    fn blob(&mut self) -> Option<&'a [u8]> {
+        let n = self.u32()? as usize;
+        self.take(n)
+    }
+}
 
 /// Ask the kernel to move this program's break outward, and get back where it
 /// USED to be -- which is the first address of the new memory.
@@ -325,6 +416,79 @@ extern "C" fn umain(tag: usize) -> ! {
     write(b"\nuser: break is now ");
     print_num(sbrk(0));
     write(b"\n");
+
+    // Milestone 18: the whole shell loop, from userspace.
+    //
+    // Only the child spawned by `run` does this. procA and procB start at boot
+    // alongside the kernel's own shell, and two readers pulling from one
+    // console ring would race for every keystroke. `run` blocks the kernel
+    // shell in thread_wait, which is what makes the console free to take.
+    if tag == b'C' as usize {
+        write(b"child: type something, then enter> ");
+        let text = read_line();
+
+        // create -- the object is a statement about those bytes
+        let mut b = Buf::new();
+        b.u32(text.len() as u32);
+        b.raw(text.as_bytes());
+        b.u32(2);
+        b.text(b"name");
+        b.u8v(1);
+        b.text(b"typed");
+        b.text(b"type");
+        b.u8v(1);
+        b.text(b"note");
+        let id = unsafe { syscall4(SYS_CREATE, b.b.as_ptr() as usize, b.n, 0, 0) };
+
+        // get -- read it straight back out of the kernel's store
+        match get(id as u64) {
+            Some(raw) => {
+                let mut r = Rd { b: &raw, i: 0 };
+                let content = r.u64().unwrap_or(0);
+                let n = r.u32().unwrap_or(0);
+                write(b"child: object has ");
+                print_num(n as usize);
+                write(b" attributes, content #");
+                print_num(content as usize);
+                write(b"\n");
+                for _ in 0..n {
+                    let key = r.blob().unwrap_or(b"?");
+                    let kind = r.take(1).map(|k| k[0]).unwrap_or(255);
+                    write(b"child:   ");
+                    write(key);
+                    write(b" = ");
+                    match kind {
+                        0 => {
+                            let v = r.take(8).unwrap_or(&[0; 8]);
+                            print_num(i64::from_le_bytes(v.try_into().unwrap()) as usize);
+                        }
+                        1 => write(r.blob().unwrap_or(b"?")),
+                        _ => write(b"(other)"),
+                    }
+                    write(b"\n");
+                }
+                let bytes = r.blob().unwrap_or(b"");
+                write(b"child:   bytes = \"");
+                write(bytes);
+                write(b"\"\n");
+            }
+            None => write(b"child: get failed\n"),
+        }
+
+        // hide -- and then prove it left the default view but still exists
+        let hidden = verb(id as u64, 1);
+        let mut out = [0u64; 16];
+        let visible = find(b"note", 0, i64::MAX, &mut out);
+        write(b"child: hid it (");
+        print_num(if hidden { 1 } else { 0 });
+        write(b"), type=note now returns ");
+        print_num(visible);
+        write(b", but get still works: ");
+        print_num(if get(id as u64).is_some() { 1 } else { 0 });
+        write(b"\n");
+
+        write(if save() { b"child: saved to disk\n" } else { b"child: save failed\n" });
+    }
 
     unsafe { syscall4(SYS_EXIT, 0, 0, 0, 0) };
 

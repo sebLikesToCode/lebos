@@ -347,6 +347,26 @@ Syscall ABI, defined in user/src/main.rs:
     2  create(buf, len)                 -> object id, or usize::MAX
     3  query(buf, len, out, out_cap)    -> ids written, or usize::MAX
     4  sbrk(n)                          -> the OLD break, or usize::MAX
+    5  read_char()                      -> one byte, BLOCKS
+    6  get(id, buf, cap)                -> bytes written, or usize::MAX
+    7  verb(id, which)                  -> 0, or usize::MAX
+                                          0 unhide  1 hide  2 evict  3 forget
+    8  save()                           -> 0, or usize::MAX
+
+`read_char` hands over bytes and nothing else. **Echo, backspace and the whole
+notion of a "line" live in userspace**, because every one of them is policy --
+the kernel never sees a line.
+
+`get` returns "too small" as `needed | (1 << 63)` rather than truncating; a
+truncated object would still parse, which is worse than an error. `copy_to_user`
+mirrors `copy_from_user`: SUM on for exactly one store, off immediately.
+
+**A syscall a user program can panic the kernel with is a denial of service,
+not a syscall.** The first draft of `verb` ended its match with a `_ =>` arm
+that panicked, on the reasoning that the caller had validated the verb number
+-- and the caller is an untrusted program putting whatever it likes in `a1`.
+Every arm returns a value now, and the unknown case refuses. Check every match
+on user-supplied data for this.
 
 `sbrk(n)` moves the process's BREAK -- the boundary between mapped memory and
 nothing -- outward by n bytes and maps the pages behind it. It returns where
@@ -942,11 +962,10 @@ that existed. Phase VI ends with `lebos` being a kernel and nothing else.
 16. ✅ process lifecycle: exit, wait, reap, sleep/wake
 17. ✅ userspace memory: `sbrk` + a bump allocator. `Vec`, `String` and
     `format!` work in user programs
-18. ⬅ **current** — the store syscalls a shell needs: get, hide, evict,
-    forget, save, readline
-19. **exec-by-query** — a program is an object with `type=program`, so running
-    one means running a QUERY. `execve("/bin/sh")` is a path lookup in every OS
-    that has shipped; this cannot do that, and what replaces it is better.
+18. ✅ the syscalls a shell needs: read_char, get, verb, save
+19. ⬅ **current** — **exec-by-query**. A program is an object with
+    `type=program`, so running one means running a QUERY. Needs an ELF parser,
+    which also deletes the `USER_DATA_BASE` hack from 17.
 20. the shell as a user program, loaded from the store. Swap FNV-1a for
     SHA-256 here -- untrusted code can write to the store from this point.
 

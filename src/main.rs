@@ -1519,6 +1519,55 @@ fn enter_user(user_sp: usize, arg: usize) -> ! {
     }
 }
 
+/// Write one byte INTO user memory.
+///
+/// The mirror of `copy_from_user`, and it takes the same care: SUM is on for
+/// exactly one store and off again immediately. Leaving it on would mean a
+/// stray kernel pointer into user space silently succeeds instead of faulting,
+/// and accidents should stay loud.
+///
+/// The range must already have been checked with `user_range_writable`.
+unsafe fn copy_to_user(addr: usize, byte: u8) {
+    unsafe {
+        core::arch::asm!("csrs sstatus, {}", in(reg) 1_usize << 18); // SUM on
+        core::ptr::write_volatile(addr as *mut u8, byte);
+        core::arch::asm!("csrc sstatus, {}", in(reg) 1_usize << 18); // SUM off
+    }
+}
+
+/// Pack one object into a byte stream for `get`.
+///
+/// Same shape as the on-disk record and the create request, deliberately: one
+/// wire format, learned once.
+fn serialize_object(id: ObjId) -> Option<alloc::vec::Vec<u8>> {
+    let (content, attrs) = {
+        let store = STORE.lock();
+        let o = store.get(&id)?;
+        (
+            o.content,
+            o.attrs
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect::<alloc::vec::Vec<_>>(),
+        )
+    };
+
+    let mut w = Writer::new();
+    w.u64(content.0);
+    w.u32(attrs.len() as u32);
+    for (k, v) in &attrs {
+        w.blob(k.as_bytes());
+        w.value(v);
+    }
+    // The bytes last, so a caller that only wants metadata can stop early.
+    // An evicted object has none, and that is a fact rather than a failure.
+    match BLOBS.lock().get(&content) {
+        Some(b) => w.blob(b),
+        None => w.u32(0),
+    }
+    Some(w.0)
+}
+
 /// Print what a virtual address resolves to, and why it exists.
 fn explain(root_pa: usize, addr: usize) {
     match probe(root_pa, addr) {
@@ -4576,6 +4625,95 @@ extern "C" fn trap_handler(frame: &mut TrapFrame) {
                             usize::MAX
                         }
                     }
+                }
+            }
+
+            // read_char() -> one byte from the console. BLOCKS.
+            //
+            // The kernel hands over bytes and nothing else. Echo, backspace,
+            // line editing and the notion of a "line" all live in userspace,
+            // because every one of them is policy. A program that wants raw
+            // keystrokes gets raw keystrokes.
+            5 => getchar_blocking() as usize,
+
+            // get(id, buf, cap) -> bytes written, or usize::MAX.
+            //
+            // Serialises one object into the caller's buffer: its content id,
+            // its attributes, and its bytes. One packed buffer out, exactly as
+            // create takes one packed buffer in -- so there is a single range
+            // to validate rather than a nest of pointers to chase.
+            6 => {
+                let cap = frame.x[12]; // a2
+                if !user_range_writable(cur_root, arg1, cap) {
+                    println!("store: REFUSED get -- buffer not user-writable");
+                    usize::MAX
+                } else {
+                    let id = ObjId(arg0 as u64);
+                    match serialize_object(id) {
+                        Some(buf) if buf.len() <= cap => {
+                            log_event(id);
+                            for (i, b) in buf.iter().enumerate() {
+                                unsafe { copy_to_user(arg1 + i, *b) };
+                            }
+                            buf.len()
+                        }
+                        // Too big is not an error, it is an answer: ask again
+                        // with a buffer this size. Truncating silently would
+                        // hand back a half-object that still parses.
+                        Some(buf) => buf.len() | (1 << 63),
+                        None => usize::MAX,
+                    }
+                }
+            }
+
+            // verb(id, which) -> 0, or usize::MAX.
+            //
+            //   0 unhide   1 hide   2 evict   3 forget
+            //
+            // The three that are not `hide` are the three that "delete" was
+            // always hiding: clutter, space and privacy are different problems
+            // and this is where they stop sharing a word.
+            7 => {
+                let id = ObjId(arg0 as u64);
+                if !STORE.lock().contains_key(&id) {
+                    usize::MAX
+                } else {
+                    // Every arm returns a value. The unknown case REFUSES --
+                    // it must never panic, because the caller is an untrusted
+                    // program and `arg1` is whatever it felt like putting in
+                    // a1. A syscall that a user program can crash the kernel
+                    // with is not a syscall, it is a denial of service.
+                    match arg1 {
+                        0 => {
+                            hide(id, false);
+                            0
+                        }
+                        1 => {
+                            hide(id, true);
+                            0
+                        }
+                        2 => {
+                            evict(id);
+                            0
+                        }
+                        3 => {
+                            forget(id);
+                            0
+                        }
+                        _ => {
+                            println!("store: REFUSED verb {} -- no such verb", arg1);
+                            usize::MAX
+                        }
+                    }
+                }
+            }
+
+            // save() -> 0, or usize::MAX. Flush the store to disk.
+            8 => {
+                if store_save() {
+                    0
+                } else {
+                    usize::MAX
                 }
             }
 
