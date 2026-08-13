@@ -19,3 +19,7 @@ user/hello.bin
 
 # disk image
 lebos.img
+
+# A Python mirror of the kernel algorithms, for reading alongside main.rs.
+# Not part of the build; deliberately untracked.
+pykernel.py

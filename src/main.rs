@@ -31,8 +31,9 @@ static TICKS: AtomicU64 = AtomicU64::new(0);
 /// 0x1000 in the LOW half, then flattened from ELF to raw bytes with objcopy.
 ///
 /// Embedding is the simplest way to get a second binary into memory when there
-/// is no disk driver yet -- xv6 does exactly this with its `initcode`. Loading
-/// from storage waits for milestone 13.
+/// is no disk driver yet -- xv6 does exactly this with its `initcode`. The
+/// disk exists as of milestone 13, but loading a PROGRAM off it still needs an
+/// ELF parser and a way to name one without a path. That is milestone 19.
 static USER_PROG: &[u8] = include_bytes!("../user/hello.bin");
 
 /// Where user programs are mapped. Not 0, so that a null dereference faults
@@ -414,8 +415,9 @@ extern "C" fn kmain_high() -> ! {
     }
 
     // 10a: a second binary now exists inside the kernel image. It is not
-    // running -- there is no user mode yet, and nothing has mapped it. This
-    // just proves the toolchain produced it and the kernel can see it.
+    // mapped -- this print happens before any address space exists. User mode
+    // arrived at milestone 10b; this line only proves the toolchain produced
+    // the program and the kernel can see the bytes.
     println!(
         "user: {} bytes of program embedded, to be mapped at {:#x}",
         USER_PROG.len(),
@@ -1704,7 +1706,7 @@ fn paging_init(ram_end: usize) {
     //
     // This is a "direct map", and it is worth more than just being a stepping
     // stone to relocating the kernel: it means the kernel can reach ANY
-    // physical page by adding a constant. At milestone 11, editing another
+    // physical page by adding a constant. As of milestone 11, editing another
     // process's page tables becomes arithmetic instead of a special case.
     map_range(
         root,
@@ -2795,7 +2797,11 @@ static BLOBS: SpinLock<alloc::collections::BTreeMap<ObjId, alloc::vec::Vec<u8>>>
 /// these raw events into sessions and co-occurrence; the kernel only writes
 /// down that something happened.
 #[derive(Clone, Copy)]
-#[allow(dead_code)] // written by the kernel, read by userspace, which does not exist yet
+// Userspace exists now, but nothing there can READ these -- there is no
+// syscall for the event log. Deliberate: deciding who may see the causal graph
+// is the unresolved capability question, and it should not be answered by
+// accident.
+#[allow(dead_code)]
 struct Event {
     time: u64,
     process: usize,
@@ -3070,7 +3076,9 @@ fn forget(id: ObjId) {
 /// Every object satisfying ALL conditions.
 ///
 /// A linear scan, deliberately: indexes are an optimisation, and the semantics
-/// have to be right before the speed matters. Milestone 13 adds them.
+/// have to be right before the speed matters. Still a linear scan as of 17 --
+/// indexes were pencilled in for 13 and got spent on the disk instead, which
+/// was the right call: nothing is slow yet.
 fn store_query(conds: &[Cond]) -> alloc::vec::Vec<ObjId> {
     let ids: alloc::vec::Vec<ObjId> = {
         let store = STORE.lock();
