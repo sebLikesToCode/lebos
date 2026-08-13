@@ -26,3 +26,6 @@ pykernel.py
 decoder.md
 TOUR.md
 RUST.md
+
+# Sebastian's kernel build output
+kernel/target/

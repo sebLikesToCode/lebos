@@ -1,11 +1,15 @@
 [package]
-name = "lebos"
+name = "lebos-ref"
 version = "0.1.0"
 edition = "2021"
 
+# The reference kernel -- the one written alongside Claude across milestones
+# 1-20. It still boots, and it exists to be READ while the real one is written.
+# Same role xv6 plays for everyone else, except every decision in it is already
+# Sebastian's and the comments explain the reasoning.
 [[bin]]
-name = "lebos"
-path = "src/main.rs"
+name = "lebos-ref"
+path = "reference/main.rs"
 test = false
 bench = false
 
@@ -14,7 +18,7 @@ bench = false
 # with `make resync`.
 [[bin]]
 name = "main2"
-path = "src/main2.rs"
+path = "reference/main2.rs"
 test = false
 bench = false
 

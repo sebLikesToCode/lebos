@@ -1,8 +1,20 @@
 TARGET  := riscv64gc-unknown-none-elf
-KERNEL  := target/$(TARGET)/debug/lebos
+
+# -------------------------------------------------------------------------
+# TWO KERNELS.
+#
+#   kernel/     yours.        `make run`
+#   reference/  the one built alongside Claude, milestones 1-20.  `make ref`
+#
+# The reference still boots. It is there to be read when yours gets stuck --
+# the same role xv6 plays for everyone else, except every decision in it is
+# already yours and the comments say why.
+# -------------------------------------------------------------------------
+MYKERNEL := kernel/target/$(TARGET)/debug/lebos
+REFKERNEL := target/$(TARGET)/debug/lebos-ref
 
 # Scratch copy for experiments. Gitignored; see `play` / `resync` below.
-PLAY    := src/main2.rs
+PLAY    := reference/main2.rs
 PLAYBIN := target/$(TARGET)/debug/main2
 
 QEMU    := qemu-system-riscv64
@@ -19,7 +31,8 @@ $(DISK):
 	@qemu-img create -f raw $(DISK) 64M >/dev/null
 	@echo "created $(DISK) (64 MiB)"
 
-.PHONY: build run debug gdb clean objdump nm size dumpdtb check fmt \
+.PHONY: build run ref mine mine-nm mine-objdump mine-debug mine-check \
+        debug gdb clean objdump nm size dumpdtb check fmt \
         play resync playdiff user logo
 
 USERELF := user/target/$(TARGET)/debug/hello
@@ -48,18 +61,46 @@ user: $(USERBIN) $(SHELLBIN)
 
 ## logo    -- print the boot banner in colour, without booting anything.
 ##            Regenerate it from the artwork with:
-##              python3 toascii.py assets/logo.png 72 > src/banner_art.txt
+##              python3 toascii.py assets/logo.png 72 > reference/banner_art.txt
 logo:
-	@cat src/banner.txt
+	@cat reference/banner.txt
 
-## build   -- compile the kernel ELF.
+## mine    -- compile YOUR kernel.
+##            RUSTFLAGS is set here rather than in kernel/.cargo/config.toml
+##            because cargo MERGES config files up the tree -- the root crate's
+##            -Tlinker.ld would otherwise leak in and link this into the higher
+##            half. The env var REPLACES them instead of merging.
+mine:
+	cd kernel && RUSTFLAGS="-C code-model=medium -C link-arg=-Tkernel.ld -C link-arg=--no-gc-sections" cargo build
+
+## run     -- boot YOUR kernel in QEMU. Quit with: Ctrl-A then X
+run: mine
+	$(QEMU) $(QFLAGS) -kernel $(MYKERNEL)
+
+## mine-nm -- symbols by address. Confirms _start really is at 0x80200000.
+mine-nm: mine
+	rust-nm -n $(MYKERNEL)
+
+## mine-objdump -- disassemble your kernel
+mine-objdump: mine
+	rust-objdump -d --print-imm-hex $(MYKERNEL) | less
+
+## mine-debug -- boot yours frozen, GDB stub on :1234
+mine-debug: mine
+	$(QEMU) $(QFLAGS) -kernel $(MYKERNEL) -s -S
+
+## mine-check -- clippy on yours
+mine-check:
+	cd kernel && RUSTFLAGS="-C code-model=medium -C link-arg=-Tkernel.ld -C link-arg=--no-gc-sections" cargo clippy
+
+## ref     -- boot the REFERENCE kernel (milestones 1-20)
+ref: build
+	$(QEMU) $(QFLAGS) -kernel $(REFKERNEL)
+
+## build   -- compile the reference kernel ELF.
 ##            Only --bin lebos, so a broken main2.rs can never block this.
 build: $(USERBIN) $(SHELLBIN) $(PLAY) $(DISK)
-	cargo build --bin lebos
-
-## run     -- boot the kernel in QEMU. Quit with: Ctrl-A then X
-run: build
-	$(QEMU) $(QFLAGS) -kernel $(KERNEL)
+	cargo build --bin lebos-ref
 
 # -------------------------------------------------------------------------
 # Scratch copy. src/main2.rs is a gitignored duplicate of main.rs that exists
@@ -69,10 +110,10 @@ run: build
 
 # Created on demand so a fresh checkout works without extra steps.
 $(PLAY):
-	@cp src/main.rs $(PLAY)
-	@cp src/entry.S src/entry2.S
+	@cp reference/main.rs $(PLAY)
+	@cp reference/entry.S reference/entry2.S
 	@sed -i 's|include_str!("entry.S")|include_str!("entry2.S")|' $(PLAY)
-	@echo "created $(PLAY) + src/entry2.S from the real kernel"
+	@echo "created $(PLAY) + reference/entry2.S from the real kernel"
 
 ## play    -- build and run the scratch copy instead of the real kernel
 play: $(PLAY)
@@ -81,27 +122,27 @@ play: $(PLAY)
 
 ## resync  -- overwrite the scratch copy with the current main.rs.
 ##            DISCARDS whatever you were experimenting with.
-##            Also refreshes src/entry2.S, the scratch copy of the assembly,
+##            Also refreshes reference/entry2.S, the scratch copy of the assembly,
 ##            so bugs can be planted there without touching the real kernel.
 resync:
-	@cp src/main.rs $(PLAY)
-	@cp src/entry.S src/entry2.S
+	@cp reference/main.rs $(PLAY)
+	@cp reference/entry.S reference/entry2.S
 	@sed -i 's|include_str!("entry.S")|include_str!("entry2.S")|' $(PLAY)
-	@echo "$(PLAY) + src/entry2.S reset to match the real kernel"
+	@echo "$(PLAY) + reference/entry2.S reset to match the real kernel"
 
 ## playdiff -- show what you changed in the scratch copy vs the real kernel
 playdiff: $(PLAY)
-	@diff -u src/main.rs $(PLAY) || true
+	@diff -u reference/main.rs $(PLAY) || true
 
 ## debug   -- boot QEMU frozen before the first instruction, waiting for GDB
 ##            on port 1234. Run this, then `make gdb` in a second terminal.
 debug: build
-	$(QEMU) $(QFLAGS) -kernel $(KERNEL) -s -S
+	$(QEMU) $(QFLAGS) -kernel $(REFKERNEL) -s -S
 
 ## gdb     -- attach to a waiting `make debug`. Try: `b kmain`, `c`, `si`,
 ##            `info registers`, `x/8i $pc`
 gdb:
-	gdb-multiarch $(KERNEL) \
+	gdb-multiarch $(REFKERNEL) \
 	  -ex 'set arch riscv:rv64' \
 	  -ex 'target remote localhost:1234' \
 	  -ex 'break _start'
@@ -109,21 +150,21 @@ gdb:
 ## trace   -- boot with QEMU logging every exception and MMU translation to
 ##            qemu.log. Indispensable when the machine dies silently.
 trace: build
-	$(QEMU) $(QFLAGS) -kernel $(KERNEL) -d int,mmu,guest_errors -D qemu.log
+	$(QEMU) $(QFLAGS) -kernel $(REFKERNEL) -d int,mmu,guest_errors -D qemu.log
 
 ## objdump -- disassemble the kernel. Read this when the source and the
 ##            machine disagree about what you wrote.
 objdump: build
-	rust-objdump -d --print-imm-hex $(KERNEL) | less
+	rust-objdump -d --print-imm-hex $(REFKERNEL) | less
 
 ## nm      -- list symbols with addresses. Confirms _start really is at
 ##            0x80200000 and shows you where __bss_start etc. landed.
 nm: build
-	rust-nm -n $(KERNEL)
+	rust-nm -n $(REFKERNEL)
 
 ## size    -- section sizes. Watch .bss grow.
 size: build
-	rust-size -A $(KERNEL)
+	rust-size -A $(REFKERNEL)
 
 ## dumpdtb -- dump the device tree QEMU passes the kernel, as readable text.
 ##            This is the authoritative description of the hardware you are
@@ -135,13 +176,14 @@ dumpdtb:
 	  || echo "install device-tree-compiler to decode virt.dtb"
 
 check:
-	cargo clippy --bin lebos
+	cargo clippy --bin lebos-ref
 
 fmt:
 	cargo fmt
 
 clean:
 	cargo clean
+	cd kernel && cargo clean
 	cd user && cargo clean
 	rm -f $(USERBIN) $(SHELLBIN)
 	rm -f qemu.log virt.dtb virt.dts $(DISK)

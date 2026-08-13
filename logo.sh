@@ -5,6 +5,6 @@
 # only reason a script like this ever needs a last line.
 cd "$(dirname "$0")" || exit 1
 clear
-cat src/banner.txt
+cat reference/banner.txt
 echo
 read -rp "press enter to close "

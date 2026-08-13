@@ -1,0 +1,31 @@
+# Sebastian's kernel. A separate crate on purpose, not a second binary in the
+# root one: .cargo/config.toml applies its linker flags to every target in a
+# crate, and this kernel needs its own linker script.
+#
+# [workspace] with nothing in it makes this crate standalone rather than a
+# member of the root workspace. Same trick user/ uses.
+[workspace]
+
+[package]
+name = "lebos"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "lebos"
+path = "src/main.rs"
+test = false
+bench = false
+
+# There is no unwinder, so a panic must abort.
+[profile.dev]
+panic = "abort"
+# opt-level 0 generates stack frames large enough to overflow a small boot
+# stack. 1 is the floor for a kernel.
+opt-level = 1
+
+[profile.release]
+panic = "abort"
+lto = true
+
+[dependencies]

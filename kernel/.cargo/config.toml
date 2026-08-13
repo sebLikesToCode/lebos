@@ -1,0 +1,11 @@
+# ONLY the target lives here.
+#
+# Cargo MERGES config files up the directory tree, so anything written here
+# would be combined with the root crate's flags -- including its -Tlinker.ld,
+# which links the reference kernel into the higher half. That would silently
+# apply to this kernel too.
+#
+# The Makefile therefore sets RUSTFLAGS in the environment, which REPLACES
+# config rustflags instead of merging with them. Same lesson user/ taught.
+[build]
+target = "riscv64gc-unknown-none-elf"
