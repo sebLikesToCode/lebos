@@ -549,6 +549,58 @@ three times instead of forever, and the timer no longer announces each second.
 Both were proof the scheduler worked and became a machine talking over its
 user the moment there was a user.
 
+## The userspace heap (milestone 17)
+
+A **bump allocator**: one pointer walks forward, `dealloc` does nothing. That
+is correct rather than lazy — `thread_exit` tears down the whole address space
+at once, so reclaiming individual allocations solves a problem that does not
+exist. Before milestone 16 it would have been a real leak.
+
+Chunk size is **64 KiB, or the request rounded up to a page if bigger** — xv6's
+rule. Nobody asks the OS for exactly what was requested (the syscall costs more
+than the waste); glibc pads by 128 KiB, jemalloc takes megabytes, Go reserves
+64 MiB arenas. And note that **doubling belongs one layer up**: `Vec` doubles
+when it outgrows its buffer, the allocator underneath asks in flat chunks.
+
+Verified: the demo program's break grows by exactly 65536 + 106496 — one chunk
+for all the small allocations, one page-rounded chunk for a 100 KiB `Vec`. Two
+syscalls for the whole program.
+
+### The bug it exposed: user programs had no writable memory
+
+`map_user` mapped **every** page of the program `r-x`, and nobody noticed
+because until milestone 17 the user program had no writable globals at all —
+its request buffer was a stack local. The allocator's `next`/`limit` are a
+`static`, so the first allocation faulted writing to its own image, with
+`stval` pointing inside `.bss`.
+
+Two things were wrong and both matter:
+
+- **W^X applies to user pages.** Map it all `r-x` and any global faults; map it
+  all `rw-x` and a program can rewrite its own code.
+- **`.bss` occupies no space in a flat binary.** It is a promise that zeroed
+  bytes will exist, not a record of them, so those pages must be mapped and
+  zeroed by the loader.
+
+Fixed with a **fixed split both sides agree on**: `USER_DATA_BASE = 0x8000`,
+`USER_DATA_SIZE = 0x4000`, asserted in `user/user.ld`. Below it is `r-x`, above
+is `rw-`, and the break now starts past the data region rather than past the
+image — the two stopped being the same thing.
+
+This is deliberately temporary and the linker script says so. **Milestone 19
+must parse an ELF anyway** to run programs out of the store, and an ELF states
+permissions per segment, which deletes the whole arrangement.
+
+### Identity arrives in a0, not by patching the image
+
+The old `map_user_tagged` wrote a byte directly into the program's `.rodata` so
+two processes could announce themselves differently. That only ever worked
+because the kernel could write those pages and the message sat at a predictable
+offset; both stopped being true. The tag now arrives in **a0**, which
+`_start` leaves untouched before `call umain`, so it lands as the first
+parameter. A program is told who it is rather than having its own text
+rewritten behind its back — and that is the first seed of argv.
+
 ## Process lifecycle (milestone 16)
 
 `ThreadState` is `Runnable | Sleeping(chan) | Zombie(code) | Free`, and
@@ -879,9 +931,10 @@ that existed. Phase VI ends with `lebos` being a kernel and nothing else.
 
 15. ✅ PLIC + interrupt-driven console
 16. ✅ process lifecycle: exit, wait, reap, sleep/wake
-17. ⬅ **current** — userspace memory. Kernel half DONE (`sbrk`, syscall 4);
-    the userspace bump allocator is Sebastian's half, in progress
-18. the store syscalls a shell needs: get, hide, evict, forget, save, readline
+17. ✅ userspace memory: `sbrk` + a bump allocator. `Vec`, `String` and
+    `format!` work in user programs
+18. ⬅ **current** — the store syscalls a shell needs: get, hide, evict,
+    forget, save, readline
 19. **exec-by-query** — a program is an object with `type=program`, so running
     one means running a QUERY. `execve("/bin/sh")` is a path lookup in every OS
     that has shipped; this cannot do that, and what replaces it is better.

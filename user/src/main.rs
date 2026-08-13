@@ -9,6 +9,8 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 // Syscall ABI:
 //
 //   a7 = number, a0.. = arguments, a0 = return value
@@ -62,6 +64,109 @@ unsafe fn syscall4(n: usize, a0: usize, a1: usize, a2: usize, a3: usize) -> usiz
 fn write(s: &[u8]) {
     unsafe { syscall4(SYS_WRITE, s.as_ptr() as usize, s.len(), 0, 0) };
 }
+
+// ---------------------------------------------------------------------------
+// The heap -- milestone 17
+//
+// A BUMP ALLOCATOR. One pointer walks forward and never comes back.
+//
+//     next   the first free byte
+//     limit  one past the end of the land we own
+//
+// alloc: round `next` up to the alignment the caller demanded, hand it back,
+// move `next` past it. free: DO NOTHING.
+//
+// That is not laziness. This program's entire address space is torn down in
+// one go by thread_exit at milestone 16 -- page tables, program, stack and
+// heap, all returned at once. Reclaiming individual allocations would be work
+// done to solve a problem that does not exist. Before 16 this would have been
+// a genuine leak; after it, it is the correct design for a short-lived
+// program.
+//
+// The chunk size is xv6's rule almost exactly: ask for 64 KiB at a time, or
+// for the whole request if it is bigger. Real allocators all land somewhere
+// near here -- glibc pads by 128 KiB, jemalloc takes megabytes at once, Go
+// reserves 64 MiB arenas. Nobody asks the kernel for exactly what was
+// requested, because the syscall costs far more than the wasted bytes.
+//
+// Note what doubling is NOT. `Vec` doubles when it outgrows its buffer, but
+// that happens one layer above this: Vec asks the allocator for a bigger
+// block, and the allocator asks the kernel in flat chunks.
+// ---------------------------------------------------------------------------
+
+const CHUNK: usize = 64 * 1024;
+
+struct Bump {
+    next: core::cell::UnsafeCell<usize>,
+    limit: core::cell::UnsafeCell<usize>,
+}
+
+// Sound only because a LeBOS process is single-threaded. The moment a process
+// can have two threads, this needs a lock -- exactly the one the kernel grew
+// at milestone 9b.
+unsafe impl Sync for Bump {}
+
+/// Smallest multiple of `align` that is >= `x`.
+///
+/// Adding `align - 1` pushes anything not already on a boundary past the next
+/// one; the mask then chops it back down to it. Works because alignments are
+/// always powers of two, so `!(align - 1)` is a clean run of high bits.
+fn align_up(x: usize, align: usize) -> usize {
+    (x + align - 1) & !(align - 1)
+}
+
+unsafe impl core::alloc::GlobalAlloc for Bump {
+    unsafe fn alloc(&self, layout: core::alloc::Layout) -> *mut u8 {
+        let size = layout.size();
+        let align = layout.align();
+
+        loop {
+            let next = *self.next.get();
+            let limit = *self.limit.get();
+
+            let start = align_up(next, align);
+            let end = start.wrapping_add(size);
+
+            // `end >= start` catches the wrap. A Layout that huge cannot be
+            // honest, but it must not be allowed to look like it fits either.
+            if end >= start && end <= limit {
+                *self.next.get() = end;
+                return start as *mut u8;
+            }
+
+            // Out of land. `size + align` rather than `size`, because the
+            // alignment skip happens INSIDE the new chunk and has to fit too.
+            let want = if size + align > CHUNK {
+                align_up(size + align, 4096)
+            } else {
+                CHUNK
+            };
+
+            let got = sbrk(want);
+            if got == usize::MAX {
+                return core::ptr::null_mut();
+            }
+
+            // sbrk always extends from the current break, so `got` is normally
+            // exactly the old limit and the land stays one unbroken strip. If
+            // it ever is not -- the first call, when there is no limit yet --
+            // start over from wherever it actually landed.
+            if got != limit {
+                *self.next.get() = got;
+            }
+            *self.limit.get() = got + want;
+        }
+    }
+
+    /// Nothing. See the note above: the kernel reclaims all of it at exit.
+    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: core::alloc::Layout) {}
+}
+
+#[global_allocator]
+static HEAP: Bump = Bump {
+    next: core::cell::UnsafeCell::new(0),
+    limit: core::cell::UnsafeCell::new(0),
+};
 
 /// Builds the packed buffers the store syscalls expect. No allocator, so it
 /// writes into a fixed array and tracks how far it got.
@@ -151,8 +256,14 @@ fn print_num(mut n: usize) {
 }
 
 #[no_mangle]
-extern "C" fn umain() -> ! {
-    write(b"user: storing three objects, naming no paths\n");
+extern "C" fn umain(tag: usize) -> ! {
+    // Who am I? The kernel put it in a0. The program is TOLD its identity
+    // rather than having a byte of its own text rewritten behind its back --
+    // which is what happened before .rodata became genuinely read-only, and
+    // is the first seed of argv.
+    write(b"user: I am process ");
+    write(&[tag as u8]);
+    write(b", storing three objects, naming no paths\n");
 
     make(b"import pygame  # paddle", b"brick breaker", b"python", 101);
     make(b"remember the paddle", b"notes", b"text", 101);
@@ -180,27 +291,40 @@ extern "C" fn umain() -> ! {
     print_num(if r == usize::MAX { 1 } else { 0 });
     write(b" (1 = refused)\n");
 
-    // Milestone 17: memory this program did not have at compile time.
+    // Milestone 17: things that cannot exist without a heap.
     //
-    // No allocator yet -- that is the other half. This only proves the fence
-    // moved and the land behind it is real: write a word, read it back.
-    let a = sbrk(0);
-    let p = sbrk(4096);
-    if p == usize::MAX {
-        write(b"user: sbrk refused\n");
-    } else {
-        unsafe { core::ptr::write_volatile(p as *mut usize, 0x1EB05) };
-        let back = unsafe { core::ptr::read_volatile(p as *const usize) };
-        write(b"user: break was ");
-        print_num(a);
-        write(b", sbrk gave ");
-        print_num(p);
-        write(b", now ");
-        print_num(sbrk(0));
-        write(b"\nuser: wrote 0x1eb05 to fresh memory, read back ");
-        print_num(back);
-        write(if back == 0x1EB05 { b" (ok)\n" } else { b" (WRONG)\n" });
+    // Every line below was impossible in this program yesterday. Buf is a
+    // fixed [u8; 512] decided at compile time precisely because there was
+    // nowhere to put anything else.
+    write(b"user: break starts at ");
+    print_num(sbrk(0));
+    write(b"\n");
+
+    let mut v: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+    for i in 1..=8u64 {
+        v.push(i * i);
     }
+    write(b"user: Vec of squares ->");
+    for x in &v {
+        write(b" ");
+        print_num(*x as usize);
+    }
+    write(b"\n");
+
+    // format! -- allocation, formatting and a String, in one line.
+    let s = alloc::format!("user: a String built in userspace, {} squares\n", v.len());
+    write(s.as_bytes());
+
+    // Force a second chunk: 64 KiB is one sbrk, so this crosses the boundary
+    // and proves the allocator asks for more rather than falling over.
+    let big: alloc::vec::Vec<u8> = alloc::vec![0xAB; 100 * 1024];
+    write(b"user: allocated ");
+    print_num(big.len());
+    write(b" bytes, last byte is ");
+    print_num(big[big.len() - 1] as usize);
+    write(b"\nuser: break is now ");
+    print_num(sbrk(0));
+    write(b"\n");
 
     unsafe { syscall4(SYS_EXIT, 0, 0, 0, 0) };
 

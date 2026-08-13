@@ -23,11 +23,31 @@ SECTIONS
     }
 
     .rodata : { *(.rodata .rodata.*) }
+
+    /* WRITABLE DATA STARTS AT A FIXED ADDRESS.
+     *
+     * The kernel receives a flat binary with no section table, so it has no
+     * way to discover where read-only code ends and writable data begins --
+     * and it must know, because W^X applies to user pages: mapping the whole
+     * image r-x makes any global variable fault on first write, and mapping it
+     * all rw-x hands a program the ability to rewrite its own code.
+     *
+     * So the boundary is a constant both sides agree on. Ugly, and deliberately
+     * temporary: milestone 19 has to parse a real ELF anyway, which carries a
+     * permissions field per segment and deletes this whole arrangement.
+     *
+     * The gap is padded with zeros by objcopy, which costs image size and
+     * nothing else.
+     */
+    . = 0x8000;
     .data   : { *(.sdata .sdata.* .data .data.*) }
-    /* .bss occupies no file space, so nothing that must exist at runtime may
-     * live here -- the kernel copies the raw image and does not know to zero
-     * anything beyond it. The stack comes from the kernel. */
     .bss    : { *(.sbss .sbss.* .bss .bss.*) }
+    __bss_end = .;
+
+    ASSERT(ADDR(.data) == 0x8000,
+           "code and rodata overran 0x8000 -- raise USER_DATA_BASE in main.rs too")
+    ASSERT(__bss_end <= 0xC000,
+           "data + bss overran 16 KiB -- raise USER_DATA_SIZE in main.rs too")
 
     /DISCARD/ : { *(.eh_frame) *(.note .note.*) *(.comment) }
 }

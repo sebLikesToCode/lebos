@@ -426,17 +426,10 @@ extern "C" fn kmain_high() -> ! {
         print!(" {:02x}", b);
     }
     println!();
-    // The message it intends to print, still just data inside the kernel.
-    let tail = &USER_PROG[USER_PROG.len() - 14..];
-    print!("user: its message is \"");
-    for &b in tail {
-        if b == b'\n' {
-            print!("\\n");
-        } else {
-            putchar(b);
-        }
-    }
-    println!("\"");
+    // It used to print the message it intended to write, read straight out of
+    // the tail of the image. That stopped meaning anything once the program
+    // grew a data section at a fixed address -- the last bytes of the file are
+    // no longer the last bytes of any string.
 
     threads_init();
     thread_spawn("alpha", thread_alpha);
@@ -528,11 +521,12 @@ extern "C" fn kmain_high() -> ! {
 /// thread's address space -- so `USER_BASE` here means *this* process's copy of
 /// the program, not anyone else's.
 extern "C" fn user_thread_entry() -> ! {
-    let user_sp = {
+    let (user_sp, arg) = {
         let t = THREADS.lock();
-        t[CURRENT.load(Ordering::Relaxed)].user_sp
+        let cur = CURRENT.load(Ordering::Relaxed);
+        (t[cur].user_sp, t[cur].user_arg)
     };
-    enter_user(user_sp);
+    enter_user(user_sp, arg);
 }
 
 /// Create a process: a private address space, the program loaded into it, and
@@ -555,16 +549,18 @@ fn process_spawn(name: &'static str, tag: u8) -> usize {
     ctx.sp = top;
     ctx.s[0] = user_thread_entry as *const () as usize;
 
-    // The heap starts on the first page-aligned address past the program.
-    // Below it: the program, and below that the stack. Above it: nothing yet,
-    // which is exactly what a break means.
-    let brk = USER_BASE + USER_PROG.len().div_ceil(PAGE_SIZE) * PAGE_SIZE;
+    // The heap starts on the first page past the writable data region --
+    // NOT past the image. The two stopped being the same thing when data got
+    // its own fixed address, and a break that overlapped .bss would hand the
+    // allocator pages the program's globals were already living in.
+    let brk = USER_DATA_BASE + USER_DATA_SIZE;
 
     thread_insert(Thread {
         ctx,
         satp,
         root_pa,
         user_sp,
+        user_arg: tag as usize,
         brk,
         name,
         state: ThreadState::Runnable,
@@ -1174,6 +1170,18 @@ const PTE_U: usize = 1 << 4; // user mode may access this page
 /// Bytes of user stack. One frame is plenty for a program this small.
 const USER_STACK_SIZE: usize = PAGE_SIZE;
 
+/// Where a user program's WRITABLE data begins. Must match `user/user.ld`.
+///
+/// A flat binary carries no section table, so the kernel cannot see where
+/// read-only code stops and writable globals start -- and it has to know,
+/// because W^X applies to user pages. Map the lot r-x and the first global
+/// variable faults; map the lot rw-x and a program can rewrite its own code.
+///
+/// Deliberately temporary. Milestone 19 must parse an ELF to run programs out
+/// of the store, and an ELF states permissions per segment, which deletes this.
+const USER_DATA_BASE: usize = 0x8000;
+const USER_DATA_SIZE: usize = 0x4000;
+
 /// How far a process may push its break. A cap rather than "until memory runs
 /// out", because one greedy program should not be able to starve the machine
 /// -- and because it makes the overflow check on the request trivially safe.
@@ -1214,18 +1222,16 @@ fn proc_pagetable() -> usize {
 /// The low half is free real estate: the kernel relocated to the high half and
 /// dropped the identity map, so user and kernel share one page table and can
 /// never collide. That is what milestone 6c bought.
-fn map_user_tagged(root_pa: usize, tag: u8) -> usize {
-    let sp = map_user(root_pa);
-
-    // Patch the identity byte. The message ends "X\n", so the X is the
-    // second-to-last byte of the image -- and the image starts at USER_BASE.
-    let off = USER_PROG.len() - 2;
-    let root = va(root_pa) as *mut usize;
-    if let Some(e) = probe_in(root, USER_BASE + off) {
-        let phys = pte_to_pa(e) | ((USER_BASE + off) & (PAGE_SIZE - 1));
-        unsafe { core::ptr::write_volatile(va(phys) as *mut u8, tag) };
-    }
-    sp
+fn map_user_tagged(root_pa: usize, _tag: u8) -> usize {
+    // The tag used to be patched directly into a byte of the program's image.
+    // That worked only while every page was writable by the kernel and the
+    // message sat at a predictable offset -- and it stopped being true the
+    // moment the program grew and .rodata became genuinely read-only.
+    //
+    // It arrives in a0 now instead, which is both simpler and the first seed
+    // of argv: a program is told who it is rather than having its own text
+    // rewritten behind its back.
+    map_user(root_pa)
 }
 
 /// Copy the embedded user program into fresh frames and map it into the LOW
@@ -1233,28 +1239,44 @@ fn map_user_tagged(root_pa: usize, tag: u8) -> usize {
 fn map_user(root_pa: usize) -> usize {
     let root = va(root_pa) as *mut usize;
 
-    // --- the program itself ---
-    let pages = USER_PROG.len().div_ceil(PAGE_SIZE);
-    for i in 0..pages {
+    // --- code and rodata: readable, executable, NOT writable ---
+    let mut addr = USER_BASE;
+    while addr < USER_DATA_BASE {
         let frame = frame_alloc().expect("no frame for the user program");
-        // Zero it through the alias -- `frame` is physical.
-        unsafe { core::ptr::write_bytes(va(frame as usize) as *mut u8, 0, PAGE_SIZE) };
-
-        // Copy through the higher-half alias: `frame` is a PHYSICAL address,
-        // and the identity map is long gone.
         let dst = va(frame as usize) as *mut u8;
-        let start = i * PAGE_SIZE;
-        let n = core::cmp::min(PAGE_SIZE, USER_PROG.len() - start);
-        unsafe { core::ptr::copy_nonoverlapping(USER_PROG.as_ptr().add(start), dst, n) };
+        unsafe { core::ptr::write_bytes(dst, 0, PAGE_SIZE) };
 
-        // R and X but no W: the program's message lives in .text, so it needs
-        // to be readable, and W^X applies to user pages too.
-        map(
-            root,
-            USER_BASE + start,
-            frame as usize,
-            PTE_R | PTE_X | PTE_U | RSW_TEXT,
-        );
+        // Copy whatever the image has for this page. Past the end of the
+        // image there is nothing to copy and the page stays zero.
+        let off = addr - USER_BASE;
+        if off < USER_PROG.len() {
+            let n = core::cmp::min(PAGE_SIZE, USER_PROG.len() - off);
+            unsafe { core::ptr::copy_nonoverlapping(USER_PROG.as_ptr().add(off), dst, n) };
+        }
+
+        map(root, addr, frame as usize, PTE_R | PTE_X | PTE_U | RSW_TEXT);
+        addr += PAGE_SIZE;
+    }
+
+    // --- data and bss: readable, WRITABLE, not executable ---
+    //
+    // .bss occupies no space in a flat binary -- it is a promise that some
+    // zeroed bytes will exist, not a record of them -- so these pages are
+    // zeroed first and the image is copied over whatever part of them it
+    // reaches. Everything past the image end is the .bss, already correct.
+    while addr < USER_DATA_BASE + USER_DATA_SIZE {
+        let frame = frame_alloc().expect("no frame for user data");
+        let dst = va(frame as usize) as *mut u8;
+        unsafe { core::ptr::write_bytes(dst, 0, PAGE_SIZE) };
+
+        let off = addr - USER_BASE;
+        if off < USER_PROG.len() {
+            let n = core::cmp::min(PAGE_SIZE, USER_PROG.len() - off);
+            unsafe { core::ptr::copy_nonoverlapping(USER_PROG.as_ptr().add(off), dst, n) };
+        }
+
+        map(root, addr, frame as usize, PTE_R | PTE_W | PTE_U | RSW_DATA);
+        addr += PAGE_SIZE;
     }
 
     // --- the user stack, immediately below the program ---
@@ -1271,8 +1293,13 @@ fn map_user(root_pa: usize) -> usize {
     unsafe { core::arch::asm!("sfence.vma") };
 
     println!(
-        "user: mapped {} page(s) at {:#x} r-x U, stack {:#x}..{:#x} rw- U",
-        pages, USER_BASE, stack_va, USER_BASE
+        "user: {:#x}..{:#x} r-x, {:#x}..{:#x} rw-, stack {:#x}..{:#x} rw-",
+        USER_BASE,
+        USER_DATA_BASE,
+        USER_DATA_BASE,
+        USER_DATA_BASE + USER_DATA_SIZE,
+        stack_va,
+        USER_BASE
     );
 
     stack_va + USER_STACK_SIZE
@@ -1457,7 +1484,7 @@ fn user_range_writable(root_pa: usize, ptr: usize, len: usize) -> bool {
 
 /// Drop to user mode and start the program. Never returns -- from here on this
 /// thread IS the user program, and only a trap brings the kernel back.
-fn enter_user(user_sp: usize) -> ! {
+fn enter_user(user_sp: usize, arg: usize) -> ! {
     unsafe {
         // SPP (bit 8) = 0  -> sret returns to USER mode, not supervisor
         core::arch::asm!("csrc sstatus, {}", in(reg) 1_usize << 8);
@@ -1477,6 +1504,10 @@ fn enter_user(user_sp: usize) -> ! {
             "sret",
             entry = in(reg) USER_BASE,
             usp = in(reg) user_sp,
+            // a0 is the first argument in the RISC-V calling convention, and
+            // _start does not touch it before `call umain` -- so this arrives
+            // as umain's first parameter.
+            in("a0") arg,
             options(noreturn),
         );
     }
@@ -2182,6 +2213,10 @@ struct Thread {
     root_pa: usize,
     /// Initial user stack pointer, for a thread that will drop to user mode.
     user_sp: usize,
+    /// What lands in a0 when this thread enters user mode. Today it is an
+    /// identity tag so two processes running one binary can tell themselves
+    /// apart; tomorrow it is argv.
+    user_arg: usize,
     /// The BREAK: the boundary between this process's mapped memory and
     /// nothing. One of the oldest names in Unix. `sbrk` moves it outward and
     /// the kernel maps the land that just came inside the fence. 0 for a
@@ -2234,6 +2269,7 @@ fn threads_init() {
         satp: KERNEL_SATP.load(Ordering::Relaxed),
         root_pa: 0,
         user_sp: 0,
+        user_arg: 0,
         brk: 0,
         name: "main",
         state: ThreadState::Runnable,
@@ -2267,6 +2303,7 @@ fn thread_spawn(name: &'static str, entry: extern "C" fn() -> !) {
         satp: KERNEL_SATP.load(Ordering::Relaxed),
         root_pa: 0,
         user_sp: 0,
+        user_arg: 0,
         brk: 0,
         name,
         state: ThreadState::Runnable,
