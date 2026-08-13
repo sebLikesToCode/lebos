@@ -210,6 +210,15 @@ changes the job:
 - xv6-riscv is the canonical reference implementation to point at. It solves
   nearly every problem this project will hit, in ~9k lines of readable C.
 
+## The logo -- DECIDED, day 2
+
+**A prism.** His call, and it earns its place: white light goes in unchanged
+and a spectrum comes out. The prism does not alter the light, it reveals what
+was already in it -- which is what a query does to an object. One thing, many
+views, no single correct one, and no hierarchy among the colours.
+
+Do not redesign this into something with folders in it.
+
 ## Easter eggs and tributes
 
 The author wants this codebase full of them. **Flag the opportunity whenever
