@@ -23,9 +23,9 @@ reference/main2.rs
 reference/entry2.S
 reference/banner_art.txt
 
-# ---- reading aids ----
-# Not part of the build. Notes rather than source, so they live outside git.
-learn/
+# learn/ IS tracked. It was ignored as "notes rather than source", which was
+# wrong: it is ~1400 lines of documentation about this project and it existed
+# in exactly one place on one disk.
 
 # ---- editors ----
 .idea/
