@@ -41,7 +41,11 @@ const BANNER: &str = include_str!("banner.txt");
 
 const INTERVAL: u64 = 10_000_000;
 
+const HIGH_BASE: usize = 0xFFFF_FFC0_0000_0000;
+
 static FREE_LIST: AtomicUsize = AtomicUsize::new(0);
+
+static mut TEST: usize = 0;
 
 macro_rules! print {
     ($($arg:tt)*) => { _print(format_args!($($arg)*)) };
@@ -85,22 +89,37 @@ pub extern "C" fn kmain(_hartid: usize, _dtb: *const u8) -> ! {
     let rodata_start = core::ptr::addr_of!(__rodata_start) as usize;
     let rodata_end = core::ptr::addr_of!(__rodata_end) as usize;
     let data_start = core::ptr::addr_of!(__data_start) as usize;
+    let addr = core::ptr::addr_of!(TEST) as usize;
 
     frame_init(kernel_end, 0x8800_0000);
 
     let un_tableau = frame_alloc().unwrap();
     unsafe { core::ptr::write_bytes(un_tableau as *mut u8, 0, 4096) };
 
-    memory_loop(un_tableau, text_start, text_end, 0xCB);
-    memory_loop(un_tableau, rodata_start, rodata_end, 0xC3);
-    memory_loop(un_tableau, data_start, kernel_end, 0xC7);
-    memory_loop(un_tableau, 0x1000_0000, 0x1000_1000, 0xC7);
+    memory_loop(un_tableau, text_start, text_end, 0,0xCB);
+    memory_loop(un_tableau, rodata_start, rodata_end, 0,0xC3);
+    memory_loop(un_tableau, data_start, kernel_end, 0,0xC7);
+    memory_loop(un_tableau, 0x1000_0000, 0x1000_1000, 0,0xC7);
+
+    memory_loop(un_tableau, text_start, text_end, HIGH_BASE,0xCB);
+    memory_loop(un_tableau, rodata_start, rodata_end, HIGH_BASE,0xC3);
+    memory_loop(un_tableau, data_start, kernel_end, HIGH_BASE,0xC7);
+    memory_loop(un_tableau, 0x1000_0000, 0x1000_1000, HIGH_BASE,0xC7);
 
     let satp = 0x8000_0000_0000_0000usize | (un_tableau >> 12);
+
+    let mut high = 0;
+    let mut low = 0;
+
     unsafe {
         core::arch::asm!("csrw satp, {}", in(reg) satp);
         core::arch::asm!("sfence.vma");
+        core::ptr::write_volatile(addr as *mut usize, 0x1EB05);
+        low = core::ptr::read_volatile(addr as *const usize);
+        high = core::ptr::read_volatile((addr + HIGH_BASE) as *const usize);
     }
+
+    println!("hi{} lo{}", high, low);
 
     loop {
         // Wait For Interrupt: parks the core instead of spinning it at 100%.
@@ -179,12 +198,12 @@ fn frame_free(page: usize) {
     FREE_LIST.store(page, Ordering::Relaxed);
 }
 
-fn memory_loop(root: usize, start: usize, end: usize, flags: usize) {
+fn memory_loop(root: usize, start: usize, end: usize, offset: usize, flags: usize) {
     let mut real_start = start + 4095;
     real_start &= !0xFFF;
     let mut addr = end - 4096;
     while addr >= real_start {
-        map_memory_management_unit(root, addr, addr, flags);
+        map_memory_management_unit(root, addr, addr + offset, flags);
         addr -= 4096;
     }
 }
