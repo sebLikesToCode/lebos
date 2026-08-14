@@ -69,7 +69,6 @@ core::arch::global_asm!(include_str!("entry.S"));
 /// `-> !` means this never returns. There is nothing to return TO.
 #[no_mangle]
 pub extern "C" fn kmain(_hartid: usize, _dtb: *const u8) -> ! {
-
     println!("{}", BANNER);
 
     let kernel_end = core::ptr::addr_of!(__kernel_end) as usize;
@@ -84,26 +83,35 @@ pub extern "C" fn kmain(_hartid: usize, _dtb: *const u8) -> ! {
     let un_tableau = frame_alloc().unwrap();
     unsafe { core::ptr::write_bytes(un_tableau as *mut u8, 0, 4096) };
 
-    memory_loop(un_tableau, text_start, text_end, 0,0xCB);
-    memory_loop(un_tableau, rodata_start, rodata_end, 0,0xC3);
-    memory_loop(un_tableau, data_start, kernel_end, 0,0xC7);
-    memory_loop(un_tableau, 0x1000_0000, 0x1000_1000, 0,0xC7);
+    memory_loop(un_tableau, text_start, text_end, 0, 0xCB);
+    memory_loop(un_tableau, rodata_start, rodata_end, 0, 0xC3);
+    memory_loop(un_tableau, data_start, kernel_end, 0, 0xC7);
+    memory_loop(un_tableau, 0x1000_0000, 0x1000_1000, 0, 0xC7);
 
-    memory_loop(un_tableau, text_start, text_end, HIGH_BASE,0xCB);
-    memory_loop(un_tableau, rodata_start, rodata_end, HIGH_BASE,0xC3);
-    memory_loop(un_tableau, data_start, kernel_end, HIGH_BASE,0xC7);
-    memory_loop(un_tableau, 0x1000_0000, 0x1000_1000, HIGH_BASE,0xC7);
+    memory_loop(un_tableau, text_start, text_end, HIGH_BASE, 0xCB);
+    memory_loop(un_tableau, rodata_start, rodata_end, HIGH_BASE, 0xC3);
+    memory_loop(un_tableau, data_start, kernel_end, HIGH_BASE, 0xC7);
+    memory_loop(un_tableau, 0x1000_0000, 0x1000_1000, HIGH_BASE, 0xC7);
 
     let satp = 0x8000_0000_0000_0000usize | (un_tableau >> 12);
 
     unsafe {
         core::arch::asm!("csrw satp, {}", in(reg) satp);
         core::arch::asm!("sfence.vma");
+        core::arch::asm!(
+        "add sp, sp, {off}",   // the stack moves up
+        "jr {dest}",            // and so does the program counter
+        off = in(reg) HIGH_BASE,
+        dest = in(reg) kmain_high as usize + HIGH_BASE,
+        options(noreturn),
+        )
     }
+}
 
+extern "C" fn kmain_high() -> ! {
     UART_BASE.store(0x1000_0000 + HIGH_BASE, Ordering::Relaxed);
 
-    unsafe { core::arch::asm!("csrw stvec, {}", in(reg) trap_entry as *const usize as usize + HIGH_BASE) }
+    unsafe { core::arch::asm!("csrw stvec, {}", in(reg) trap_entry as *const usize as usize) }
 
     sbi_set_timer(now() + INTERVAL);
 
@@ -112,12 +120,10 @@ pub extern "C" fn kmain(_hartid: usize, _dtb: *const u8) -> ! {
         core::arch::asm!("csrs sstatus, {}", in(reg) 1usize << 1);
     }
 
-    unsafe { core::arch::asm!("unimp") }
-
     loop {
         // Wait For Interrupt: parks the core instead of spinning it at 100%.
         unsafe { core::arch::asm!("wfi") }
-}
+    }
 }
 
 // prints a byte literal character. if it is a newline, isers \r (cairrage return) to return to the start of the next line.
