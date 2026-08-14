@@ -74,17 +74,13 @@ pub extern "C" fn kmain(_hartid: usize, _dtb: *const u8) -> ! {
 
     sbi_set_timer(now() + INTERVAL);
 
-    let kernel_end = unsafe {core::ptr::addr_of!(__kernel_end) as usize};
+    let kernel_end = core::ptr::addr_of!(__kernel_end) as usize;
     frame_init(kernel_end, 0x8800_0000);
 
     let a = frame_alloc();
-    let b = frame_alloc();
-    let c = frame_alloc();
-    println!("{:#x}, {:#x}, {:#x}", a.unwrap(), b.unwrap(), c.unwrap());
 
-    frame_free(b.unwrap());
-    let d = frame_alloc();
-    println!("{:#x}", d.unwrap());
+    let pte = (0x8000_0000usize >> 12) << 10 | 0xCF;
+    println!("{:#x}", pte);
 
     loop {
         // Wait For Interrupt: parks the core instead of spinning it at 100%.
