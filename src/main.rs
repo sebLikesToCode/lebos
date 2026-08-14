@@ -29,6 +29,8 @@ fn _print(args: fmt::Arguments) {
 
 const BANNER: &str = include_str!("banner.txt");
 
+const INTERVAL: u64 = 10_000_000;
+
 macro_rules! print {
     ($($arg:tt)*) => { _print(format_args!($($arg)*)) };
 }
@@ -56,9 +58,14 @@ pub extern "C" fn kmain(_hartid: usize, _dtb: *const u8) -> ! {
         core::arch::asm!("csrw stvec, {}", in(reg) trap_entry as *const () as usize);
     }
 
-    unsafe { core::arch::asm!("unimp") };
-
     println!("{}", BANNER);
+
+    unsafe {
+        core::arch::asm!("csrs sie, {}", in(reg) 1usize << 5);
+        core::arch::asm!("csrs sstatus, {}", in(reg) 1usize << 1);
+    }
+
+    sbi_set_timer(now() + INTERVAL);
 
     loop {
         // Wait For Interrupt: parks the core instead of spinning it at 100%.
@@ -90,6 +97,24 @@ impl Write for Uart {
         puts(s);
         Ok(())
     }
+}
+
+fn sbi_set_timer(when: u64) {
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            in("a7") 0x5449_4D45_usize,
+            in("a6") 0_usize,
+            inout("a0") when => _,
+            out("a1") _,
+        );
+    }
+}
+
+fn now() -> u64 {
+    let t: u64;
+    unsafe {core::arch::asm!("csrr {}, time", out(reg) t)};
+    t
 }
 
 #[no_mangle]
@@ -131,14 +156,17 @@ extern "C" fn trap_handler() {
             _  => "unknown exception",
         };
         println!("ERROR: {}", name);
-    }
-    else {
+    } else {
         let name = match code {
             1 => "supervisor software interrupt",
             5 => "supervisor timer interrupt",
             9 => "supervisor external interrupt",
             _ => "unknown interrupt",
         };
+        if name == "supervisor timer interrupt" {
+            sbi_set_timer(now() + INTERVAL);
+            println!("tick");
+        }
         println!("ERROR: {}", name);
     }
 
