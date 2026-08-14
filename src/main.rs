@@ -18,9 +18,14 @@
 
 use core::panic::PanicInfo;
 use core::fmt::{self, Write};
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 extern "C" {
     fn trap_entry();
+}
+
+extern "C" {
+    static __kernel_end: u8;
 }
 
 fn _print(args: fmt::Arguments) {
@@ -30,6 +35,8 @@ fn _print(args: fmt::Arguments) {
 const BANNER: &str = include_str!("banner.txt");
 
 const INTERVAL: u64 = 10_000_000;
+
+static FREE_LIST: AtomicUsize = AtomicUsize::new(0);
 
 macro_rules! print {
     ($($arg:tt)*) => { _print(format_args!($($arg)*)) };
@@ -64,6 +71,18 @@ pub extern "C" fn kmain(_hartid: usize, _dtb: *const u8) -> ! {
         core::arch::asm!("csrs sie, {}", in(reg) 1usize << 5);
         core::arch::asm!("csrs sstatus, {}", in(reg) 1usize << 1);
     }
+
+    let kernel_end = unsafe {core::ptr::addr_of!(__kernel_end) as usize};
+    frame_init(kernel_end, 0x8800_0000);
+
+    let a = frame_alloc();
+    let b = frame_alloc();
+    let c = frame_alloc();
+    println!("{:#x}, {:#x}, {:#x}", a.unwrap(), b.unwrap(), c.unwrap());
+
+    frame_free(b.unwrap());
+    let d = frame_alloc();
+    println!("{:#x}", d.unwrap());
 
     sbi_set_timer(now() + INTERVAL);
 
@@ -115,6 +134,33 @@ fn now() -> u64 {
     let t: u64;
     unsafe {core::arch::asm!("csrr {}, time", out(reg) t)};
     t
+}
+
+fn frame_init(start: usize, end: usize) {
+    let mut real_start = start + 4095;
+    real_start &= !0xFFF;
+    let mut addr = end - 4096;
+    while addr >= real_start {
+        frame_free(addr);
+        addr -= 4096;
+    }
+}
+
+fn frame_alloc() -> Option<usize> {
+    let x: usize = FREE_LIST.load(Ordering::Relaxed);
+    if x == 0 {
+        return None;
+    }
+    let next = unsafe {core::ptr::read_volatile(x as *const usize)};
+    FREE_LIST.store(next, Ordering::Relaxed);
+    Some(x)
+}
+
+fn frame_free(page: usize) {
+    unsafe {
+        core::ptr::write_volatile(page as *mut usize, FREE_LIST.load(Ordering::Relaxed));
+    }
+    FREE_LIST.store(page, Ordering::Relaxed);
 }
 
 #[no_mangle]
