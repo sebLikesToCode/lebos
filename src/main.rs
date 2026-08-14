@@ -132,11 +132,6 @@ extern "C" fn trap_handler() {
     let is_interrupt = (cause as isize) < 0;
     let code = cause & 0xff;
 
-    println!("TRAP");
-    println!("sepc = {:#x}", sep);
-    println!("scause = {}", cause);
-    println!("stval = {:#x}", val);
-
     if !is_interrupt {
         let name = match code {
             0  => "instruction address misaligned",
@@ -156,6 +151,10 @@ extern "C" fn trap_handler() {
             _  => "unknown exception",
         };
         println!("ERROR: {}", name);
+        println!("TRAP");
+        println!("sepc = {:#x}", sep);
+        println!("scause = {}", cause);
+        println!("stval = {:#x}", val);
     } else {
         let name = match code {
             1 => "supervisor software interrupt",
@@ -163,11 +162,12 @@ extern "C" fn trap_handler() {
             9 => "supervisor external interrupt",
             _ => "unknown interrupt",
         };
-        if name == "supervisor timer interrupt" {
+        if code == 5 {
             sbi_set_timer(now() + INTERVAL);
             println!("tick");
+        } else {
+            println!("Interrupt: {}", name);
         }
-        println!("ERROR: {}", name);
     }
 
     let insn = unsafe { core::ptr::read_volatile(sep as *const u16) };
