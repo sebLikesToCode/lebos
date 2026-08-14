@@ -45,7 +45,7 @@ const HIGH_BASE: usize = 0xFFFF_FFC0_0000_0000;
 
 static FREE_LIST: AtomicUsize = AtomicUsize::new(0);
 
-static mut TEST: usize = 0;
+static UART_BASE: AtomicUsize = AtomicUsize::new(0x1000_0000);
 
 macro_rules! print {
     ($($arg:tt)*) => { _print(format_args!($($arg)*)) };
@@ -89,7 +89,6 @@ pub extern "C" fn kmain(_hartid: usize, _dtb: *const u8) -> ! {
     let rodata_start = core::ptr::addr_of!(__rodata_start) as usize;
     let rodata_end = core::ptr::addr_of!(__rodata_end) as usize;
     let data_start = core::ptr::addr_of!(__data_start) as usize;
-    let addr = core::ptr::addr_of!(TEST) as usize;
 
     frame_init(kernel_end, 0x8800_0000);
 
@@ -108,18 +107,13 @@ pub extern "C" fn kmain(_hartid: usize, _dtb: *const u8) -> ! {
 
     let satp = 0x8000_0000_0000_0000usize | (un_tableau >> 12);
 
-    let mut high = 0;
-    let mut low = 0;
-
     unsafe {
         core::arch::asm!("csrw satp, {}", in(reg) satp);
         core::arch::asm!("sfence.vma");
-        core::ptr::write_volatile(addr as *mut usize, 0x1EB05);
-        low = core::ptr::read_volatile(addr as *const usize);
-        high = core::ptr::read_volatile((addr + HIGH_BASE) as *const usize);
     }
 
-    println!("hi{} lo{}", high, low);
+    UART_BASE.store(0x1000_0000 + HIGH_BASE, Ordering::Relaxed);
+    println!("Hello, world!");
 
     loop {
         // Wait For Interrupt: parks the core instead of spinning it at 100%.
@@ -131,7 +125,7 @@ pub extern "C" fn kmain(_hartid: usize, _dtb: *const u8) -> ! {
 // uses write volatile because rust would delete it in the end
 fn putchar(c: u8) {
     unsafe {
-        core::ptr::write_volatile(0x1000_0000 as *mut u8, c);
+        core::ptr::write_volatile(UART_BASE.load(Ordering::Relaxed) as *mut u8, c);
     }
     if c == b'\n' {
             putchar(b'\r');
