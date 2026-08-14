@@ -70,18 +70,7 @@ core::arch::global_asm!(include_str!("entry.S"));
 #[no_mangle]
 pub extern "C" fn kmain(_hartid: usize, _dtb: *const u8) -> ! {
 
-    unsafe {
-        core::arch::asm!("csrw stvec, {}", in(reg) trap_entry as *const () as usize);
-    }
-
     println!("{}", BANNER);
-
-    unsafe {
-        core::arch::asm!("csrs sie, {}", in(reg) 1usize << 5);
-        core::arch::asm!("csrs sstatus, {}", in(reg) 1usize << 1);
-    }
-
-    sbi_set_timer(now() + INTERVAL);
 
     let kernel_end = core::ptr::addr_of!(__kernel_end) as usize;
     let text_start = core::ptr::addr_of!(__text_start) as usize;
@@ -113,12 +102,22 @@ pub extern "C" fn kmain(_hartid: usize, _dtb: *const u8) -> ! {
     }
 
     UART_BASE.store(0x1000_0000 + HIGH_BASE, Ordering::Relaxed);
-    println!("Hello, world!");
+
+    unsafe { core::arch::asm!("csrw stvec, {}", in(reg) trap_entry as *const usize as usize + HIGH_BASE) }
+
+    sbi_set_timer(now() + INTERVAL);
+
+    unsafe {
+        core::arch::asm!("csrs sie, {}", in(reg) 1usize << 5);
+        core::arch::asm!("csrs sstatus, {}", in(reg) 1usize << 1);
+    }
+
+    unsafe { core::arch::asm!("unimp") }
 
     loop {
         // Wait For Interrupt: parks the core instead of spinning it at 100%.
-        unsafe { core::arch::asm!("wfi") };
-    }
+        unsafe { core::arch::asm!("wfi") }
+}
 }
 
 // prints a byte literal character. if it is a newline, isers \r (cairrage return) to return to the start of the next line.
