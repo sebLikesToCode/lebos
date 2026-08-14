@@ -77,10 +77,20 @@ pub extern "C" fn kmain(_hartid: usize, _dtb: *const u8) -> ! {
     let kernel_end = core::ptr::addr_of!(__kernel_end) as usize;
     frame_init(kernel_end, 0x8800_0000);
 
-    let a = frame_alloc();
+    let table = frame_alloc().unwrap();
+    let satp = 0x8000_0000_0000_0000 | (table >> 12);
+    unsafe {
+        core::ptr::write_bytes(table as *mut u8, 0, 4096);
+        core::ptr::write_volatile((table + 0 * 8) as *mut usize, 0xC7);
+        core::ptr::write_volatile((table + 2 * 8) as *mut usize, 0x200000CF);
+        core::arch::asm!("csrw satp, {}", in(reg) satp);
+        core::arch::asm!("sfence.vma");
+    }
 
-    let pte = (0x8000_0000usize >> 12) << 10 | 0xCF;
-    println!("{:#x}", pte);
+    let l =  unsafe {core::ptr::read_volatile((table + 0 * 8) as *const usize)};
+    let p = unsafe {core::ptr::read_volatile((table + 2 * 8) as *const usize)};
+
+    println!("{:#x} {:#x}", l, p);
 
     loop {
         // Wait For Interrupt: parks the core instead of spinning it at 100%.
