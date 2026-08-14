@@ -26,6 +26,11 @@ extern "C" {
 
 extern "C" {
     static __kernel_end: u8;
+    static __text_start: u8;
+    static __text_end: u8;
+    static __rodata_start: u8;
+    static __rodata_end: u8;
+    static __data_start: u8;
 }
 
 fn _print(args: fmt::Arguments) {
@@ -75,22 +80,27 @@ pub extern "C" fn kmain(_hartid: usize, _dtb: *const u8) -> ! {
     sbi_set_timer(now() + INTERVAL);
 
     let kernel_end = core::ptr::addr_of!(__kernel_end) as usize;
+    let text_start = core::ptr::addr_of!(__text_start) as usize;
+    let text_end = core::ptr::addr_of!(__text_end) as usize;
+    let rodata_start = core::ptr::addr_of!(__rodata_start) as usize;
+    let rodata_end = core::ptr::addr_of!(__rodata_end) as usize;
+    let data_start = core::ptr::addr_of!(__data_start) as usize;
+
     frame_init(kernel_end, 0x8800_0000);
 
-    let table = frame_alloc().unwrap();
-    let satp = 0x8000_0000_0000_0000 | (table >> 12);
+    let un_tableau = frame_alloc().unwrap();
+    unsafe { core::ptr::write_bytes(un_tableau as *mut u8, 0, 4096) };
+
+    memory_loop(un_tableau, text_start, text_end, 0xCB);
+    memory_loop(un_tableau, rodata_start, rodata_end, 0xC3);
+    memory_loop(un_tableau, data_start, kernel_end, 0xC7);
+    memory_loop(un_tableau, 0x1000_0000, 0x1000_1000, 0xC7);
+
+    let satp = 0x8000_0000_0000_0000usize | (un_tableau >> 12);
     unsafe {
-        core::ptr::write_bytes(table as *mut u8, 0, 4096);
-        core::ptr::write_volatile((table + 0 * 8) as *mut usize, 0xC7);
-        core::ptr::write_volatile((table + 2 * 8) as *mut usize, 0x200000CF);
         core::arch::asm!("csrw satp, {}", in(reg) satp);
         core::arch::asm!("sfence.vma");
     }
-
-    let l =  unsafe {core::ptr::read_volatile((table + 0 * 8) as *const usize)};
-    let p = unsafe {core::ptr::read_volatile((table + 2 * 8) as *const usize)};
-
-    println!("{:#x} {:#x}", l, p);
 
     loop {
         // Wait For Interrupt: parks the core instead of spinning it at 100%.
@@ -167,6 +177,48 @@ fn frame_free(page: usize) {
         core::ptr::write_volatile(page as *mut usize, FREE_LIST.load(Ordering::Relaxed));
     }
     FREE_LIST.store(page, Ordering::Relaxed);
+}
+
+fn memory_loop(root: usize, start: usize, end: usize, flags: usize) {
+    let mut real_start = start + 4095;
+    real_start &= !0xFFF;
+    let mut addr = end - 4096;
+    while addr >= real_start {
+        map_memory_management_unit(root, addr, addr, flags);
+        addr -= 4096;
+    }
+}
+
+// this does what you think it does. manages shit for the memory management unit. don't forget what it does, FUTURE ME. yours truly, current you. (past you? current me?)
+fn map_memory_management_unit(root: usize, physical_address: usize, digital_address: usize, flags: usize, ) {
+    let slot = (digital_address >> 30) & 511;
+    let entry = unsafe { core::ptr::read_volatile((root + slot * 8) as *const usize) };
+    let mut new_table: usize = 0;
+    if entry & 1 == 0 {
+        new_table = frame_alloc().unwrap();
+        unsafe {
+            core::ptr::write_bytes(new_table as *mut u8, 0, 4096);
+            core::ptr::write_volatile((root + slot * 8) as *mut usize, (new_table >> 12) << 10 | 1);
+        }
+    } else {
+        new_table = (entry >> 10) << 12
+    }
+
+    let slot2 = (digital_address >> 21) & 511;
+    let entry2 = unsafe { core::ptr::read_volatile((new_table + slot2 * 8) as *const usize) };
+    let mut newer_table: usize = 0;
+    if entry2 & 1 == 0 {
+        newer_table = frame_alloc().unwrap();
+        unsafe {
+            core::ptr::write_bytes(newer_table as *mut u8, 0, 4096);
+            core::ptr::write_volatile((new_table + slot2 * 8) as *mut usize, (newer_table >> 12) << 10 | 1);
+        }
+    } else {
+        newer_table = (entry2 >> 10) << 12
+    }
+
+    let slot3 = (digital_address >> 12) & 511;
+    unsafe { core::ptr::write_volatile((newer_table + slot3 * 8) as *mut usize, (physical_address >> 12) << 10 | flags) };
 }
 
 #[no_mangle]

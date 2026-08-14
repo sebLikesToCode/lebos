@@ -17,14 +17,31 @@ SECTIONS
 {
     . = 0x80200000;
 
+    /* Each region is padded to a whole number of 4096-byte pages, and its
+     * boundaries exported, so the kernel can give each one different
+     * permissions. A page can only have ONE set of permissions, so a boundary
+     * landing mid-page would force a choice between "code is writable" and
+     * "data is executable" -- both wrong. ALIGN(4096) removes the choice.
+     *
+     * These symbols have no value, only an address. Read them in Rust with
+     * core::ptr::addr_of!, never by dereferencing. */
+
+    __text_start = .;
     /* .text.entry FIRST, so _start lands exactly at 0x80200000. If any other
      * code got there first, OpenSBI would jump into the middle of it. */
     .text : {
         KEEP(*(.text.entry))
         *(.text .text.*)
     }
+    . = ALIGN(4096);
+    __text_end = .;
 
+    __rodata_start = .;
     .rodata : { *(.rodata .rodata.*) }
+    . = ALIGN(4096);
+    __rodata_end = .;
+
+    __data_start = .;
     .data   : { *(.sdata .sdata.* .data .data.*) }
 
     /* .bss occupies NO space in the file -- it is a promise that some zeroed
@@ -42,6 +59,7 @@ SECTIONS
     . += 64 * 1024;
     __stack_top = .;
 
+    . = ALIGN(4096);
     __kernel_end = .;
 
     /DISCARD/ : { *(.eh_frame) *(.note .note.*) *(.comment) }
