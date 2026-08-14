@@ -72,6 +72,8 @@ pub extern "C" fn kmain(_hartid: usize, _dtb: *const u8) -> ! {
         core::arch::asm!("csrs sstatus, {}", in(reg) 1usize << 1);
     }
 
+    sbi_set_timer(now() + INTERVAL);
+
     let kernel_end = unsafe {core::ptr::addr_of!(__kernel_end) as usize};
     frame_init(kernel_end, 0x8800_0000);
 
@@ -83,8 +85,6 @@ pub extern "C" fn kmain(_hartid: usize, _dtb: *const u8) -> ! {
     frame_free(b.unwrap());
     let d = frame_alloc();
     println!("{:#x}", d.unwrap());
-
-    sbi_set_timer(now() + INTERVAL);
 
     loop {
         // Wait For Interrupt: parks the core instead of spinning it at 100%.
