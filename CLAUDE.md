@@ -252,6 +252,32 @@ three milestones before it owns a pixel. Escapes are emitted only where the
 colour CHANGES, since otherwise every character carries 19 bytes of preamble.
 Regenerate the banner whenever the logo changes; do not hand-edit it.
 
+## The curb -- Sebastian's analogy for the heap, day 4
+
+Better than the shelf version, because it carries fragmentation for free.
+
+| the curb | the heap |
+|---|---|
+| the street | the heap region |
+| a parked car | an allocated block |
+| a gap between cars | a free block |
+| a note in each gap: "12m, next gap 40m that way" | `FreeBlock { size, next }` |
+| a sign at the corner pointing at the first gap | `FREE_HEAD` |
+| taking the first gap you fit in | first fit |
+| parking a 5m car in a 12m gap, leaving 7m | splitting |
+| two cars leave and their gaps join | coalescing |
+| **a 20m truck cannot use two 10m gaps** | **fragmentation** |
+
+**Cars carry no sign saying how long they are** -- the driver knows when they
+pull out. That is exactly Rust's `Layout`: `dealloc` is handed the size, so
+allocated blocks need no header and only gaps need notes. In C, `free(p)` gets
+only a pointer, so every allocation has to carry a hidden length.
+
+His truck line IS the argument for two-way coalescing: two adjacent 10m gaps
+are 20m of street that the list insists is 10 and 10. Merge in one direction
+only and the free BYTE count stays identical while the block count climbs --
+the same memory as confetti, until a large request fails on an empty street.
+
 ## Easter eggs and tributes
 
 The author wants this codebase full of them. **Flag the opportunity whenever

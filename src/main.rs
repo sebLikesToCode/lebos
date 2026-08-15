@@ -131,6 +131,10 @@ extern "C" fn kmain_high(tabletop: usize) -> ! {
     }
 }
 
+fn heap_init(start: usize, size: usize) {
+    
+}
+
 // prints a byte literal character. if it is a newline, isers \r (cairrage return) to return to the start of the next line.
 // uses write volatile because rust would delete it in the end
 fn putchar(c: u8) {
@@ -147,6 +151,11 @@ fn puts(s: &str) {
     for c in s.bytes() {
         putchar(c);
     }
+}
+
+struct FreeSpace {
+    size: usize,
+    next: usize,
 }
 
 struct Uart;
