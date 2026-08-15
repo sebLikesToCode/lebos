@@ -18,6 +18,7 @@
 
 use core::panic::PanicInfo;
 use core::fmt::{self, Write};
+use core::ptr::write_volatile;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 extern "C" {
@@ -47,6 +48,8 @@ static FREE_LIST: AtomicUsize = AtomicUsize::new(0);
 
 static UART_BASE: AtomicUsize = AtomicUsize::new(0x1000_0000);
 
+static FREE_HEAD: AtomicUsize = AtomicUsize::new(0);
+
 macro_rules! print {
     ($($arg:tt)*) => { _print(format_args!($($arg)*)) };
 }
@@ -69,7 +72,12 @@ core::arch::global_asm!(include_str!("entry.S"));
 /// `-> !` means this never returns. There is nothing to return TO.
 #[no_mangle]
 pub extern "C" fn kmain(_hartid: usize, _dtb: *const u8) -> ! {
-    println!("{}", BANNER);
+    // NOTHING MAY PRINT BEFORE THE JUMP.
+    //
+    // The kernel is linked at its HIGH address, so the ~436 absolute addresses
+    // the linker baked into .rodata -- vtables, which is what println!
+    // dispatches through -- are all high. They do not resolve until the higher
+    // half exists. The banner therefore prints in kmain_high, not here.
 
     let kernel_end = core::ptr::addr_of!(__kernel_end) as usize;
     let text_start = core::ptr::addr_of!(__text_start) as usize;
@@ -78,7 +86,7 @@ pub extern "C" fn kmain(_hartid: usize, _dtb: *const u8) -> ! {
     let rodata_end = core::ptr::addr_of!(__rodata_end) as usize;
     let data_start = core::ptr::addr_of!(__data_start) as usize;
 
-    frame_init(kernel_end, 0x8800_0000);
+    frame_init(kernel_end, 0x8700_0000);
 
     let un_tableau = frame_alloc().unwrap();
     unsafe { core::ptr::write_bytes(un_tableau as *mut u8, 0, 4096) };
@@ -113,6 +121,9 @@ pub extern "C" fn kmain(_hartid: usize, _dtb: *const u8) -> ! {
 extern "C" fn kmain_high(tabletop: usize) -> ! {
     UART_BASE.store(0x1000_0000 + HIGH_BASE, Ordering::Relaxed);
 
+    // Safe to print from here: the code is high, so the vtables resolve.
+    println!("{}", BANNER);
+
     unsafe { core::arch::asm!("csrw stvec, {}", in(reg) trap_entry as *const usize as usize) }
 
     sbi_set_timer(now() + INTERVAL);
@@ -125,6 +136,16 @@ extern "C" fn kmain_high(tabletop: usize) -> ! {
         core::arch::asm!("sfence.vma");
     }
 
+    heap_init(0x8800_0000 - 0x10_0000 + HIGH_BASE, 0x10_0000);
+
+    println!("{:#x}", FREE_HEAD.load(Ordering::Relaxed));
+
+    let x = unsafe { core::ptr::read_volatile(FREE_HEAD.load(Ordering::Relaxed) as *const usize) };
+
+    let y = unsafe { core::ptr::read_volatile((FREE_HEAD.load(Ordering::Relaxed) + 8) as *const usize) };
+
+    println!("{} {}", x, y);
+
     loop {
         // Wait For Interrupt: parks the core instead of spinning it at 100%.
         unsafe { core::arch::asm!("wfi") }
@@ -132,7 +153,11 @@ extern "C" fn kmain_high(tabletop: usize) -> ! {
 }
 
 fn heap_init(start: usize, size: usize) {
-    
+    unsafe {
+        core::ptr::write_volatile((start + 0) as *mut usize, size);
+        core::ptr::write_volatile((start + 8) as *mut usize, 0);
+    }
+    FREE_HEAD.store(start, Ordering::Relaxed);
 }
 
 // prints a byte literal character. if it is a newline, isers \r (cairrage return) to return to the start of the next line.
@@ -153,10 +178,7 @@ fn puts(s: &str) {
     }
 }
 
-struct FreeSpace {
-    size: usize,
-    next: usize,
-}
+struct FreeSpace; 
 
 struct Uart;
 impl Write for Uart {
