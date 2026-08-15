@@ -92,6 +92,7 @@ pub extern "C" fn kmain(_hartid: usize, _dtb: *const u8) -> ! {
     memory_loop(un_tableau, rodata_start, rodata_end, HIGH_BASE, 0xC3);
     memory_loop(un_tableau, data_start, kernel_end, HIGH_BASE, 0xC7);
     memory_loop(un_tableau, 0x1000_0000, 0x1000_1000, HIGH_BASE, 0xC7);
+    memory_loop(un_tableau, kernel_end, 0x8800_0000, HIGH_BASE, 0xC7);
 
     let satp = 0x8000_0000_0000_0000usize | (un_tableau >> 12);
 
@@ -103,12 +104,13 @@ pub extern "C" fn kmain(_hartid: usize, _dtb: *const u8) -> ! {
         "jr {dest}",            // and so does the program counter
         off = in(reg) HIGH_BASE,
         dest = in(reg) kmain_high as usize + HIGH_BASE,
+        in("a0") un_tableau,
         options(noreturn),
         )
     }
 }
 
-extern "C" fn kmain_high() -> ! {
+extern "C" fn kmain_high(tabletop: usize) -> ! {
     UART_BASE.store(0x1000_0000 + HIGH_BASE, Ordering::Relaxed);
 
     unsafe { core::arch::asm!("csrw stvec, {}", in(reg) trap_entry as *const usize as usize) }
@@ -118,6 +120,9 @@ extern "C" fn kmain_high() -> ! {
     unsafe {
         core::arch::asm!("csrs sie, {}", in(reg) 1usize << 5);
         core::arch::asm!("csrs sstatus, {}", in(reg) 1usize << 1);
+        core::ptr::write_volatile((tabletop + HIGH_BASE + 0 * 8) as *mut usize, 0);
+        core::ptr::write_volatile((tabletop + HIGH_BASE + 2 * 8) as *mut usize, 0);
+        core::arch::asm!("sfence.vma");
     }
 
     loop {
@@ -308,6 +313,7 @@ extern "C" fn trap_handler() {
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
     println!("PANIC! AT THE KERNEL");
+    println!("The PC is crying for help");
     println!("{}", _info);
     loop {
         unsafe { core::arch::asm!("wfi") };
