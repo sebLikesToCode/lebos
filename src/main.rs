@@ -152,6 +152,23 @@ extern "C" fn kmain_high(tabletop: usize) -> ! {
     }
 }
 
+fn alloc(size: usize) -> usize {
+    let mut block: usize = FREE_HEAD.load(Ordering::Relaxed);
+    let mut next: usize = 0;
+    let mut av_size: usize = 0;
+    while block != 0 {
+        next = unsafe { core::ptr::read_volatile((block + 8) as *const usize) };
+        av_size = unsafe { core::ptr::read_volatile((block + 0) as *const usize) };
+        if size > av_size {
+            block = next;
+        } else {
+            unsafe { core::ptr::write_volatile((block + 0) as *mut usize, av_size - size); }
+            return block + (av_size - size);
+        }
+    }
+    return 0;
+}
+
 fn heap_init(start: usize, size: usize) {
     unsafe {
         core::ptr::write_volatile((start + 0) as *mut usize, size);
@@ -178,7 +195,7 @@ fn puts(s: &str) {
     }
 }
 
-struct FreeSpace; 
+struct FreeSpace;
 
 struct Uart;
 impl Write for Uart {
