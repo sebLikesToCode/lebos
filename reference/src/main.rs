@@ -41,7 +41,7 @@ static USER_PROG: &[u8] = include_bytes!("../user/hello.elf");
 /// Baked into the kernel image only to seed a blank disk -- something has to
 /// put the first program in the store, and xv6 does exactly this with
 /// `initcode`. Once saved, it is reached the way everything else is: by query.
-static SHELL_PROG: &[u8] = include_bytes!("../user/shell.elf");
+static SHELL_PROG: &[u8] = include_bytes!("../user/bananashell.banash");
 
 /// Where user programs are mapped. Not 0, so that a null dereference faults
 /// rather than silently reading whatever sits at address zero. Must match
@@ -504,7 +504,7 @@ extern "C" fn kmain_high() -> ! {
     let shell_id = store_create(
         SHELL_PROG.to_vec(),
         alloc::vec![
-            ("name".into(), Value::Text("shell".into())),
+            ("name".into(), Value::Text("bananashell".into())),
             ("type".into(), Value::Text("program".into())),
         ],
     );
@@ -543,7 +543,7 @@ extern "C" fn kmain_high() -> ! {
     // typed ran in supervisor mode with unrestricted access to physical
     // memory. It is a user process now: it reaches the store only through
     // validated syscalls, and if it crashes the machine survives it.
-    match process_spawn("shell", b'S', SHELL_PROG) {
+    match process_spawn("bananashell", b'S', SHELL_PROG) {
         Some(_) => {}
         None => println!("BOOT FAILED: the shell is not a program this machine can run"),
     }
@@ -3693,7 +3693,7 @@ fn blk_rw(sector: u64, buf_phys: usize, write: bool) -> bool {
 // ===========================================================================
 // The shell used to live here -- milestones 14 through 19.
 //
-// It is a user program now (`user/src/bin/shell.rs`), and about 280 lines came
+// It is a user program now (`user/src/bin/bananashell.rs`), and about 280 lines came
 // out of this file when it moved. Everything it did was policy: what a
 // predicate means, how to format a table, which verb `hide` is short for, what
 // counts as a line of input. None of that needed supervisor mode; it lived

@@ -80,17 +80,17 @@ trace: build $(DISK)
 # =========================================================================
 
 REFELF  := reference/user/target/$(TARGET)/debug/hello
-SHELELF := reference/user/target/$(TARGET)/debug/shell
+SHELELF := reference/user/target/$(TARGET)/debug/bananashell
 REFBIN  := reference/user/hello.elf
-SHELBIN := reference/user/shell.elf
+SHELBIN := reference/user/bananashell.banash
 
 ## user    -- build the reference's user programs (the shell, and a demo)
 $(REFBIN) $(SHELBIN): reference/user/src/main.rs reference/user/src/sys.rs \
-                      reference/user/src/bin/shell.rs reference/user/user.ld
+                      reference/user/src/bin/bananashell.rs reference/user/user.ld
 	cd reference/user && RUSTFLAGS="$(USRFLAGS)" cargo build
 	rust-objcopy --strip-all $(REFELF) $(REFBIN)
 	rust-objcopy --strip-all $(SHELELF) $(SHELBIN)
-	@echo "hello: $$(stat -c%s $(REFBIN)) bytes | shell: $$(stat -c%s $(SHELBIN)) bytes"
+	@echo "hello: $$(stat -c%s $(REFBIN)) bytes | bananashell: $$(stat -c%s $(SHELBIN)) bytes"
 
 user: $(REFBIN) $(SHELBIN)
 
