@@ -17,41 +17,35 @@ say *where* something is, because nothing is anywhere. You describe it.
 
 ---
 
-## Where everything is
+## Layout
 
 ```
-src/             YOUR kernel.  main.rs, entry.S       -> make run
-kernel.ld        where yours goes in memory
-Cargo.toml       yours
+src/             the kernel.  main.rs, entry.S        -> make run
+kernel.ld        where it goes in memory
+Cargo.toml
 
-reference/       the ENTIRE old project, self-contained -> make ref
+reference/       previous implementation, self-contained -> make ref
   src/             its kernel
   user/            its user programs (the shell, a demo)
   assets/ tools/   its logo and banner renderer
   linker.ld        its linker script (links high)
   Cargo.toml       its own crate
 
-learn/           reading aids. Not built, not in git.
-CLAUDE.md        the design record: every decision and why
+DESIGN.md        the design record: every decision and why
 README.md        this
 ```
 
-Everything old is inside `reference/`. The root is yours.
-
-### Two kernels, on purpose
-
-`reference/` still boots. It exists to be **read** while `kernel/` is written —
-the same role xv6 plays for everyone else, except every design decision in it is
-already yours and the comments explain the reasoning.
-
-`make run` boots **yours**. That is the point.
+`reference/` is the previous implementation. It stays in the tree because it
+still boots and still covers ground the current kernel hasn't reached yet, which
+makes it the fastest way to check intended behaviour against working code.
+`make run` boots the current kernel; `make ref` boots the old one.
 
 ### The three top-level crates
 
 | crate | what | linker script |
 |---|---|---|
-| root | **yours**, links flat at `0x8020_0000` | `kernel.ld` |
-| `reference/` | the old kernel, links into the higher half | `reference/linker.ld` |
+| root | the current kernel, links flat at `0x8020_0000` | `kernel.ld` |
+| `reference/` | the previous kernel, links into the higher half | `reference/linker.ld` |
 | `reference/user/` | user programs, link at `0x1000` | `reference/user/user.ld` |
 
 Each is separate because **cargo merges `.cargo/config.toml` up the directory
@@ -64,10 +58,10 @@ rustflags instead of merging with them.
 
 ## Commands
 
-### Yours
+### The kernel
 
 ```
-make run       build and boot your kernel     (quit: Ctrl-A then X)
+make run       build and boot it              (quit: Ctrl-A then X)
 make build     build only
 make nm        symbols by address -- confirm _start is at 0x80200000
 make objdump   disassembly
@@ -84,7 +78,7 @@ make user      build its user programs
 make logo      print its colour boot banner without booting
 make play      run its breakable scratch copy
 make resync    reset that scratch copy
-make playdiff  show what you changed in it
+make playdiff  show what changed in it
 ```
 
 ### Shared
@@ -96,22 +90,6 @@ make gdb       attach to a waiting `make debug`  (second terminal)
 make trace     boot logging exceptions and MMU translations to qemu.log
 make clean
 ```
-
----
-
-## Reading it
-
-Nothing in `learn/` is required to build anything. In this order:
-
-| file | what it is |
-|---|---|
-| `learn/RUST.md` | the ~15 Rust constructs a kernel uses. Pointers, `unsafe`, `volatile`, `asm!`. Every example copied out of the real code. |
-| `learn/decoder.md` | quick lookup: **what you see → what it means in Python → why Rust makes you say it** |
-| `learn/pykernel.py` | the kernel's algorithms in Python. `python3 learn/pykernel.py` and watch them run |
-| `learn/TOUR.md` | one section per milestone: the problem, the picture, the code, the gotcha |
-
-`CLAUDE.md` is different — it's the **design record**, not a tutorial. What was
-decided, and why, in the words the decision was made in.
 
 ---
 
@@ -163,4 +141,4 @@ the attribute that makes it match. One object can appear in many folders, with
 no copies and no canonical location. Gmail is the precedent — labels, not
 folders, and hundreds of millions of people migrated without noticing.
 
-Full reasoning, including what was rejected and why, is in `CLAUDE.md`.
+Full reasoning, including what was rejected and why, is in `DESIGN.md`.

@@ -1,6 +1,8 @@
-# CLAUDE.md
+# LeBOS — Design Record
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Every decision made in this kernel and the reasoning behind it, in the words the
+decision was made in. Not a tutorial and not API documentation: it exists so a
+choice can be re-examined later against what was actually known at the time.
 
 ## What this is
 

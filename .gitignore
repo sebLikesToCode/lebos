@@ -23,9 +23,10 @@ reference/main2.rs
 reference/entry2.S
 reference/banner_art.txt
 
-# learn/ IS tracked. It was ignored as "notes rather than source", which was
-# wrong: it is ~1400 lines of documentation about this project and it existed
-# in exactly one place on one disk.
+# learn/ is personal reading notes, not part of the kernel. Kept locally and
+# out of the repo. It is ~1400 lines and lives on one disk -- back it up
+# separately; git is no longer doing that for it.
+learn/
 
 # ---- editors ----
 .idea/
