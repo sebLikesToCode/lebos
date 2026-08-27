@@ -974,6 +974,229 @@ crash-correct than in-place update; see log-structured storage / LSM trees).
 
 The syscall surface for storage is roughly `create` / `get` / `query` / `link`.
 
+## The second thesis: agents are principals -- DECIDED, 2026-08-27
+
+Worked out in conversation with the author. These are his calls; do not
+relitigate them without him.
+
+The first thesis says there are no paths. This one says **an AI acting on your
+behalf is a distinct kind of actor, and the OS should know it.** The two are the
+same idea one level apart, and the second is nearly free because of decisions
+already made for the first.
+
+**Why a query store and a language model want the same thing.** To use a
+filesystem an agent must already know where things are, so every operation
+begins with a search the OS refuses to help with -- `ls`, guess, parse output
+formatted for a human. A query is not a location, it is a *description*, and
+descriptions are what a language model produces natively. `find name~brick
+created_at>100` is closer to English than to a path. So the natural-language
+layer is a translation between two things that already agree what a request is.
+On a path OS it is a guess.
+
+**A small model sits above the kernel and translates English to a query.** It
+is not in the kernel and it is not a shell built-in: it is a userspace service
+with the same store syscalls as anything else. It has no privileged path.
+
+**The query is always SHOWN.** English in, generated query displayed, numbered
+results, act by index. NEVER English in, action out. This preserves what the
+shell already got right -- the numbered result list is the path replacement --
+and it makes the translation auditable: the user sees what it understood before
+anything happens. Retrofitting this later is how tools become untrustworthy.
+
+### The stamp carries the actor, not just the process
+
+`origin` currently records which process produced an object. Widen it:
+
+    origin = (agent identity, acting-for human, task id)
+
+Unix has exactly one notion of who: the UID. When an agent runs a command it
+*is* you, so a file written by a model and a file written by a person are
+byte-identical in every respect the OS records -- same owner, same group, same
+mode. That gives no audit, no scoping, no revocation, and no provenance. The
+workarounds are all containers, which isolate a *process* and still cannot name
+an *actor*.
+
+Once the stamp carries an actor, `find origin=agent created_at>yesterday` is not
+a feature. It is a query that already works.
+
+**This is NOT a byline.** The author's objection to git's `Co-Authored-By` is
+correct and does not apply here: a trailer is *broadcast* -- a public claim about
+credit, aimed at strangers, attached to work he is judged on. A stamp is
+*infrastructure* -- a private record aimed at the machine, so it can answer
+questions and undo things. Same information, opposite purpose. Do not surface
+the stamp as attribution.
+
+### Accepted versions -- a pull request at the storage layer
+
+The author's design: an agent may edit freely, the original stays untouchable,
+and the edit does not become official until accepted.
+
+Append-only already gives the preservation half for free -- the previous version
+is still there because nothing is ever modified. What is added is a rule about
+which version counts as current, and that is an attribute:
+
+    find name=player.gd accepted=true      what is live
+    find origin=agent accepted=false       the review queue
+
+"Current" stops being a pointer and becomes a query, exactly as folders did.
+
+**Acceptance is per EDIT, not per file and not per task.** An edit is one
+coherent change and may span many objects; a file is too granular to reason
+about and a task is too coarse to reject partially. Author's call.
+
+**Rollback is not a feature to build.** Every superseded version is still in the
+log, so undo is a query selecting objects by origin and restoring what they
+displaced. On an in-place filesystem this needs snapshots, a journal, or
+copy-on-write bolted on. Here it needs a verb. It belongs beside
+`hide`/`evict`/`forget` -- "put back what this actor changed" and "go back to
+Tuesday" are different operations and the model can express both.
+
+**UNRESOLVED, decide before the accepted/candidate split ships:** what does a
+reader see when an edit is pending? If readers resolve to accepted, the agent's
+work is invisible until approved and accepting becomes a guess. If they resolve
+to candidates, an unfinished edit is live in a build. The likely answer is that
+resolution is part of the query CONTEXT -- an interactive shell sees candidates,
+a running service sees accepted -- which is cheap now and painful later.
+
+**Failure mode to design against:** agents generate many edits. A queue nobody
+reviews makes "accept all" a reflex and the safety becomes theatre. Grouping by
+edit is the mitigation, which is why the stamp must carry a task id and not only
+an actor.
+
+### Why this is not WinFS
+
+WinFS failed as an *addition*. It layered queries and metadata over NTFS while
+files still lived at paths, so every existing application kept using paths --
+and once paths still work, nothing has a reason to use queries. The old model
+wins by default. It also ran a relational engine in the storage path on 2005
+hardware, and was cut when Longhorn collapsed.
+
+LeBOS has no path model to retreat to. `cd /home` answering "there is nowhere"
+is not a joke line; it is the design refusing the fallback that killed WinFS.
+That is a different bet, and a riskier one for adoption -- no compatibility
+means no existing software -- but it is not the same mistake.
+
+The precedent that WORKED is BeOS: BFS had indexed, queryable metadata
+attributes, shipped in 1998, and ran on the hardware of the day. Haiku still
+runs it. BeOS died for company reasons, not because BFS did not work. The
+surviving additive version is Spotlight, which persists precisely because it
+never threatened the filesystem, and stays marginal for the same reason.
+
+## Porting to the other architectures -- PLANNED, 2026-08-27
+
+The author intends LeBOS to run on aarch64 and x86_64 as well as riscv64, and
+on real hardware rather than only QEMU. This section exists because the cost of
+that decision is almost entirely determined by WHEN the arch split happens, not
+by how much work the ports themselves are.
+
+### Roughly 15% of a kernel is architecture-specific
+
+    arch-specific                  arch-neutral
+    -------------                  ------------
+    entry / boot asm               the store
+    trap vector and dispatch       query engine and indexes
+    page tables and MMU setup      the shell
+    context switch                 scheduler policy
+    atomics and memory barriers    heap allocator
+    timer, firmware interface      syscall SEMANTICS (not the mechanism)
+
+**Every idea that makes LeBOS not-Linux is in the right-hand column.** No paths,
+content-addressed objects, hide/evict/forget, queries instead of locations, the
+origin stamp -- none of it touches a CPU. Porting means rewriting the boring 15%
+three times, not writing LeBOS three times.
+
+### The split must happen BEFORE milestone 8
+
+    src/arch/riscv64/    entry.S, traps, MMU, context switch, timer
+    src/                 everything else, talking through a defined interface
+
+Every portable kernel does this; Linux's `arch/` is the same idea.
+
+**The cost curve is not linear in lines, it is proportional to how many
+architecture assumptions have leaked into neutral code -- and the leaks all
+happen in the next four milestones:**
+
+    8   kernel threads + context switch   the single most arch-specific code
+                                          in a kernel
+    9   preemption + spinlocks            barriers and interrupt-disable are
+                                          per-arch
+    10  user mode + syscalls              sscratch, SUM, sret -- all RISC-V
+                                          nouns that will end up in process code
+    11  process creation                  one address space per process, i.e.
+                                          page tables again
+
+    now (368 lines in main.rs)   an afternoon
+    after milestone 11           days of untangling
+    reference/ (7,896 lines)     a rewrite
+
+The reference implementation is what "did not split" looks like. Do it at
+milestone 8, when context switching is being written for the first time, and the
+second port is filling in a directory rather than unpicking one.
+
+### Order: riscv64 -> aarch64 -> x86_64
+
+**aarch64 is the sensible second.** The concepts map cleanly and QEMU's `virt`
+board carries virtio-mmio, so the whole disk driver -- descriptor rings and all
+-- ports unchanged.
+
+    riscv64                        aarch64
+    -------                        -------
+    M / S / U mode                 EL3 / EL2 / EL1 / EL0  (kernel at EL1)
+    one vector (stvec), decode     16-entry vector table, 128 bytes per entry
+      scause
+    scause + stval                 ESR_EL1 (syndrome), FAR_EL1
+    sepc / sstatus / sret          ELR_EL1 / SPSR_EL1 / eret
+    satp                           TTBR0_EL1 (user) + TTBR1_EL1 (kernel)
+    PLIC                           GIC -- distributor + CPU interface, fiddlier
+    SBI for timer and console      no equivalent: direct registers, PL011 UART
+
+Two things get BETTER on aarch64. Separate user/kernel page-table base registers
+mean the higher-half split built by hand in milestone 6c is architectural there.
+And the timer is plain register access with no firmware call.
+
+Two get worse: the vector table is sixteen entries rather than one, and the GIC
+is materially more work than the PLIC. **The real loss is SBI** -- there is no
+console or timer service, so early boot output means driving the PL011 directly
+from the first instruction.
+
+**x86_64 is the hard one and should be last.** Real mode to protected mode to
+long mode, GDT, IDT, APIC, ACPI, and a boot path that is forty years of
+sediment. Its documentation describes decisions made in 1978. Nothing about it
+is conceptually harder than aarch64; it is just carrying everything it has ever
+been.
+
+All three are emulated by QEMU, so none of this requires hardware:
+`qemu-system-riscv64`, `qemu-system-aarch64`, `qemu-system-x86_64`. The Makefile
+grows an ARCH variable and `make run ARCH=aarch64` is the goal.
+
+### Real hardware, when it comes
+
+Do NOT switch architecture to get onto metal -- there is real RISC-V hardware:
+
+    Milk-V Mars             JH7110, quad U74    ~$40   same SoC, cheapest way in
+    StarFive VisionFive 2   JH7110              ~$60   best documented, upstream
+                                                       Linux support means a real
+                                                       device tree to read
+    Banana Pi BPI-F3        SpacemiT K1         ~$70   newer, less trodden
+
+**A USB-to-UART adapter is not optional** (~$5, CH340 or FTDI, three jumper
+wires). It is the only window when the kernel does not boot: no screen, no logs,
+and the UART setup is part of what is broken.
+
+What survives the move to metal: SBI is a spec, not a QEMU convenience, so
+OpenSBI provides the same calls -- `sbi_set_timer` and the trap/sret path travel
+unchanged. What breaks: the UART is at a different address, virtio does not
+exist, memory layout differs, and the device tree is real rather than QEMU's
+tidy fiction. `make dumpdtb` exists to practise reading one.
+
+**Storage on metal argues for NVMe before USB.** NVMe is the same SHAPE as
+virtio -- shared-memory submission/completion queues, doorbell registers,
+physical addresses, DMA straight to RAM -- so every lesson in "The disk" above
+transfers, including that a wrong descriptor address is unbounded silent
+corruption. Its prerequisite is PCIe enumeration. USB is three stacked protocol
+layers (xHCI, then USB core, then mass-storage BOT, then SCSI) and is the
+classic hobby-OS "later" that becomes never.
+
 ## Known improvement, deliberately deferred
 
 `frame_alloc` returns a raw `*mut u8`, which opts out of every guarantee Rust
