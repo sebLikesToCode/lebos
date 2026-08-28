@@ -10,6 +10,7 @@ use core::fmt::{self, Write};
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicUsize, Ordering};
+use crate::hw::timer_reset;
 
 extern "C" {
     fn trap_entry();
@@ -32,7 +33,6 @@ fn _print(args: fmt::Arguments) {
 
 const BANNER: &str = include_str!("banner.txt");
 
-const INTERVAL: u64 = 10_000_000;
 
 const HIGH_BASE: usize = 0xFFFF_FFC0_0000_0000;
 
@@ -118,7 +118,7 @@ extern "C" fn kmain_high(tabletop: usize) -> ! {
 
     unsafe { core::arch::asm!("csrw stvec, {}", in(reg) trap_entry as *const usize as usize) }
 
-    sbi_set_timer(now() + INTERVAL);
+    hw::timer_reset();
 
     unsafe {
         core::arch::asm!("csrs sie, {}", in(reg) 1usize << 5);
@@ -274,24 +274,6 @@ fn round_16(n: usize) -> usize {
     (n + 15) & !15
 }
 
-fn sbi_set_timer(when: u64) {
-    unsafe {
-        core::arch::asm!(
-            "ecall",
-            in("a7") 0x5449_4D45_usize,
-            in("a6") 0_usize,
-            inout("a0") when => _,
-            out("a1") _,
-        );
-    }
-}
-
-fn now() -> u64 {
-    let t: u64;
-    unsafe {core::arch::asm!("csrr {}, time", out(reg) t)};
-    t
-}
-
 fn frame_init(start: usize, end: usize) {
     let mut real_start = start + 4095;
     real_start &= !0xFFF;
@@ -407,7 +389,7 @@ extern "C" fn trap_handler() {
             _ => "unknown interrupt",
         };
         if code == 5 {
-            sbi_set_timer(now() + INTERVAL);
+            timer_reset();
             println!("tick");
         } else {
             println!("Interrupt: {}", name);

@@ -23,6 +23,8 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 static UART_BASE: AtomicUsize = AtomicUsize::new(0x1000_0000);
 
+const INTERVAL: u64 = 10_000_000;
+
 pub fn putchar(c: u8) {
     unsafe {
         write_volatile(UART_BASE.load(Ordering::Relaxed) as *mut u8, c);
@@ -34,4 +36,26 @@ pub fn putchar(c: u8) {
 
 pub fn console_relocate(offset: usize) {
     UART_BASE.fetch_add(offset, Ordering::Relaxed);
+}
+
+pub fn timer_reset() {
+    sbi_set_timer(now() + INTERVAL);
+}
+
+fn now() -> u64 {
+    let t: u64;
+    unsafe {core::arch::asm!("csrr {}, time", out(reg) t)};
+    t
+}
+
+fn sbi_set_timer(when: u64) {
+    unsafe {
+        core::arch::asm!(
+        "ecall",
+        in("a7") 0x5449_4D45_usize,
+        in("a6") 0_usize,
+        inout("a0") when => _,
+        out("a1") _,
+        );
+    }
 }
