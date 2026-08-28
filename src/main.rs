@@ -53,8 +53,7 @@ macro_rules! println {
 
 // entry.S, pasted in at compile time. It has to be assembly: there is no valid
 // stack when it runs, and Rust cannot function without one.
-mod arch;
-mod board;
+mod hw;
 
 core::arch::global_asm!(include_str!("entry.S"));
 

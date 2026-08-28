@@ -1,8 +1,0 @@
-{
-  "recommendations": [
-    "rust-lang.rust-analyzer",
-    "maziac.asm-code-lens",
-    "webfreak.debug",
-    "ms-vscode.hexeditor"
-  ]
-}

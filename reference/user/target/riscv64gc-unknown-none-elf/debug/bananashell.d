@@ -1,1 +1,0 @@
-/home/sebastian/code/OS/reference/user/target/riscv64gc-unknown-none-elf/debug/bananashell: /home/sebastian/code/OS/reference/user/src/bin/bananashell.rs /home/sebastian/code/OS/reference/user/src/sys.rs
