@@ -1,14 +1,3 @@
-//! LeBOS -- the kernel.
-//!
-//! Written by Sebastian LeBlanc. The kernel in `reference/` is the one built
-//! alongside Claude across milestones 1-20; it still boots (`make ref`) and it
-//! is there to be READ when this one gets stuck. Same role xv6 plays for
-//! everybody else, except every decision in it is already yours.
-//!
-//! Milestone 1 -- build and boot harness -- is done: the linker script, the
-//! boot assembly and the build tooling are mechanical and typing them teaches
-//! nothing. Everything from here is yours.
-
 // No standard library. `std` assumes an operating system underneath it --
 // files, threads, a heap, a way to exit. There is nothing underneath this.
 #![no_std]
@@ -18,12 +7,15 @@
 
 use core::panic::PanicInfo;
 use core::fmt::{self, Write};
-use core::ptr::write_volatile;
+use core::alloc::{GlobalAlloc, Layout};
+use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 extern "C" {
     fn trap_entry();
 }
+
+extern crate alloc;
 
 extern "C" {
     static __kernel_end: u8;
@@ -131,38 +123,17 @@ extern "C" fn kmain_high(tabletop: usize) -> ! {
     unsafe {
         core::arch::asm!("csrs sie, {}", in(reg) 1usize << 5);
         core::arch::asm!("csrs sstatus, {}", in(reg) 1usize << 1);
-        core::ptr::write_volatile((tabletop + HIGH_BASE + 0 * 8) as *mut usize, 0);
-        core::ptr::write_volatile((tabletop + HIGH_BASE + 2 * 8) as *mut usize, 0);
+        write_volatile((tabletop + HIGH_BASE + 0 * 8) as *mut usize, 0);
+        write_volatile((tabletop + HIGH_BASE + 2 * 8) as *mut usize, 0);
         core::arch::asm!("sfence.vma");
     }
 
     heap_init(0x8800_0000 - 0x10_0000 + HIGH_BASE, 0x10_0000);
 
-    println!("{:#x}", FREE_HEAD.load(Ordering::Relaxed));
-
-    let x = unsafe { core::ptr::read_volatile(FREE_HEAD.load(Ordering::Relaxed) as *const usize) };
-    let y = unsafe { core::ptr::read_volatile((FREE_HEAD.load(Ordering::Relaxed) + 8) as *const usize) };
-
-    println!("{} {}", x, y);
-
-    let a = alloc(100);
-    let b = alloc(100);
-    let c = alloc(100);
-
-    let (mut blocks, mut bytes) = walk_heap();
-    println!("blocks{}, size{}", blocks, bytes);
-
-    dealloc(b, 100);
-
-    (blocks, bytes) = walk_heap();
-    println!("blocks{}, size{}", blocks, bytes);
-
-    dealloc(a, 100);
-    dealloc(c, 100);
-
-    (blocks, bytes) = walk_heap();
-    println!("blocks{}, size{}", blocks, bytes);
-
+    let mut v: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+    for i in 1..=8u64 { v.push(i * i); }
+    println!("{:?}", v);
+    println!("{:?}", walk_heap());
 
     loop {
         // Wait For Interrupt: parks the core instead of spinning it at 100%.
@@ -179,8 +150,8 @@ fn walk_heap() -> (usize, usize) {
     let mut heap_blocks: usize = 0;
 
     while block != 0 {
-        next = unsafe { core::ptr::read_volatile((block + 8) as *const usize) };
-        av_size = unsafe { core::ptr::read_volatile((block + 0) as *const usize) };
+        next = unsafe { read_volatile((block + 8) as *const usize) };
+        av_size = unsafe { read_volatile((block + 0) as *const usize) };
 
         heap_blocks += 1;
         heap_size += av_size;
@@ -196,12 +167,12 @@ fn alloc(size: usize) -> usize {
     let mut av_size: usize;
 
     while block != 0 {
-        next = unsafe { core::ptr::read_volatile((block + 8) as *const usize) };
-        av_size = unsafe { core::ptr::read_volatile((block + 0) as *const usize) };
+        next = unsafe { read_volatile((block + 8) as *const usize) };
+        av_size = unsafe { read_volatile((block + 0) as *const usize) };
         if size > av_size {
             block = next;
         } else {
-            unsafe { core::ptr::write_volatile((block + 0) as *mut usize, av_size - size); }
+            unsafe { write_volatile((block + 0) as *mut usize, av_size - size); }
             return block + (av_size - size);
         }
     }
@@ -215,39 +186,39 @@ fn dealloc(addr: usize, size: usize) {
 
     while block != 0 && block < addr {
         prev = block;
-        block = unsafe { core::ptr::read_volatile((block + 8) as *const usize) };
+        block = unsafe { read_volatile((block + 8) as *const usize) };
     }
 
-    let touches_before = prev != 0 && prev + unsafe { core::ptr::read_volatile((prev + 0) as *const usize) } == addr;
+    let touches_before = prev != 0 && prev + unsafe { read_volatile((prev + 0) as *const usize) } == addr;
     let touches_after = block != 0 && next_addr == block;
 
     if touches_after && touches_before {
         unsafe {
-            core::ptr::write_volatile((prev + 0) as *mut usize, core::ptr::read_volatile((prev + 0) as *const usize) + size + core::ptr::read_volatile((block + 0) as *const usize));
-            core::ptr::write_volatile((prev + 8) as *mut usize, core::ptr::read_volatile((block + 8) as *const usize));
+            write_volatile((prev + 0) as *mut usize, read_volatile((prev + 0) as *const usize) + size + read_volatile((block + 0) as *const usize));
+            write_volatile((prev + 8) as *mut usize, read_volatile((block + 8) as *const usize));
         }
     } else if touches_after {
         unsafe {
-            core::ptr::write_volatile((addr + 0) as *mut usize, size + core::ptr::read_volatile((block + 0) as *const usize));
-            core::ptr::write_volatile((addr + 8) as *mut usize, core::ptr::read_volatile((block + 8) as *const usize));
+            write_volatile((addr + 0) as *mut usize, size + read_volatile((block + 0) as *const usize));
+            write_volatile((addr + 8) as *mut usize, read_volatile((block + 8) as *const usize));
 
             if prev != 0 {
-                core::ptr::write_volatile((prev + 8) as *mut usize, addr);
+                write_volatile((prev + 8) as *mut usize, addr);
             } else {
                 FREE_HEAD.store(addr, Ordering::Relaxed);
             }
         }
     } else if touches_before {
         unsafe {
-            core::ptr::write_volatile((prev + 0) as *mut usize, core::ptr::read_volatile((prev + 0) as *const usize) + size);
+            write_volatile((prev + 0) as *mut usize, read_volatile((prev + 0) as *const usize) + size);
         }
     } else {
         unsafe {
-            core::ptr::write_volatile((addr + 0) as *mut usize, size);
-            core::ptr::write_volatile((addr + 8) as *mut usize, block);
+            write_volatile((addr + 0) as *mut usize, size);
+            write_volatile((addr + 8) as *mut usize, block);
 
             if prev != 0 {
-                core::ptr::write_volatile((prev + 8) as *mut usize, addr);
+                write_volatile((prev + 8) as *mut usize, addr);
             } else {
                 FREE_HEAD.store(addr, Ordering::Relaxed);
             }
@@ -258,8 +229,8 @@ fn dealloc(addr: usize, size: usize) {
 
 fn heap_init(start: usize, size: usize) {
     unsafe {
-        core::ptr::write_volatile((start + 0) as *mut usize, size);
-        core::ptr::write_volatile((start + 8) as *mut usize, 0);
+        write_volatile((start + 0) as *mut usize, size);
+        write_volatile((start + 8) as *mut usize, 0);
     }
     FREE_HEAD.store(start, Ordering::Relaxed);
 }
@@ -268,7 +239,7 @@ fn heap_init(start: usize, size: usize) {
 // uses write volatile because rust would delete it in the end
 fn putchar(c: u8) {
     unsafe {
-        core::ptr::write_volatile(UART_BASE.load(Ordering::Relaxed) as *mut u8, c);
+        write_volatile(UART_BASE.load(Ordering::Relaxed) as *mut u8, c);
     }
     if c == b'\n' {
             putchar(b'\r');
@@ -282,7 +253,22 @@ fn puts(s: &str) {
     }
 }
 
-struct FreeSpace;
+struct Kheap;
+
+unsafe impl GlobalAlloc for Kheap {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let n = round_16(layout.size());
+        let a = alloc(n);
+        if a == 0 { core::ptr::null_mut() } else { a as *mut u8 }
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        let n = round_16(layout.size());
+        dealloc(ptr as usize, n);
+    }
+}
+
+#[global_allocator]
+static HEAP: Kheap = Kheap;
 
 struct Uart;
 impl Write for Uart {
@@ -290,6 +276,10 @@ impl Write for Uart {
         puts(s);
         Ok(())
     }
+}
+
+fn round_16(n: usize) -> usize {
+    (n + 15) & !15
 }
 
 fn sbi_set_timer(when: u64) {
@@ -325,14 +315,14 @@ fn frame_alloc() -> Option<usize> {
     if x == 0 {
         return None;
     }
-    let next = unsafe {core::ptr::read_volatile(x as *const usize)};
+    let next = unsafe {read_volatile(x as *const usize)};
     FREE_LIST.store(next, Ordering::Relaxed);
     Some(x)
 }
 
 fn frame_free(page: usize) {
     unsafe {
-        core::ptr::write_volatile(page as *mut usize, FREE_LIST.load(Ordering::Relaxed));
+        write_volatile(page as *mut usize, FREE_LIST.load(Ordering::Relaxed));
     }
     FREE_LIST.store(page, Ordering::Relaxed);
 }
@@ -350,33 +340,33 @@ fn memory_loop(root: usize, start: usize, end: usize, offset: usize, flags: usiz
 // this does what you think it does. manages shit for the memory management unit. don't forget what it does, FUTURE ME. yours truly, current you. (past you? current me?)
 fn map_memory_management_unit(root: usize, physical_address: usize, digital_address: usize, flags: usize, ) {
     let slot = (digital_address >> 30) & 511;
-    let entry = unsafe { core::ptr::read_volatile((root + slot * 8) as *const usize) };
+    let entry = unsafe { read_volatile((root + slot * 8) as *const usize) };
     let mut new_table: usize = 0;
     if entry & 1 == 0 {
         new_table = frame_alloc().unwrap();
         unsafe {
             core::ptr::write_bytes(new_table as *mut u8, 0, 4096);
-            core::ptr::write_volatile((root + slot * 8) as *mut usize, (new_table >> 12) << 10 | 1);
+            write_volatile((root + slot * 8) as *mut usize, (new_table >> 12) << 10 | 1);
         }
     } else {
         new_table = (entry >> 10) << 12
     }
 
     let slot2 = (digital_address >> 21) & 511;
-    let entry2 = unsafe { core::ptr::read_volatile((new_table + slot2 * 8) as *const usize) };
+    let entry2 = unsafe { read_volatile((new_table + slot2 * 8) as *const usize) };
     let mut newer_table: usize = 0;
     if entry2 & 1 == 0 {
         newer_table = frame_alloc().unwrap();
         unsafe {
             core::ptr::write_bytes(newer_table as *mut u8, 0, 4096);
-            core::ptr::write_volatile((new_table + slot2 * 8) as *mut usize, (newer_table >> 12) << 10 | 1);
+            write_volatile((new_table + slot2 * 8) as *mut usize, (newer_table >> 12) << 10 | 1);
         }
     } else {
         newer_table = (entry2 >> 10) << 12
     }
 
     let slot3 = (digital_address >> 12) & 511;
-    unsafe { core::ptr::write_volatile((newer_table + slot3 * 8) as *mut usize, (physical_address >> 12) << 10 | flags) };
+    unsafe { write_volatile((newer_table + slot3 * 8) as *mut usize, (physical_address >> 12) << 10 | flags) };
 }
 
 #[no_mangle]
@@ -432,7 +422,7 @@ extern "C" fn trap_handler() {
         }
     }
 
-    let insn = unsafe { core::ptr::read_volatile(sep as *const u16) };
+    let insn = unsafe { read_volatile(sep as *const u16) };
 
     if !is_interrupt {
         let width = if insn & 0b11 == 0b11 { 4 } else { 2 };
