@@ -254,6 +254,28 @@ three milestones before it owns a pixel. Escapes are emitted only where the
 colour CHANGES, since otherwise every character carries 19 bytes of preamble.
 Regenerate the banner whenever the logo changes; do not hand-edit it.
 
+## The wall socket -- Sebastian's analogy for the arch split
+
+`main.rs` is a socket. Any plug fits it, whatever hardware is on the other end.
+
+The sharpening that makes it useful: **the socket's shape has to be designed
+for plugs that do not exist yet.** Shape it around the only plug in the room
+and the second one arrives with the wrong prongs -- after everything is wired.
+
+That is the whole argument for designing the seam against three architectures
+while owning one. Concretely: the console is `putchar(byte)` and never
+`UART_BASE`, because an x86 plug has no pin for "UART address" -- x86 reaches
+its serial port with `out` instructions, which are not memory at all.
+
+The property it captures is the payoff: **main.rs does not change when the
+hardware does.** Add a Pi, add an x86 box, and the socket is untouched. That is
+what makes a port "fill in a directory" rather than "unpick a kernel".
+
+It is also literally why plug standards exist. Whoever wires a building and
+whoever builds a kettle never speak, and it works because the shape was agreed
+in advance. `hw::` is the same contract, and the party on the other end of it is
+Sebastian in a year, having forgotten all of this.
+
 ## The curb -- Sebastian's analogy for the heap, day 4
 
 Better than the shelf version, because it carries fragmentation for free.
