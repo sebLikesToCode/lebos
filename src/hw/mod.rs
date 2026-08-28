@@ -17,3 +17,21 @@
 //! The interface is VERBS, not addresses -- putchar(byte), never UART_BASE.
 //! An x86 serial port is reached with `out` instructions rather than memory
 //! writes, so an address-shaped interface has no x86 implementation at all.
+
+use core::ptr::write_volatile;
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+static UART_BASE: AtomicUsize = AtomicUsize::new(0x1000_0000);
+
+pub fn putchar(c: u8) {
+    unsafe {
+        write_volatile(UART_BASE.load(Ordering::Relaxed) as *mut u8, c);
+    }
+    if c == b'\n' {
+        putchar(b'\r');
+    }
+}
+
+pub fn console_relocate(offset: usize) {
+    UART_BASE.fetch_add(offset, Ordering::Relaxed);
+}

@@ -38,8 +38,6 @@ const HIGH_BASE: usize = 0xFFFF_FFC0_0000_0000;
 
 static FREE_LIST: AtomicUsize = AtomicUsize::new(0);
 
-static UART_BASE: AtomicUsize = AtomicUsize::new(0x1000_0000);
-
 static FREE_HEAD: AtomicUsize = AtomicUsize::new(0);
 
 macro_rules! print {
@@ -113,7 +111,7 @@ pub extern "C" fn kmain(_hartid: usize, _dtb: *const u8) -> ! {
 }
 
 extern "C" fn kmain_high(tabletop: usize) -> ! {
-    UART_BASE.store(0x1000_0000 + HIGH_BASE, Ordering::Relaxed);
+    hw::console_relocate(HIGH_BASE);
 
     // Safe to print from here: the code is high, so the vtables resolve.
     println!("{}", BANNER);
@@ -239,19 +237,11 @@ fn heap_init(start: usize, size: usize) {
 
 // prints a byte literal character. if it is a newline, isers \r (cairrage return) to return to the start of the next line.
 // uses write volatile because rust would delete it in the end
-fn putchar(c: u8) {
-    unsafe {
-        write_volatile(UART_BASE.load(Ordering::Relaxed) as *mut u8, c);
-    }
-    if c == b'\n' {
-            putchar(b'\r');
-    }
-}
 
 // puts a string of byte literals down with putchar
 fn puts(s: &str) {
     for c in s.bytes() {
-        putchar(c);
+        hw::putchar(c);
     }
 }
 
