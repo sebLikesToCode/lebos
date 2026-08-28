@@ -141,10 +141,28 @@ extern "C" fn kmain_high(tabletop: usize) -> ! {
     println!("{:#x}", FREE_HEAD.load(Ordering::Relaxed));
 
     let x = unsafe { core::ptr::read_volatile(FREE_HEAD.load(Ordering::Relaxed) as *const usize) };
-
     let y = unsafe { core::ptr::read_volatile((FREE_HEAD.load(Ordering::Relaxed) + 8) as *const usize) };
 
     println!("{} {}", x, y);
+
+    let a = alloc(100);
+    let b = alloc(100);
+    let c = alloc(100);
+
+    let (mut blocks, mut bytes) = walk_heap();
+    println!("blocks{}, size{}", blocks, bytes);
+
+    dealloc(b, 100);
+
+    (blocks, bytes) = walk_heap();
+    println!("blocks{}, size{}", blocks, bytes);
+
+    dealloc(a, 100);
+    dealloc(c, 100);
+
+    (blocks, bytes) = walk_heap();
+    println!("blocks{}, size{}", blocks, bytes);
+
 
     loop {
         // Wait For Interrupt: parks the core instead of spinning it at 100%.
@@ -152,10 +170,31 @@ extern "C" fn kmain_high(tabletop: usize) -> ! {
     }
 }
 
+fn walk_heap() -> (usize, usize) {
+    let mut block: usize = FREE_HEAD.load(Ordering::Relaxed);
+    let mut next: usize;
+    let mut av_size: usize;
+
+    let mut heap_size: usize = 0;
+    let mut heap_blocks: usize = 0;
+
+    while block != 0 {
+        next = unsafe { core::ptr::read_volatile((block + 8) as *const usize) };
+        av_size = unsafe { core::ptr::read_volatile((block + 0) as *const usize) };
+
+        heap_blocks += 1;
+        heap_size += av_size;
+
+        block = next;
+    }
+    return (heap_blocks, heap_size);
+}
+
 fn alloc(size: usize) -> usize {
     let mut block: usize = FREE_HEAD.load(Ordering::Relaxed);
-    let mut next: usize = 0;
-    let mut av_size: usize = 0;
+    let mut next: usize;
+    let mut av_size: usize;
+
     while block != 0 {
         next = unsafe { core::ptr::read_volatile((block + 8) as *const usize) };
         av_size = unsafe { core::ptr::read_volatile((block + 0) as *const usize) };
@@ -168,6 +207,54 @@ fn alloc(size: usize) -> usize {
     }
     return 0;
 }
+
+fn dealloc(addr: usize, size: usize) {
+    let next_addr: usize = addr + size;
+    let mut block = FREE_HEAD.load(Ordering::Relaxed);
+    let mut prev: usize = 0;
+
+    while block != 0 && block < addr {
+        prev = block;
+        block = unsafe { core::ptr::read_volatile((block + 8) as *const usize) };
+    }
+
+    let touches_before = prev != 0 && prev + unsafe { core::ptr::read_volatile((prev + 0) as *const usize) } == addr;
+    let touches_after = block != 0 && next_addr == block;
+
+    if touches_after && touches_before {
+        unsafe {
+            core::ptr::write_volatile((prev + 0) as *mut usize, core::ptr::read_volatile((prev + 0) as *const usize) + size + core::ptr::read_volatile((block + 0) as *const usize));
+            core::ptr::write_volatile((prev + 8) as *mut usize, core::ptr::read_volatile((block + 8) as *const usize));
+        }
+    } else if touches_after {
+        unsafe {
+            core::ptr::write_volatile((addr + 0) as *mut usize, size + core::ptr::read_volatile((block + 0) as *const usize));
+            core::ptr::write_volatile((addr + 8) as *mut usize, core::ptr::read_volatile((block + 8) as *const usize));
+
+            if prev != 0 {
+                core::ptr::write_volatile((prev + 8) as *mut usize, addr);
+            } else {
+                FREE_HEAD.store(addr, Ordering::Relaxed);
+            }
+        }
+    } else if touches_before {
+        unsafe {
+            core::ptr::write_volatile((prev + 0) as *mut usize, core::ptr::read_volatile((prev + 0) as *const usize) + size);
+        }
+    } else {
+        unsafe {
+            core::ptr::write_volatile((addr + 0) as *mut usize, size);
+            core::ptr::write_volatile((addr + 8) as *mut usize, block);
+
+            if prev != 0 {
+                core::ptr::write_volatile((prev + 8) as *mut usize, addr);
+            } else {
+                FREE_HEAD.store(addr, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
 
 fn heap_init(start: usize, size: usize) {
     unsafe {
