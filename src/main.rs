@@ -10,7 +10,7 @@ use core::fmt::{self, Write};
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicUsize, Ordering};
-use crate::hw::timer_reset;
+use crate::hw::{Trap, HIGH_BASE, memory_loop, Perm, console_relocate, map_devices, paging_on, timer_reset, timer_on, traps_on, unmap_low, enter_high};
 
 extern "C" {
     fn trap_entry();
@@ -33,8 +33,6 @@ fn _print(args: fmt::Arguments) {
 
 const BANNER: &str = include_str!("banner.txt");
 
-
-const HIGH_BASE: usize = 0xFFFF_FFC0_0000_0000;
 
 static FREE_LIST: AtomicUsize = AtomicUsize::new(0);
 
@@ -83,57 +81,35 @@ pub extern "C" fn kmain(_hartid: usize, _dtb: *const u8) -> ! {
     let un_tableau = frame_alloc().unwrap();
     unsafe { core::ptr::write_bytes(un_tableau as *mut u8, 0, 4096) };
 
-    memory_loop(un_tableau, text_start, text_end, 0, 0xCB);
-    memory_loop(un_tableau, rodata_start, rodata_end, 0, 0xC3);
-    memory_loop(un_tableau, data_start, kernel_end, 0, 0xC7);
-    memory_loop(un_tableau, 0x1000_0000, 0x1000_1000, 0, 0xC7);
+    memory_loop(un_tableau, text_start, text_end, 0, Perm::Code);
+    memory_loop(un_tableau, rodata_start, rodata_end, 0, Perm::Rodata);
+    memory_loop(un_tableau, data_start, kernel_end, 0, Perm::Data);
+    map_devices(un_tableau, 0);
 
-    memory_loop(un_tableau, text_start, text_end, HIGH_BASE, 0xCB);
-    memory_loop(un_tableau, rodata_start, rodata_end, HIGH_BASE, 0xC3);
-    memory_loop(un_tableau, data_start, kernel_end, HIGH_BASE, 0xC7);
-    memory_loop(un_tableau, 0x1000_0000, 0x1000_1000, HIGH_BASE, 0xC7);
-    memory_loop(un_tableau, kernel_end, 0x8800_0000, HIGH_BASE, 0xC7);
+    memory_loop(un_tableau, text_start, text_end, HIGH_BASE, Perm::Code);
+    memory_loop(un_tableau, rodata_start, rodata_end, HIGH_BASE, Perm::Rodata);
+    memory_loop(un_tableau, data_start, kernel_end, HIGH_BASE, Perm::Data);
+    map_devices(un_tableau, HIGH_BASE);
+    memory_loop(un_tableau, kernel_end, 0x8800_0000, HIGH_BASE, Perm::Data);
 
-    let satp = 0x8000_0000_0000_0000usize | (un_tableau >> 12);
+    paging_on(un_tableau);
 
-    unsafe {
-        core::arch::asm!("csrw satp, {}", in(reg) satp);
-        core::arch::asm!("sfence.vma");
-        core::arch::asm!(
-        "add sp, sp, {off}",   // the stack moves up
-        "jr {dest}",            // and so does the program counter
-        off = in(reg) HIGH_BASE,
-        dest = in(reg) kmain_high as usize + HIGH_BASE,
-        in("a0") un_tableau,
-        options(noreturn),
-        )
-    }
+    enter_high(kmain_high as *const usize as usize, un_tableau);
 }
 
 extern "C" fn kmain_high(tabletop: usize) -> ! {
-    hw::console_relocate(HIGH_BASE);
+    console_relocate(HIGH_BASE);
 
     // Safe to print from here: the code is high, so the vtables resolve.
     println!("{}", BANNER);
 
-    unsafe { core::arch::asm!("csrw stvec, {}", in(reg) trap_entry as *const usize as usize) }
+    traps_on();
+    timer_reset();
+    timer_on();
 
-    hw::timer_reset();
-
-    unsafe {
-        core::arch::asm!("csrs sie, {}", in(reg) 1usize << 5);
-        core::arch::asm!("csrs sstatus, {}", in(reg) 1usize << 1);
-        write_volatile((tabletop + HIGH_BASE + 0 * 8) as *mut usize, 0);
-        write_volatile((tabletop + HIGH_BASE + 2 * 8) as *mut usize, 0);
-        core::arch::asm!("sfence.vma");
-    }
+    unmap_low(tabletop);
 
     heap_init(0x8800_0000 - 0x10_0000 + HIGH_BASE, 0x10_0000);
-
-    let mut v: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
-    for i in 1..=8u64 { v.push(i * i); }
-    println!("{:?}", v);
-    println!("{:?}", walk_heap());
 
     loop {
         // Wait For Interrupt: parks the core instead of spinning it at 100%.
@@ -301,107 +277,33 @@ fn frame_free(page: usize) {
     FREE_LIST.store(page, Ordering::Relaxed);
 }
 
-fn memory_loop(root: usize, start: usize, end: usize, offset: usize, flags: usize) {
-    let mut real_start = start + 4095;
-    real_start &= !0xFFF;
-    let mut addr = end - 4096;
-    while addr >= real_start {
-        map_memory_management_unit(root, addr, addr + offset, flags);
-        addr -= 4096;
-    }
-}
-
-// this does what you think it does. manages shit for the memory management unit. don't forget what it does, FUTURE ME. yours truly, current you. (past you? current me?)
-fn map_memory_management_unit(root: usize, physical_address: usize, digital_address: usize, flags: usize, ) {
-    let slot = (digital_address >> 30) & 511;
-    let entry = unsafe { read_volatile((root + slot * 8) as *const usize) };
-    let mut new_table: usize = 0;
-    if entry & 1 == 0 {
-        new_table = frame_alloc().unwrap();
-        unsafe {
-            core::ptr::write_bytes(new_table as *mut u8, 0, 4096);
-            write_volatile((root + slot * 8) as *mut usize, (new_table >> 12) << 10 | 1);
+pub fn on_trap(t: Trap) {
+    println!("TRAP");
+    match t {
+        Trap::Fault { cause, address, pc} => {
+            let name = match cause {
+                0 => "instruction address misaligned",
+                1 => "instruction access fault",
+                2 => "illegal instruction",
+                3 => "breakpoint",
+                4 => "load address misaligned",
+                5 => "load access fault",
+                6 => "store/AMO address misaligned",
+                7 => "store/AMO access fault",
+                8 => "ecall from user mode",
+                9 => "ecall from supervisor mode",
+                11 => "ecall from machine mode",
+                12 => "instruction page fault",
+                13 => "load page fault",
+                15 => "store/AMO page fault",
+                _ => "unknown exception",
+            };
+            println!("{}", name);
+            println!("Address {:#x}, Pc {:#x}", address, pc);
         }
-    } else {
-        new_table = (entry >> 10) << 12
-    }
-
-    let slot2 = (digital_address >> 21) & 511;
-    let entry2 = unsafe { read_volatile((new_table + slot2 * 8) as *const usize) };
-    let mut newer_table: usize = 0;
-    if entry2 & 1 == 0 {
-        newer_table = frame_alloc().unwrap();
-        unsafe {
-            core::ptr::write_bytes(newer_table as *mut u8, 0, 4096);
-            write_volatile((new_table + slot2 * 8) as *mut usize, (newer_table >> 12) << 10 | 1);
-        }
-    } else {
-        newer_table = (entry2 >> 10) << 12
-    }
-
-    let slot3 = (digital_address >> 12) & 511;
-    unsafe { write_volatile((newer_table + slot3 * 8) as *mut usize, (physical_address >> 12) << 10 | flags) };
-}
-
-#[no_mangle]
-extern "C" fn trap_handler() {
-    let cause: usize;
-    let val: usize;
-    let sep: usize;
-
-    unsafe {
-        core::arch::asm!("csrr {}, scause", out(reg) cause);
-        core::arch::asm!("csrr {}, stval", out(reg) val);
-        core::arch::asm!("csrr {}, sepc", out(reg) sep);
-    }
-
-    let is_interrupt = (cause as isize) < 0;
-    let code = cause & 0xff;
-
-    if !is_interrupt {
-        let name = match code {
-            0  => "instruction address misaligned",
-            1  => "instruction access fault",
-            2  => "illegal instruction",
-            3  => "breakpoint",
-            4  => "load address misaligned",
-            5  => "load access fault",
-            6  => "store/AMO address misaligned",
-            7  => "store/AMO access fault",
-            8  => "ecall from user mode",
-            9  => "ecall from supervisor mode",
-            11 => "ecall from machine mode",
-            12 => "instruction page fault",
-            13 => "load page fault",
-            15 => "store/AMO page fault",
-            _  => "unknown exception",
-        };
-        println!("ERROR: {}", name);
-        println!("TRAP");
-        println!("sepc = {:#x}", sep);
-        println!("scause = {}", cause);
-        println!("stval = {:#x}", val);
-    } else {
-        let name = match code {
-            1 => "supervisor software interrupt",
-            5 => "supervisor timer interrupt",
-            9 => "supervisor external interrupt",
-            _ => "unknown interrupt",
-        };
-        if code == 5 {
-            timer_reset();
-            println!("tick");
-        } else {
-            println!("Interrupt: {}", name);
-        }
-    }
-
-    let insn = unsafe { read_volatile(sep as *const u16) };
-
-    if !is_interrupt {
-        let width = if insn & 0b11 == 0b11 { 4 } else { 2 };
-        unsafe {core::arch::asm!("csrw sepc, {}", in(reg) sep + width)}
-    }
+        Trap::Timer => println!("Timer"),
+        Trap::Unknown => println!("unknown trap")
+    };
 }
 
 /// Where a panic ends up.
