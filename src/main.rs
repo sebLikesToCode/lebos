@@ -10,7 +10,7 @@ use core::fmt::{self, Write};
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicUsize, Ordering};
-use crate::hw::{Trap, HIGH_BASE, memory_loop, Perm, console_relocate, map_devices, paging_on, timer_reset, timer_on, traps_on, unmap_low, enter_high};
+use crate::hw::{Trap, HIGH_BASE, memory_loop, Perm, console_relocate, map_devices, paging_on, timer_reset, timer_on, traps_on, unmap_low, enter_high, idle};
 
 extern "C" {
     fn trap_entry();
@@ -50,8 +50,6 @@ macro_rules! println {
 // entry.S, pasted in at compile time. It has to be assembly: there is no valid
 // stack when it runs, and Rust cannot function without one.
 mod hw;
-
-core::arch::global_asm!(include_str!("entry.S"));
 
 /// The first Rust that ever runs.
 ///
@@ -113,7 +111,7 @@ extern "C" fn kmain_high(tabletop: usize) -> ! {
 
     loop {
         // Wait For Interrupt: parks the core instead of spinning it at 100%.
-        unsafe { core::arch::asm!("wfi") }
+        idle()
     }
 }
 
@@ -317,6 +315,6 @@ fn panic(_info: &PanicInfo) -> ! {
     println!("The PC is crying for help");
     println!("{}", _info);
     loop {
-        unsafe { core::arch::asm!("wfi") };
+        idle()
     }
 }

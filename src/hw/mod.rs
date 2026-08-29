@@ -18,9 +18,11 @@
 //! An x86 serial port is reached with `out` instructions rather than memory
 //! writes, so an address-shaped interface has no x86 implementation at all.
 
+core::arch::global_asm!(include_str!("entry.S"));
+
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicUsize, Ordering};
-use crate::{frame_alloc, kmain_high, trap_entry};
+use crate::{frame_alloc, trap_entry};
 
 static UART_BASE: AtomicUsize = AtomicUsize::new(0x1000_0000);
 
@@ -46,6 +48,10 @@ pub fn timer_on() {
         core::arch::asm!("csrs sie, {}", in(reg) 1usize << 5);
         core::arch::asm!("csrs sstatus, {}", in(reg) 1usize << 1);
     }
+}
+
+pub fn idle() {
+    unsafe { core::arch::asm!("wfi") }
 }
 
 pub fn unmap_low(root: usize) {
