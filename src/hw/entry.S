@@ -117,3 +117,66 @@ trap_entry:
         # and has nothing to do with where the trap happened. `sret` jumps to
         # sepc and restores the pre-trap interrupt-enable state.
         sret
+
+# ---------------------------------------------------------------------------
+# switch_context(old_sp: *mut usize, new_sp: usize)
+#
+#   a0 -- where to write the outgoing thread's stack pointer
+#   a1 -- the incoming thread's stack pointer
+#
+# Saves ra and s0-s11 and nothing else. This is an ordinary function call, so
+# the calling convention has already forced the caller to spill anything it
+# cared about in t0-t6 and a0-a7. A callee is only obliged to preserve s0-s11,
+# and honouring that obligation is the entire job.
+#
+# trap_entry above saves all 31 registers instead, because an interrupt is not
+# a call: it lands between two arbitrary instructions and nobody agreed to
+# save anything first.
+#
+# 13 registers * 8 = 104 bytes, rounded to 112 so sp stays 16-byte aligned.
+
+.equ CTX, 112
+
+.section .text
+.align 2
+.globl switch_context
+switch_context:
+        addi    sp, sp, -CTX
+        sd      ra,   0*8(sp)
+        sd      s0,   1*8(sp)
+        sd      s1,   2*8(sp)
+        sd      s2,   3*8(sp)
+        sd      s3,   4*8(sp)
+        sd      s4,   5*8(sp)
+        sd      s5,   6*8(sp)
+        sd      s6,   7*8(sp)
+        sd      s7,   8*8(sp)
+        sd      s8,   9*8(sp)
+        sd      s9,  10*8(sp)
+        sd      s10, 11*8(sp)
+        sd      s11, 12*8(sp)
+
+        # hand the outgoing stack pointer back to the scheduler
+        sd      sp, 0(a0)
+
+        # everything below this line runs on the INCOMING thread's stack
+        mv      sp, a1
+
+        ld      ra,   0*8(sp)
+        ld      s0,   1*8(sp)
+        ld      s1,   2*8(sp)
+        ld      s2,   3*8(sp)
+        ld      s3,   4*8(sp)
+        ld      s4,   5*8(sp)
+        ld      s5,   6*8(sp)
+        ld      s6,   7*8(sp)
+        ld      s7,   8*8(sp)
+        ld      s8,   9*8(sp)
+        ld      s9,  10*8(sp)
+        ld      s10, 11*8(sp)
+        ld      s11, 12*8(sp)
+        addi    sp, sp, CTX
+
+        # Returns to whoever called switch_context on the INCOMING thread --
+        # a different place than the one we arrived from.
+        ret

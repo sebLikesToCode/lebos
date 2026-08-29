@@ -11,6 +11,7 @@ use core::alloc::{GlobalAlloc, Layout};
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicUsize, Ordering};
 use crate::hw::{Trap, HIGH_BASE, memory_loop, Perm, console_relocate, map_devices, paging_on, timer_reset, timer_on, traps_on, unmap_low, enter_high, idle};
+use crate::State::Empty;
 
 extern "C" {
     fn trap_entry();
@@ -37,6 +38,23 @@ const BANNER: &str = include_str!("banner.txt");
 static FREE_LIST: AtomicUsize = AtomicUsize::new(0);
 
 static FREE_HEAD: AtomicUsize = AtomicUsize::new(0);
+
+static mut THREADS: [Thread; 8] = [Thread { sp: 0, state: State::Empty }; 8];
+
+static mut CURRENT: usize = 0;
+
+#[derive(Clone, Copy, PartialEq)]
+enum State {
+    Empty,
+    Ready,
+    Running,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct Thread {
+    sp: usize,
+    state: State,
+}
 
 macro_rules! print {
     ($($arg:tt)*) => { _print(format_args!($($arg)*)) };
@@ -104,14 +122,34 @@ extern "C" fn kmain_high(tabletop: usize) -> ! {
     traps_on();
     timer_reset();
     timer_on();
-
     unmap_low(tabletop);
-
     heap_init(0x8800_0000 - 0x10_0000 + HIGH_BASE, 0x10_0000);
+    thread_init();
 
     loop {
         // Wait For Interrupt: parks the core instead of spinning it at 100%.
         idle()
+    }
+}
+
+fn spawn(entry: fn()) {
+    unsafe {
+        let mut thread: usize = usize::MAX;
+        for i in 0..THREADS.len() {
+            if THREADS[i].state == Empty { thread = i; break }
+        }
+        if thread == usize::MAX { return }
+        let base = alloc(16 * 1024);
+        let top = base + 16 * 1024;
+        THREADS[thread].sp = hw::init_stack(top, entry as *const () as usize);
+        THREADS[thread].state = State::Ready;
+    }
+}
+
+
+fn thread_init() {
+    unsafe {
+        THREADS[0].state = State::Running;
     }
 }
 

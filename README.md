@@ -12,13 +12,13 @@ say *where* something is, because nothing is anywhere. You describe it.
 ## The whole project
 
 ```
-src/main.rs     the kernel
-src/hw/         machine-specific: CPU registers and hardware addresses
-src/entry.S     the twelve instructions before Rust can run
-src/banner.txt  the boot logo, generated from the artwork
-kernel.ld       where everything goes in memory
-Cargo.toml      build settings
-DESIGN.md       every decision and why
+src/main.rs      the kernel -- not one CPU register, not one device address
+src/hw/mod.rs    the RISC-V driver: CSRs, page tables, the UART
+src/hw/entry.S   the twelve instructions before Rust can run
+src/banner.txt   the boot logo, generated from the artwork
+kernel.ld        where everything goes in memory
+Cargo.toml       build settings
+DESIGN.md        every decision and why
 ```
 
 That is all of it. `make run` builds exactly those.
@@ -43,6 +43,10 @@ instrument that works once the console is broken.
 
 ## Where it is
 
+```
+[███████▌░░░░░░░░░░░░]  7.5 / 20 milestones  --  37.5%
+```
+
 | milestone | |
 |---|---|
 | 1 | build and boot harness |
@@ -52,8 +56,9 @@ instrument that works once the console is broken.
 | 5 | physical frame allocator |
 | 6 | paging: identity map, W^X, higher half |
 | 7 | the heap. `Vec`, `String` and `Box` work |
-| 7.5 | **current** -- separating machine-specific code into `src/hw/` |
-| 8-20 | threads, user mode, processes, the store, disk, shell |
+| 7.5 | the arch split -- every machine-specific line behind a verb in `src/hw/` |
+| 8 | **current** -- threads |
+| 9-20 | user mode, processes, the store, disk, shell |
 
 Full ladder and reasoning in `DESIGN.md`.
 

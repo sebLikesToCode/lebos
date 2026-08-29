@@ -30,12 +30,32 @@ pub const HIGH_BASE: usize = 0xFFFF_FFC0_0000_0000;
 
 const INTERVAL: u64 = 10_000_000;
 
+const CTX: usize = 112;
+
+extern "C" {
+    fn switch_context(old_sp: *mut usize, new_sp: usize);
+}
+
+pub fn init_stack(top: usize, entry: usize) -> usize {
+    let frame: usize = top - CTX;
+    unsafe {
+        core::ptr::write_bytes(frame as *mut u8, 0, CTX);
+        write_volatile(frame as *mut usize, entry);
+    }
+    frame
+}
 pub fn putchar(c: u8) {
     unsafe {
         write_volatile(UART_BASE.load(Ordering::Relaxed) as *mut u8, c);
     }
     if c == b'\n' {
         putchar(b'\r');
+    }
+}
+
+pub fn switch(old_sp: *mut usize, new_sp: usize) {
+    unsafe {
+        switch_context(old_sp, new_sp);
     }
 }
 
